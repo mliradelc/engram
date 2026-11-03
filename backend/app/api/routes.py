@@ -1910,6 +1910,7 @@ async def get_config() -> ConfigResponse:
         tmdb_configured=bool(config.tmdb_api_key),
         tvdb_api_key="***" if config.tvdb_api_key else "",  # Redacted
         tvdb_configured=bool(tvdb_client.resolve_api_key(config)),
+        asr_remote_api_key="***" if config.asr_remote_api_key else "",  # Redacted
         max_concurrent_matches=config.max_concurrent_matches,
         enable_gpu_acceleration=config.enable_gpu_acceleration,
         # Background pre-transcription (transcript cache prewarmer)

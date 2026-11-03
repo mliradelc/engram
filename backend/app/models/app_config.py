@@ -90,6 +90,25 @@ class AppConfig(SQLModel, table=True):
         default=False, sa_column_kwargs={"server_default": text("0")}
     )
 
+    # Remote ASR: any service speaking the OpenAI-compatible /audio/transcriptions
+    # contract. The base URL is required when the provider is remote; there is no
+    # built-in endpoint. A blank language lets the server auto-detect. A blank key falls
+    # back to the ASR_REMOTE_API_KEY env var, then to no auth. Redacted on GET.
+    # server_default so upgraded databases get the same values as new ones.
+    asr_remote_base_url: str = ""
+    asr_remote_model: str = Field(
+        default="whisper-1", sa_column_kwargs={"server_default": text("'whisper-1'")}
+    )
+    asr_remote_language: str = ""
+    asr_remote_api_key: str = ""
+    # Dotted path to the transcript in the JSON response, e.g. "data.transcript"
+    asr_remote_text_path: str = Field(
+        default="text", sa_column_kwargs={"server_default": text("'text'")}
+    )
+    asr_remote_timeout_read: int = Field(
+        default=120, sa_column_kwargs={"server_default": text("120")}
+    )
+
     # FFmpeg path (empty string = use PATH)
     ffmpeg_path: str = ""
 

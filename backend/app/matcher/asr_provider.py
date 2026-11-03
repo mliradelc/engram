@@ -51,6 +51,10 @@ class NativeASRProvider(ASRProvider):
         return self._model.calculate_match_score(transcription, reference)
 
 
+class RemoteASRProvider(NativeASRProvider):
+    """Remote OpenAI-compatible ASR, built through the same ``create_asr_model`` factory."""
+
+
 factory_memo = {}
 
 
@@ -58,8 +62,18 @@ def get_asr_provider(
     model_type: str = "whisper",
     model_name: str | None = None,
     device: str | None = None,
+    remote_config: dict[str, Any] | None = None,
 ) -> ASRProvider:
-    """Factory to get or create an ASR provider."""
+    """Factory to get or create an ASR provider.
+
+    ``remote_config`` carries the ``create_asr_model`` settings of a remote model
+    (``base_url``, ``api_key``, ...). Other model types ignore it.
+    """
+    from app.matcher.asr_models import REMOTE_MODEL_TYPES
+
+    is_remote = model_type in REMOTE_MODEL_TYPES
+    remote_settings = (remote_config or {}) if is_remote else {}
+
     # Set default model names based on type if not provided
     if not model_name:
         if model_type in ("whisper", "faster-whisper", "openai-whisper"):
@@ -69,14 +83,14 @@ def get_asr_provider(
             model_type = "whisper"
             model_name = "small"
 
-    key = (model_type, model_name, device)
+    key = (model_type, model_name, device, tuple(sorted(remote_settings.items())))
     if key in factory_memo:
         return factory_memo[key]
 
-    config = {"type": model_type, "name": model_name}
+    config = {"type": model_type, "name": model_name, **remote_settings}
     if device:
         config["device"] = device
 
-    provider = NativeASRProvider(config)
+    provider = RemoteASRProvider(config) if is_remote else NativeASRProvider(config)
     factory_memo[key] = provider
     return provider

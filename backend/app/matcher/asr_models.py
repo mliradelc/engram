@@ -2,21 +2,33 @@
 ASR Model Abstraction Layer
 
 This module provides a unified interface for different Automatic Speech Recognition models,
-supporting OpenAI Whisper models via faster-whisper for efficient inference.
+supporting OpenAI Whisper models via faster-whisper for efficient inference, and any
+external service speaking the OpenAI-compatible ``/audio/transcriptions`` contract.
+
+Remote API key precedence: the configured ``api_key`` (``AppConfig.asr_remote_api_key``)
+wins; when it is blank the ``ASR_REMOTE_API_KEY`` environment variable is used, so the
+secret need not live in SQLite; when both are blank no Authorization header is sent.
 """
 
 import abc
+import hashlib
+import json
+import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import ctranslate2
+import httpx
 import librosa
 import numpy as np
 import psutil
 from loguru import logger
 from rapidfuzz import fuzz
 
+from app.core.errors import MatchingError
 from app.matcher.srt_utils import clean_text
 
 # Cache for loaded models to avoid reloading. Guarded by _model_cache_lock so that
@@ -28,6 +40,13 @@ _model_cache_lock = threading.Lock()
 
 # Conservative parallel-stream cap on GPU (VRAM auto-sizing is a future enhancement).
 GPU_WORKER_CAP = 4
+
+REMOTE_MODEL_TYPES = ("remote", "openai-compatible")
+DEFAULT_REMOTE_MODEL = "whisper-1"
+DEFAULT_REMOTE_TEXT_PATH = "text"
+REMOTE_API_KEY_ENV = "ASR_REMOTE_API_KEY"
+_REMOTE_ERROR_EXCERPT_CHARS = 200
+_BEARER_RE = re.compile(r"\bbearer\b\s*\S*", re.IGNORECASE)
 
 # Process-wide resolved ASR device, decided ONCE at startup (job_manager.start) after the
 # CUDA runtime is registered. Before this is set, callers fall back to the raw driver probe.
@@ -471,6 +490,184 @@ class FasterWhisperModel(ASRModel):
             return {"text": "", "raw_text": "", "segments": [], "language": "en"}
 
 
+class RemoteASRModel(ASRModel):
+    """
+    ASR through an external service's OpenAI-compatible ``POST .../audio/transcriptions``.
+
+    One call per audio chunk and one attempt per call: Engram already retries at the job
+    layer, and a second layer would multiply cost invisibly.
+
+    ``base_url`` is used as given apart from surrounding whitespace and a trailing slash,
+    and ``/audio/transcriptions`` is appended. All of these are accepted, and nothing is
+    guessed, so a server that serves under ``/v1`` must be configured with it:
+
+    - ``https://api.example.com/v1`` -> ``https://api.example.com/v1/audio/transcriptions``
+    - ``https://api.example.com/v1/`` -> ``https://api.example.com/v1/audio/transcriptions``
+    - ``http://192.168.1.5:9000`` -> ``http://192.168.1.5:9000/audio/transcriptions``
+    - ``http://192.168.1.5:9000/`` -> ``http://192.168.1.5:9000/audio/transcriptions``
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model_name: str = DEFAULT_REMOTE_MODEL,
+        api_key: str = "",
+        language: str | None = None,
+        text_path: str = DEFAULT_REMOTE_TEXT_PATH,
+        timeout_connect: float = 10.0,
+        timeout_read: float = 120.0,
+    ):
+        """
+        Initialize the remote model.
+
+        Args:
+            base_url: Service base URL (see the class docstring); required
+            model_name: Sent as the ``model`` form field
+            api_key: Bearer token; blank falls back to ``ASR_REMOTE_API_KEY``
+            language: Sent as the ``language`` form field; blank lets the server auto-detect
+            text_path: Dotted path to the transcript in the JSON response
+            timeout_connect: Connect timeout in seconds
+            timeout_read: Read timeout in seconds
+        """
+        normalized_url = (base_url or "").strip().rstrip("/")
+        if not normalized_url:
+            raise ValueError("remote ASR requires base_url")
+
+        super().__init__(model_name, device="remote")
+        self.base_url = normalized_url
+        self.endpoint = f"{normalized_url}/audio/transcriptions"
+        self.language = (language or "").strip() or None
+        self.text_path = text_path
+        self._api_key = (api_key or "").strip() or os.environ.get(REMOTE_API_KEY_ENV, "").strip()
+        self._timeout = httpx.Timeout(timeout_read, connect=timeout_connect)
+
+    def load(self) -> None:
+        """No weights to load: validate the config and mark the model ready."""
+        parsed = urlparse(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("remote ASR base_url must be an absolute http(s) URL")
+        self._model = True
+
+    def _redact(self, text: str) -> str:
+        """Strip the API key and any bearer credential from text bound for an error."""
+        if self._api_key:
+            text = text.replace(self._api_key, "***")
+        return _BEARER_RE.sub("***", text)
+
+    def _excerpt(self, response: httpx.Response) -> str:
+        return self._redact(response.text)[:_REMOTE_ERROR_EXCERPT_CHARS]
+
+    def _auth_headers(self) -> dict[str, str]:
+        # Omitted, not blank: a bare "Bearer " breaks some unauthenticated servers.
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
+
+    def _resolve_text(self, payload: dict) -> str:
+        """Read the transcript at ``text_path``.
+
+        A response without the default ``text`` field is a call that produced no text,
+        but an explicitly configured path that does not resolve is a misconfiguration,
+        so that raises and names what the response actually holds.
+        """
+        value = payload
+        for part in self.text_path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                keys = sorted(str(key) for key in payload)
+                if self.text_path == DEFAULT_REMOTE_TEXT_PATH:
+                    logger.warning(f"Remote ASR response has no 'text' field; keys: {keys}")
+                    return ""
+                raise MatchingError(
+                    f"Remote ASR text path '{self.text_path}' not found in response; "
+                    f"top-level keys: {keys}"
+                )
+            value = value[part]
+
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise MatchingError(
+                f"Remote ASR text path '{self.text_path}' holds "
+                f"{type(value).__name__}, not a string"
+            )
+        return value
+
+    def _parse_response(self, response: httpx.Response) -> str:
+        if not response.is_success:
+            raise MatchingError(
+                f"Remote ASR returned HTTP {response.status_code}: {self._excerpt(response)}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            return self._resolve_text(payload)
+
+        # A plain-text transcript may happen to parse as JSON ("123"), hence the dict check.
+        content_type = response.headers.get("content-type", "")
+        if content_type.lower().startswith("text/plain"):
+            return response.text
+        raise MatchingError(
+            f"Remote ASR returned an unusable response (Content-Type "
+            f"'{content_type}'): {self._excerpt(response)}"
+        )
+
+    def transcribe(self, audio_path: str | Path) -> dict:
+        """
+        Transcribe audio through the remote service.
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            Dictionary with 'text'; "" for a successful call with no speech
+
+        Raises:
+            MatchingError: On a non-2xx status, connection error, timeout or unusable body
+        """
+        if not self.is_loaded:
+            self.load()
+
+        path = Path(audio_path)
+        form = {"model": self.model_name, "response_format": "json"}
+        if self.language:
+            form["language"] = self.language
+        files = {"file": (path.name, path.read_bytes(), "audio/wav")}
+
+        # Raised outside the except block on purpose. The file log sink runs with
+        # diagnose=True, which prints the values of variables in traceback frames, and an
+        # httpx exception chain carries the headers (h11 quotes an illegal header value in
+        # its message). Only the redacted string may reach a traceback.
+        response = None
+        failure = ""
+        try:
+            response = httpx.post(
+                self.endpoint,
+                headers=self._auth_headers(),
+                data=form,
+                files=files,
+                timeout=self._timeout,
+            )
+        except (httpx.HTTPError, httpx.InvalidURL, UnicodeError) as e:
+            failure = f"Remote ASR request failed ({type(e).__name__}): {self._redact(str(e))}"
+        if response is None:
+            raise MatchingError(failure)
+
+        return {"text": self._parse_response(response)}
+
+
+def _remote_endpoint_id(base_url: str) -> str:
+    """Host of a remote ASR URL, plus any path that distinguishes it from other services.
+
+    Credentials embedded in the URL are dropped because this ends up in a persisted key.
+    A trailing ``/v1`` is dropped so the common forms of one URL share a key, while the
+    rest of the path is kept: two services behind one gateway differ only there.
+    """
+    parsed = urlparse(base_url.strip().rstrip("/"))
+    host = parsed.netloc.rpartition("@")[2] or "remote"
+    return f"{host}{parsed.path.removesuffix('/v1')}"
+
+
 def model_output_key(model_config: dict) -> str:
     """Return a stable string identifying the *output-affecting* ASR model configuration.
 
@@ -506,12 +703,23 @@ def model_output_key(model_config: dict) -> str:
     - ``cpu_threads`` — thread-pool size for BLAS ops inside CTranslate2; same model
       weights, same output.
 
+    **Remote models** have no local device or quantization. What changes their output is
+    the service, the model it runs and the language, so they key on those instead, and
+    can never share a transcript with a local model or with another endpoint.
+
     Returns:
         ``"{type}_{name}_{device}_{compute_type}"`` — underscore-joined, deterministic
-        across process restarts for the same effective configuration.
+        across process restarts for the same effective configuration. Remote models return
+        ``"remote_{host}_{name}_{language}"``.
     """
     model_type = model_config.get("type", "")
     model_name = model_config.get("name", "")
+
+    if model_type.lower() in REMOTE_MODEL_TYPES:
+        host = _remote_endpoint_id(model_config.get("base_url") or "")
+        remote_name = model_name or DEFAULT_REMOTE_MODEL
+        language = (model_config.get("language") or "").strip()
+        return f"remote_{host}_{remote_name}_{language or 'auto'}"
 
     # Resolve the effective device: honor explicit "cpu"/"cuda", fall back to the
     # startup-pinned value for "auto", None, or missing so that a config placeholder
@@ -566,9 +774,21 @@ def create_asr_model(model_config: dict) -> ASRModel:
         )
         return FasterWhisperModel("small", device, requested_workers=requested_workers)
 
+    elif model_type in REMOTE_MODEL_TYPES:
+        return RemoteASRModel(
+            base_url=model_config.get("base_url"),
+            model_name=model_name or DEFAULT_REMOTE_MODEL,
+            api_key=model_config.get("api_key") or "",
+            language=model_config.get("language") or None,
+            text_path=model_config.get("text_path") or DEFAULT_REMOTE_TEXT_PATH,
+            timeout_connect=model_config.get("timeout_connect", 10.0),
+            timeout_read=model_config.get("timeout_read", 120.0),
+        )
+
     else:
         raise ValueError(
-            f"Unsupported model type: {model_type}. Supported types: 'whisper', 'faster-whisper'"
+            f"Unsupported model type: {model_type}. "
+            "Supported types: 'whisper', 'faster-whisper', 'remote', 'openai-compatible'"
         )
 
 
@@ -582,12 +802,19 @@ def get_cached_model(model_config: dict) -> ASRModel:
     Returns:
         ASRModel instance (loaded and ready for use)
     """
-    device = model_config.get("device") or detect_asr_device()
-    runtime = resolve_asr_runtime(device, model_config.get("requested_workers", 1))
-    cache_key = (
-        f"{model_config.get('type', '')}_{model_config.get('name', '')}"
-        f"_{device}_w{runtime.workers}_t{runtime.cpu_threads}"
-    )
+    if str(model_config.get("type", "")).lower() in REMOTE_MODEL_TYPES:
+        # Every field selects a different service or credential, and the type/name key
+        # below would hand one endpoint's model to another. Hashed to keep the key out of
+        # anything that prints this cache.
+        identity = json.dumps(model_config, sort_keys=True, default=str)
+        cache_key = f"remote_{hashlib.sha256(identity.encode()).hexdigest()}"
+    else:
+        device = model_config.get("device") or detect_asr_device()
+        runtime = resolve_asr_runtime(device, model_config.get("requested_workers", 1))
+        cache_key = (
+            f"{model_config.get('type', '')}_{model_config.get('name', '')}"
+            f"_{device}_w{runtime.workers}_t{runtime.cpu_threads}"
+        )
 
     # Hold the lock across check-create-store so exactly one thread builds the shared
     # model per cache_key; the rest block, then reuse it. First-load contention is the

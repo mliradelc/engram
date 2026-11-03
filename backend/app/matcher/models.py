@@ -74,8 +74,16 @@ class Config(BaseModel):
     min_confidence: float = 0.7
 
     # Provider settings
-    asr_provider: Literal["whisper", "parakeet"] = "whisper"  # parakeet kept for migration
+    # parakeet kept for migration
+    asr_provider: Literal["whisper", "parakeet", "remote"] = "whisper"
     asr_model_name: str = "small"
+    # Remote ASR (OpenAI-compatible /audio/transcriptions); used when asr_provider is "remote"
+    asr_remote_base_url: str = ""
+    asr_remote_model: str = "whisper-1"
+    asr_remote_language: str = ""
+    asr_remote_api_key: str = Field(default="", repr=False)
+    asr_remote_text_path: str = "text"
+    asr_remote_timeout_read: int = 120
     sub_provider: Literal["opensubtitles", "local"] = "opensubtitles"
 
     @model_validator(mode="before")
