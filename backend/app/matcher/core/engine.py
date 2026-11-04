@@ -146,9 +146,22 @@ class MatchEngineV2:
         logger.info(
             f"Initializing ASR provider: {config.asr_provider} with model: {config.asr_model_name}"
         )
+        # A remote provider is useless without its endpoint settings: without this the
+        # factory receives no base_url and silently builds a model that cannot transcribe.
+        remote_config = None
+        if config.asr_provider == "remote":
+            remote_config = {
+                "base_url": config.asr_remote_base_url,
+                "model": config.asr_remote_model,
+                "language": config.asr_remote_language,
+                "api_key": config.asr_remote_api_key,
+                "text_path": config.asr_remote_text_path,
+                "timeout_read": config.asr_remote_timeout_read,
+            }
         self.asr = get_asr_provider(
             model_type=config.asr_provider,
             model_name=config.asr_model_name,
+            remote_config=remote_config,
         )
         # Pre-load the model to avoid repeated loading delays
         self.asr.load()
