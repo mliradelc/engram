@@ -178,12 +178,13 @@ class ASRModel(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def transcribe(self, audio_path: str | Path) -> dict:
+    def transcribe(self, audio_path: str | Path, language: str | None = "en") -> dict:
         """
         Transcribe audio file.
 
         Args:
             audio_path: Path to audio file
+            language: Whisper language code; None lets Whisper detect it
 
         Returns:
             Dictionary with at least 'text' key containing transcription
@@ -423,12 +424,14 @@ class FasterWhisperModel(ASRModel):
 
         return clean_text(text)
 
-    def transcribe(self, audio_path: str | Path) -> dict:
+    def transcribe(self, audio_path: str | Path, language: str | None = "en") -> dict:
         """
         Transcribe audio using Faster Whisper.
 
         Args:
             audio_path: Path to audio file
+            language: Whisper language code (``whisper_language``); None lets
+                Whisper detect it
 
         Returns:
             Dictionary with 'text', 'raw_text', 'segments', and 'language'
@@ -445,7 +448,7 @@ class FasterWhisperModel(ASRModel):
             # Transcribe with faster-whisper
             segments, info = self._model.transcribe(
                 audio,
-                language="en",  # Force English for TV episode matching
+                language=language,  # Forced: the matching references are in one language
                 beam_size=5,
                 best_of=5,
                 temperature=0.0,  # Greedy decoding for consistency
@@ -668,7 +671,21 @@ def _remote_endpoint_id(base_url: str) -> str:
     return f"{host}{parsed.path.removesuffix('/v1')}"
 
 
-def model_output_key(model_config: dict) -> str:
+def whisper_language(code: str) -> str | None:
+    """Whisper's code for a normalized language code, or None when Whisper lacks it.
+
+    Whisper knows Norwegian only as "no"; ``app/core/languages.py`` keeps Bokmal
+    as "nb". None makes Whisper detect the language instead of forcing a wrong one.
+    """
+    code = {"nb": "no"}.get(code, code)
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+    except Exception:  # noqa: BLE001 - a private table that may move; trust the code
+        return code
+    return code if code in _LANGUAGE_CODES else None
+
+
+def model_output_key(model_config: dict, language: str = "en") -> str:
     """Return a stable string identifying the *output-affecting* ASR model configuration.
 
     This key is designed for use as the ``model_key`` component of a persistent
@@ -703,13 +720,18 @@ def model_output_key(model_config: dict) -> str:
     - ``cpu_threads`` — thread-pool size for BLAS ops inside CTranslate2; same model
       weights, same output.
 
+    - ``language``: the language the model is told to transcribe in. For Whisper,
+      English keeps the four-part key, so every transcript cached before languages
+      existed still hits; any other language appends ``"_{language}"``.
+
     **Remote models** have no local device or quantization. What changes their output is
     the service, the model it runs and the language, so they key on those instead, and
     can never share a transcript with a local model or with another endpoint.
 
     Returns:
         ``"{type}_{name}_{device}_{compute_type}"`` — underscore-joined, deterministic
-        across process restarts for the same effective configuration. Remote models return
+        across process restarts for the same effective configuration. Any language
+        but English appends ``"_{language}"``. Remote models return
         ``"remote_{host}_{name}_{language}"``.
     """
     model_type = model_config.get("type", "")
@@ -737,7 +759,8 @@ def model_output_key(model_config: dict) -> str:
     else:
         compute_type = "int8"
 
-    return f"{model_type}_{model_name}_{device}_{compute_type}"
+    key = f"{model_type}_{model_name}_{device}_{compute_type}"
+    return key if language == "en" else f"{key}_{language}"
 
 
 def create_asr_model(model_config: dict) -> ASRModel:

@@ -4,6 +4,37 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-11-08
+
+_Highlights: shows in other languages are now matched in their own language; the re-identify dialog offers All seasons; TV discs with no known season get the TheTVDB numbering check and subtitle retries on Re-match all; and two ranking fixes sharpen German-show matches._
+
+### Added
+
+- **Shows in other languages can be matched in their own language.** A show whose original language is not English (German, French, Japanese, ...) used to go to review track by track whenever a track had no English audio. Engram now also downloads the show's subtitles in its original language, and a track without English audio is transcribed from its original-language audio and matched against them, so the tracks of a German show on a German disc are matched to their episodes like an English show's; a track it is less sure of goes to review as usual. A track with English audio, including an English dub, is still matched in English exactly as before, and so is every show whose original-language subtitles cover less than 80% of the season. Japanese, Chinese and Thai matches always go to review for now. The review page names the language a track was matched in (#843, #844, #845, thanks @wintheriscomming!).
+
+### Fixed
+
+- The re-identify dialog no longer forces season 1. TV discs now get an **All seasons** checkbox beside the season number, so a multi-season disc can be matched against every season's references instead of season 1 only. It starts ticked for a disc whose season was never known, and a blank season field also means all seasons. Picking a same-name show from **Did you mean?** keeps the disc's season, or all seasons when it has none. The re-identify and set-name APIs take a new `all_seasons: true` flag to clear a season that was set before; leaving `season` out still keeps it, so older clients behave as they did (#874).
+- A TV disc with no season (a flat import folder, or "match across all seasons") now gets the same TheTVDB numbering check as a disc with one. Engram compares every season it downloads references for, and when TMDB and TheTVDB number one of them differently (Justice League season 1: 24 episodes against 26) the review page suggests TheTVDB order. A show you already moved to TheTVDB order is matched in it for every season. If TheTVDB cannot supply any one of those seasons, the disc stays on TMDB numbering rather than mixing the two (#876).
+- "Re-match all" now retries a failed reference-subtitle download for a TV disc with no season ("match across all seasons"). Before, only discs with a known season were retried, so the re-match ran against the same missing references and landed back in review. It now cancels the failed download and fetches every season before matching starts (#875).
+- One stray chunk vote no longer drags a correctly matched track's confidence to near zero. Engram picked the episode whose chunk votes had the highest average score, so a single vote for the wrong episode with a slightly higher score tied or beat a run of votes for the right one (19 against 1 calibrated to 0.003) and the track went to review. The winner, its confidence and the runner-ups shown on the review page now come from the summed score of each episode's votes, so agreement across many chunks counts (#842, thanks @wintheriscomming!).
+- When OpenSubtitles offers several subtitles for an episode, Engram now downloads the most reputable one: files from trusted uploaders and with more downloads first, machine- and AI-translated files only as a last resort. It used to take whichever the search listed first, which for a German show was a machine translation from Hungarian whose wording no longer followed the dialogue, and the episode lost most of its matching votes (#841, thanks @wintheriscomming!).
+
+## [0.44.1] - 2026-11-07
+
+_Highlights: TheTVDB episode numbering is now reachable for TV discs in review, plus a round of dashboard and setup polish: per-disc activity log lines, separate ripped and matched track counts, and a first-run welcome._
+
+### Fixed
+
+- TheTVDB episode numbering can now be reached for a TV disc in review. Correcting a disc's identity by typing a show name (without picking a search result) could bind the TV disc to a same-named movie (Justice League the 2001 series lost to the 2017 film on popularity), so Engram never linked the show to TheTVDB and never suggested its numbering. The lookup now searches the type you chose, a correction to a different show or season starts that show's numbering decision fresh, and while a TheTVDB key is configured the review page's **Episode ordering** selector offers **TheTVDB** for any disc in review, not only when the two catalogues were detected to differ. The Settings text now says what the key does: on its own it changes nothing (#862).
+- A TV re-identify sent to the API with no season now downloads reference subtitles for every season of the corrected show, as naming an unreadable disc and answering mid-rip already did. Before, it started no download at all. The re-identify dialog still sends season 1 when the field is blank; offering "All seasons" there is tracked in #874 (#873).
+- The setup wizard and Settings open each step or section scrolled to the top, checkbox descriptions read as normal sentence text instead of tracked capitals, and the inline action buttons (Test Token, Enable GPU acceleration) now have proper button styling with a visible keyboard focus ring (#725, #739, thanks @sinaiko0212!).
+- The dashboard card shows ripped and matched track counts separately during a rip, so matched tracks no longer make the old TRACKS counter look further along than the rip is (#717, #740, thanks @sinaiko0212!).
+- The dashboard activity log now names the disc on every track event (for example `OFFICE_S2D3 · T07`), so two discs ripping at once no longer interleave anonymous `T03` / `T07` lines. Long labels are shortened, and a disc with no label falls back to `JOB <id>` (#719).
+- A brand-new install no longer greets you with "All operations complete". With no job history, the dashboard now welcomes you and offers both ways in: insert a disc, or **Import** rips and disc backups you already have, plus a Getting started link. The old empty-state text returns as soon as any job exists (#721).
+- In Settings, a library or staging folder that doesn't exist yet is no longer shown as a red error. It now reads "Will be created on first use" in a neutral tone, and the server only says so when it can keep the promise: the nearest existing parent folder must be writable. A missing folder under an unwritable parent, or beneath a file, is still an error (#724).
+- One OpenSubtitles result whose file the server no longer serves ("Invalid file_id") no longer stops the subtitle download for the whole season. Engram skips that upload, tries the next one for the episode, and does not retry the dead one (#857).
+
 ## [0.44.0] - 2026-10-25
 
 _Highlights: episode titles in file names (`{episode_title}`), and manual assignment of one track to several consecutive episodes on the review page, for discs that hold two cartoon segments per track._

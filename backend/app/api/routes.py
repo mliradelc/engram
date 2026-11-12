@@ -20,7 +20,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -852,6 +852,7 @@ async def get_season_roster(
     season_num = effective_season
     # Imported here (not at module level) so tests can patch season_episodes.
     from app.core.episode_namespace import NAMESPACE_TVDB, namespace_context, season_episodes
+    from app.core.match_language import match_language_context
     from app.services.config_service import get_config
 
     config = await get_config()
@@ -903,8 +904,8 @@ async def get_season_roster(
     cache_dir = Path(config.subtitles_cache_path).expanduser()
     episode_numbers = [ep["episode_number"] for ep in episodes_raw]
     try:
-        # Bound so the scan reads the namespace's own reference folder.
-        with namespace_context(namespace):
+        # Bound so the scan reads the job's own reference folder.
+        with namespace_context(namespace), match_language_context(job.match_language):
             coverage = await asyncio.to_thread(
                 reference_coverage,
                 cache_dir,
@@ -990,6 +991,23 @@ async def get_season_roster(
                 if option.get("ordering") != "tvdb":
                     option["projection"] = {}
                     option["diverges"] = False
+    elif job.state == JobState.REVIEW_NEEDED and tvdb_client.resolve_api_key(config):
+        # With a key configured, a disc in review can always be moved to
+        # TheTVDB numbering. The divergence check above is one-shot and silent:
+        # it runs only when a subtitle download starts, and finds nothing when
+        # TheTVDB or the show link was unavailable at that moment, which left
+        # the user no way to reach the switch (#862). Offered without claiming
+        # divergence; the switch itself reports a TheTVDB failure.
+        ordering_data["options"].append(
+            {
+                "ordering": "tvdb",
+                "label": "TheTVDB",
+                "tmdb_type": 0,
+                "diverges": False,
+                "projection": {},
+            }
+        )
+        ordering_data["available"] = True
 
     from app.models.show_ordering import ShowOrderingPreference
 
@@ -1100,10 +1118,11 @@ async def preview_manual_subtitles(
     cache_dir = Path(config.subtitles_cache_path).expanduser()
 
     from app.core.episode_namespace import namespace_context
+    from app.core.match_language import match_language_context
 
     # Classified against the job's numbering, so a TVDB job's upload is checked
     # against (and later filed into) its TVDB-numbered reference folder.
-    with namespace_context(job.episode_namespace):
+    with namespace_context(job.episode_namespace), match_language_context(job.match_language):
         results = await asyncio.to_thread(
             classify_files,
             cache_dir,
@@ -1143,9 +1162,10 @@ async def commit_manual_subtitles(
     cache_dir = Path(config.subtitles_cache_path).expanduser()
 
     from app.core.episode_namespace import namespace_context
+    from app.core.match_language import match_language_context
 
     # Filed in the job's numbering (see preview_manual_subtitles).
-    with namespace_context(job.episode_namespace):
+    with namespace_context(job.episode_namespace), match_language_context(job.match_language):
         outcomes = await asyncio.to_thread(
             commit_files,
             cache_dir,
@@ -1210,6 +1230,9 @@ async def build_job_detail(job: DiscJob, session: AsyncSession) -> dict:
         "episode_namespace": job.episode_namespace or "tmdb",
         "episode_namespace_note": job.episode_namespace_note,
         "tvdb_divergence_json": job.tvdb_divergence_json,
+        "content_language": job.content_language,
+        "match_language": job.match_language,
+        "match_language_note": job.match_language_note,
         "classification_source": job.classification_source,
         "classification_confidence": job.classification_confidence,
         "tmdb_id": job.tmdb_id,
@@ -1596,12 +1619,29 @@ async def submit_review_batch(
     return {"status": "reviewed", "job_id": job.id, "count": len(decisions)}
 
 
-class SetNameRequest(BaseModel):
+class _SeasonAnswer(BaseModel):
+    """The season half of an identity answer (#874).
+
+    ``season`` omitted or null leaves the job's season as it is (what clients
+    that predate ``all_seasons`` send). ``all_seasons: true`` clears it so a TV
+    job matches across every season; it cannot be combined with a season.
+    """
+
+    season: int | None = None
+    all_seasons: bool = False
+
+    @model_validator(mode="after")
+    def _season_xor_all_seasons(self):
+        if self.all_seasons and self.season is not None:
+            raise ValueError("Pass either a season or all_seasons, not both")
+        return self
+
+
+class SetNameRequest(_SeasonAnswer):
     """Request model for setting a user-provided name on an unlabeled disc."""
 
     name: str
     content_type: str  # "tv" | "movie" | "unknown"
-    season: int | None = None
 
 
 @router.post("/jobs/{job_id}/set-name")
@@ -1621,7 +1661,9 @@ async def set_job_name(
     from app.services.job_manager import job_manager
 
     try:
-        await job_manager.set_name_and_resume(job.id, req.name, req.content_type, req.season)
+        await job_manager.set_name_and_resume(
+            job.id, req.name, req.content_type, req.season, all_seasons=req.all_seasons
+        )
     except ValueError as e:
         # TOCTOU: the state check above read a snapshot; the coordinator
         # re-validates on a fresh row and raises if the job moved on (e.g.
@@ -1630,12 +1672,11 @@ async def set_job_name(
     return {"status": "ok", "job_id": job.id}
 
 
-class ReIdentifyRequest(BaseModel):
+class ReIdentifyRequest(_SeasonAnswer):
     """Request model for re-identifying a disc with corrected metadata."""
 
     title: str
     content_type: str  # "tv" | "movie"
-    season: int | None = None
     tmdb_id: int | None = None
 
 
@@ -1662,7 +1703,12 @@ async def re_identify_job(
 
     try:
         await job_manager.re_identify_job(
-            job.id, req.title, req.content_type, req.season, req.tmdb_id
+            job.id,
+            req.title,
+            req.content_type,
+            req.season,
+            req.tmdb_id,
+            all_seasons=req.all_seasons,
         )
     except ValueError as e:
         # TOCTOU: the state check above read a snapshot; the coordinator
@@ -3222,6 +3268,19 @@ class ImportStartResponse(BaseModel):
     blocked: list[BlockedImportUnit]
 
 
+def _probe(check, p: Path) -> bool:
+    """Run a filesystem predicate, treating an OSError as "no".
+
+    ``Path.exists``/``is_dir`` only swallow a few errnos. A stale or
+    unreadable Windows drive raises others (WinError 87, "The parameter is
+    incorrect"), which would turn a bad user-picked path into a 500.
+    """
+    try:
+        return check(p)
+    except OSError:
+        return False
+
+
 @router.get("/import/browse", dependencies=[Depends(require_localhost_or_lan)])
 async def import_browse(path: str = "") -> dict:
     """Read-only directory listing for the manual-import picker.
@@ -3257,7 +3316,7 @@ async def import_browse(path: str = "") -> dict:
         p = Path(path).expanduser().resolve()
     except OSError as exc:
         raise HTTPException(status_code=400, detail="Invalid path") from exc
-    if not p.exists() or not p.is_dir():
+    if not _probe(Path.exists, p) or not _probe(Path.is_dir, p):
         raise HTTPException(status_code=400, detail=f"Not a directory: {path}")
 
     entries: list[dict] = []
@@ -3309,7 +3368,7 @@ async def import_preview(req: ImportPathRequest) -> dict:
     # resolve() collapses .. and symlinks before the path reaches the scanner
     # (mirrors import_browse), so a caller can't pick a traversal/symlink root.
     p = Path(req.path).expanduser().resolve()
-    if not p.exists():
+    if not _probe(Path.exists, p):
         raise HTTPException(status_code=400, detail=f"Path does not exist: {req.path}")
 
     scan = await asyncio.to_thread(import_scanner.scan, p)
@@ -3360,7 +3419,7 @@ async def import_start(req: ImportStartRequest) -> ImportStartResponse:
     # resolve() collapses .. and symlinks before the path reaches the scanner
     # (mirrors import_browse), so a caller can't pick a traversal/symlink root.
     p = Path(req.path).expanduser().resolve()
-    if not p.exists():
+    if not _probe(Path.exists, p):
         raise HTTPException(status_code=400, detail=f"Path does not exist: {req.path}")
 
     scan = await asyncio.to_thread(import_scanner.scan, p)
@@ -5046,10 +5105,11 @@ async def _run_llm_match_for_title(*, title: "DiscTitle", job: "DiscJob") -> LLM
         return LLMMatchOutcome.failed("transcription_failed")
 
     from app.core.episode_namespace import namespace_context
+    from app.core.match_language import match_language_context
 
     # The candidate episode list comes from season_episodes, so binding the job's
     # namespace offers (and answers in) TVDB numbering for a TVDB job.
-    with namespace_context(job.episode_namespace):
+    with namespace_context(job.episode_namespace), match_language_context(job.match_language):
         transcript = await asyncio.to_thread(episode_curator._matcher.transcribe_full, file_path)
         if not transcript:
             return LLMMatchOutcome.failed("transcription_failed")
