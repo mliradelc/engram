@@ -32,6 +32,8 @@ from app.services.matching_coordinator import (
 
 logger = logging.getLogger(__name__)
 
+from app.services import av1_hook  # noqa: E402  (post-organize AV1 hook)
+
 
 _MATCHER_REFUSAL_CODES = {REFERENCES_UNREADABLE_ERROR_CODE, AUDIO_LANGUAGE_ERROR_CODE}
 
@@ -2367,6 +2369,9 @@ class FinalizationCoordinator:
                             disc_title.episode_group_id = ordering_group_id
                         disc_title.state = TitleState.COMPLETED
                         logger.info(f"Organized: {org_result['final_path']}")
+                        await asyncio.to_thread(
+                            av1_hook.after_organize, org_result.get("final_path")
+                        )
                     elif org_result.get("error_code") == "FILE_EXISTS":
                         conflict_count += 1
                         disc_title.state = TitleState.REVIEW
@@ -2613,6 +2618,9 @@ class FinalizationCoordinator:
                         disc_title.episode_group_id = ordering_group_id
                     disc_title.state = TitleState.COMPLETED
                     logger.info(f"Organized: {org_result['final_path']}")
+                    await asyncio.to_thread(
+                        av1_hook.after_organize, org_result.get("final_path")
+                    )
                 elif org_result.get("error_code") == "FILE_EXISTS":
                     conflict_count += 1
                     disc_title.state = TitleState.REVIEW
