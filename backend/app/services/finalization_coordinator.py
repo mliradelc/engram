@@ -34,7 +34,6 @@ logger = logging.getLogger(__name__)
 
 from app.services import av1_hook  # noqa: E402  (post-organize AV1 hook)
 
-
 _MATCHER_REFUSAL_CODES = {REFERENCES_UNREADABLE_ERROR_CODE, AUDIO_LANGUAGE_ERROR_CODE}
 
 
