@@ -74,6 +74,7 @@ class ConfigUpdate(BaseModel):
     ai_api_key: str | None = None
     ai_model: str | None = None
     ai_local_base_url: str | None = None
+    ai_custom_base_url: str | None = None
     ai_episode_matching_enabled: bool | None = None
     # Staging watcher
     staging_watch_enabled: bool | None = None
@@ -179,6 +180,23 @@ async def validate_config_update(update_data: dict, *, probe_paths: bool = True)
                 detail=(
                     "ai_local_base_url must be a plain http(s) URL with no credentials "
                     "or query string, such as 'http://localhost:11434/v1'"
+                ),
+            )
+
+    # The custom endpoint is validated on write for the same reason: the server
+    # will issue real requests to it, so an unchecked value is a request-forgery
+    # primitive. Same guard as the local one — it permits loopback and private
+    # hosts (a gateway on the LAN is legitimate) while refusing credentials,
+    # queries, traversal and metadata hosts.
+    if update_data.get("ai_custom_base_url"):
+        from app.core.security import is_safe_local_ai_url
+
+        if not is_safe_local_ai_url(update_data["ai_custom_base_url"]):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "ai_custom_base_url must be a plain http(s) URL with no credentials "
+                    "or query string, such as 'https://api.example.com/v1'"
                 ),
             )
 

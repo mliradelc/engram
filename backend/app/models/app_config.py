@@ -213,13 +213,15 @@ class AppConfig(SQLModel, table=True):
 
     # AI-powered disc identification
     ai_identification_enabled: bool = False  # Enable AI-powered title resolution
-    # "anthropic" | "openai" | "openrouter" | "gemini" | "ollama" | "lmstudio"
+    # "anthropic" | "openai" | "openrouter" | "gemini" | "ollama" | "lmstudio" | "custom"
     ai_provider: str = "anthropic"
     ai_api_key: str = ""  # API key for the selected provider
     # Optional model override; "" means "use ai_client.DEFAULT_MODELS[provider]".
     # Exists because a key is not guaranteed access to the default model — a
     # Gemini key whose project cannot see gemini-2.5-flash-lite gets a 404, and
     # without this field there is no way to point Engram at a model it can use.
+    # Required (not optional) for the local and custom providers, which have no
+    # default.
     ai_model: str = ""
     # Base URL for a local AI server (ollama / lmstudio only). "" means "use the
     # slug's conventional default port", which is what makes the common case
@@ -227,6 +229,12 @@ class AppConfig(SQLModel, table=True):
     # config_service, because clearing it back to the default is a legitimate
     # action and that set exists to prevent blanking.
     ai_local_base_url: str = ""
+    # Base URL for the custom provider: any OpenAI-compatible endpoint the user
+    # supplies. Kept separate from ai_local_base_url because the two have
+    # different defaults and different lifetimes — switching between a local
+    # server and a custom gateway must not carry one address over to the other.
+    # Required when ai_provider == "custom"; blank is a configuration error.
+    ai_custom_base_url: str = ""
     ai_episode_matching_enabled: bool = (
         False  # Enable LLM-based episode identification fallback (uses ai_provider/ai_api_key)
     )

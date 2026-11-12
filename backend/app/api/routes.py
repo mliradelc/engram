@@ -377,6 +377,7 @@ class ConfigResponse(BaseModel):
     ai_api_key: str
     ai_model: str
     ai_local_base_url: str
+    ai_custom_base_url: str
     ai_episode_matching_enabled: bool
     # Staging watcher
     staging_watch_enabled: bool
@@ -2011,6 +2012,9 @@ async def get_config() -> ConfigResponse:
         ai_model=config.ai_model or "",
         # Not a secret; the wizard must round-trip it to show the endpoint in use.
         ai_local_base_url=config.ai_local_base_url or "",
+        # Not a secret either; the custom provider's endpoint, kept separate from
+        # the local one so switching between them does not carry an address over.
+        ai_custom_base_url=config.ai_custom_base_url or "",
         ai_episode_matching_enabled=config.ai_episode_matching_enabled,
         # Staging watcher
         staging_watch_enabled=config.staging_watch_enabled,
@@ -5124,6 +5128,7 @@ async def _run_llm_match_for_title(*, title: "DiscTitle", job: "DiscJob") -> LLM
                 ai_api_key=config.ai_api_key,
                 ai_model=getattr(config, "ai_model", "") or None,
                 ai_local_base_url=getattr(config, "ai_local_base_url", "") or "",
+                ai_custom_base_url=getattr(config, "ai_custom_base_url", "") or "",
                 tmdb_api_key=config.tmdb_api_key,
                 raise_on_error=True,
             )

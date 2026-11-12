@@ -37,10 +37,13 @@ async def identify_from_label(
     """Send volume label to an LLM to identify the disc content.
 
     ``model`` is the user's optional override (AppConfig.ai_model); None means
-    the provider default.
+    the provider default. It is required for the local and custom providers,
+    which have no default.
 
-    ``base_url`` is the user's local-server endpoint (AppConfig.ai_local_base_url).
-    It applies only to the local providers; blank means the slug's default port.
+    ``base_url`` is the endpoint for a provider that needs one: the local
+    server's address (AppConfig.ai_local_base_url) or the custom provider's
+    (AppConfig.ai_custom_base_url). Callers pass whichever applies; use
+    ``resolve_ai_base_url`` to pick it from the config row.
 
     Returns dict with keys: title, year, type (or None on failure).
     """

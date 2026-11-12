@@ -1,10 +1,11 @@
 """Shared AI client for structured-JSON completions across providers.
 
-Wraps anthropic, openai, openrouter, gemini, and the local servers (ollama,
-lmstudio) behind a single `complete_json` entry point. Each provider adapter
-handles its own authentication and structured-JSON convention (prompt-only for
-anthropic, response_format for openai/openrouter and the local servers, which
-speak the same OpenAI-compatible contract, responseSchema for gemini).
+Wraps anthropic, openai, openrouter, gemini, the local servers (ollama,
+lmstudio) and a user-supplied custom endpoint behind a single `complete_json`
+entry point. Each provider adapter handles its own authentication and
+structured-JSON convention (prompt-only for anthropic, response_format for
+openai/openrouter, the local servers and the custom endpoint, which speak the
+same OpenAI-compatible contract, responseSchema for gemini).
 """
 
 import asyncio
@@ -39,6 +40,18 @@ DEFAULT_MODELS = {
 # must not each hardcode the slug list.
 LOCAL_PROVIDERS = frozenset({"ollama", "lmstudio"})
 
+# A user-supplied endpoint speaking the OpenAI chat-completions contract: any
+# gateway, proxy, or hosted service that is not one of the built-in slugs. It
+# exists because the built-in list cannot cover every provider, and because the
+# Gemini adapter is tied to Google's own request shape.
+#
+# It is deliberately NOT in LOCAL_PROVIDERS: a custom endpoint is usually remote
+# and authenticated, so it needs a key like the hosted slugs do. It is also NOT
+# in DEFAULT_MODELS, because there is no sensible default model for an endpoint
+# we know nothing about — the model is required, exactly as for the local slugs.
+CUSTOM_PROVIDER = "custom"
+CUSTOM_PROVIDERS = frozenset({CUSTOM_PROVIDER})
+
 LOCAL_DEFAULT_BASE_URLS = {
     "ollama": "http://localhost:11434/v1",
     "lmstudio": "http://localhost:1234/v1",
@@ -48,7 +61,7 @@ LOCAL_DEFAULT_BASE_URLS = {
 # correct default, because the answer depends on which weights the user pulled.
 # That means DEFAULT_MODELS can no longer double as the set of providers that
 # exist, which is what this is for.
-KNOWN_PROVIDERS = frozenset(DEFAULT_MODELS) | LOCAL_PROVIDERS
+KNOWN_PROVIDERS = frozenset(DEFAULT_MODELS) | LOCAL_PROVIDERS | CUSTOM_PROVIDERS
 
 
 def resolve_local_base_url(provider: str, configured: str) -> str:
@@ -65,6 +78,58 @@ def resolve_local_base_url(provider: str, configured: str) -> str:
     return url.rstrip("/")
 
 
+def resolve_custom_base_url(configured: str) -> str:
+    """Base URL for the custom provider, trailing slash stripped.
+
+    Returns "" when unset, which callers treat as a configuration error: unlike
+    the local slugs there is no conventional default to fall back to, because the
+    whole point of this provider is that the endpoint is the user's choice.
+    """
+    return (configured or "").strip().rstrip("/")
+
+
+def resolve_ai_base_url(
+    provider: str, local_base_url: str = "", custom_base_url: str = ""
+) -> str:
+    """The base URL ``complete_json`` needs for this provider, or "".
+
+    Call sites hold one config row with two separate address fields, because a
+    local server and a custom gateway must not share one. This picks the right
+    one so no caller has to branch on the provider, and so adding a future
+    provider with its own address is a change in one place rather than five.
+
+    Remote built-ins (anthropic, openai, openrouter, gemini) have fixed URLs and
+    return "".
+    """
+    if provider in CUSTOM_PROVIDERS:
+        return resolve_custom_base_url(custom_base_url)
+    if provider in LOCAL_PROVIDERS:
+        return resolve_local_base_url(provider, local_base_url)
+    return ""
+
+
+def custom_chat_completions_url(base_url: str) -> str:
+    """The chat-completions URL for a custom endpoint.
+
+    Users paste the base URL they would give any OpenAI-compatible client, which
+    may or may not already end in ``/v1`` and may or may not already include the
+    full path. All three forms are accepted rather than guessed at:
+
+    - ``https://api.example.com/v1``  -> ``.../v1/chat/completions``
+    - ``https://api.example.com``     -> ``.../chat/completions``
+    - ``https://api.example.com/v1/chat/completions`` -> unchanged
+
+    Appending blindly to the last form would produce ``.../chat/completions
+    /chat/completions``, a 404 that reads like a broken key.
+    """
+    url = resolve_custom_base_url(base_url)
+    if not url:
+        return ""
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
+
+
 def ai_is_configured(provider: str, api_key: str) -> bool:
     """True if this provider has what it needs to make a call.
 
@@ -72,8 +137,13 @@ def ai_is_configured(provider: str, api_key: str) -> bool:
     disable them at every call site that guards on one. Four such gates exist
     (this module, curator, matching_coordinator, identification_coordinator);
     they all call this rather than testing the key directly.
+
+    The custom provider is treated as authenticated: many self-hosted gateways
+    sit behind no key at all, and requiring one here would disable them at every
+    gate. Whether a key is actually needed is answered by the request itself —
+    a 401 classifies as ``bad_key`` with an actionable message.
     """
-    return provider in LOCAL_PROVIDERS or bool(api_key)
+    return provider in LOCAL_PROVIDERS or provider in CUSTOM_PROVIDERS or bool(api_key)
 
 
 _TIMEOUT_SECONDS = 30.0
@@ -134,6 +204,7 @@ _PROVIDER_LABELS = {
     "gemini": "Gemini",
     "ollama": "Ollama",
     "lmstudio": "LM Studio",
+    "custom": "Your custom endpoint",
 }
 
 # Human sentences per cause. Rendered verbatim in the UI, so they must be
@@ -201,6 +272,40 @@ _LOCAL_BLANK_MODEL_MESSAGE = (
     "answer depends on which models you have installed."
 )
 
+# The custom endpoint gets the local wording's endpoint-naming but the remote
+# wording's auth/billing vocabulary, because it is usually a remote service with
+# a key. {url} is the resolved base URL, {provider} the display label.
+_CUSTOM_CAUSE_MESSAGES: dict[ProviderErrorCode, str] = {
+    "bad_key": (
+        "Your custom endpoint rejected the API key (HTTP 401/403). Check the key "
+        "belongs to {url} and is copied in full."
+    ),
+    "no_credits": "Your custom endpoint at {url} reports the account is out of credit or quota.",
+    "rate_limited": "Your custom endpoint at {url} is rate limiting this key. Wait a moment.",
+    "model_unavailable": (
+        "Your custom endpoint at {url} does not offer the model '{model}'. "
+        "Check the model id it expects — it must match the provider's own name exactly."
+    ),
+    "bad_request": (
+        "Your custom endpoint rejected the request. The most common cause is a "
+        "model id it does not recognise, or an endpoint that does not implement "
+        "the OpenAI chat-completions API."
+    ),
+    "network": (
+        "Could not reach your custom endpoint at {url}. Check the address, the port, "
+        "and that the service is running."
+    ),
+    "timeout": "Your custom endpoint at {url} did not respond in time.",
+    "unknown": "Your custom endpoint at {url} returned an unexpected error.",
+}
+
+# Hard stop when the custom provider is selected with no address. There is no
+# default to fall back to, so this is a configuration error, not a fallback.
+_CUSTOM_BLANK_URL_MESSAGE = (
+    "Set the endpoint address for the custom AI provider. It must be the base URL "
+    "of an OpenAI-compatible service, such as https://api.example.com/v1."
+)
+
 
 def classify_provider_error(
     provider: str,
@@ -231,6 +336,11 @@ def classify_provider_error(
         code = "unknown"
 
     label = _PROVIDER_LABELS.get(provider, provider)
+    if provider in CUSTOM_PROVIDERS:
+        # Naming the endpoint is what makes these actionable: the user chose the
+        # address, so "could not reach https://x/v1" beats "check the connection".
+        template = _CUSTOM_CAUSE_MESSAGES.get(code, _CUSTOM_CAUSE_MESSAGES["unknown"])
+        return code, template.format(provider=label, url=base_url or "(not set)", model=model or "(none set)")
     if provider in LOCAL_PROVIDERS:
         template = _LOCAL_CAUSE_MESSAGES.get(code, _LOCAL_CAUSE_MESSAGES["unknown"])
         pull = _LOCAL_PULL_HINTS.get(provider, "").format(model=model or "the model")
@@ -405,9 +515,11 @@ async def complete_json(
     ``retries`` and ``timeout`` let a caller (e.g. a "test connection"
     pre-flight check) fail fast instead of paying the full backoff ladder.
 
-    ``base_url`` applies only to the local providers (ollama, lmstudio); blank
-    means the slug's conventional default port. ``timeout`` of None means "pick
-    the right default for this provider", which is much longer for local ones.
+    ``base_url`` applies to the local providers (ollama, lmstudio), where blank
+    means the slug's conventional default port, and to the custom provider,
+    where blank is a configuration error because there is no default to fall
+    back to. ``timeout`` of None means "pick the right default for this
+    provider", which is much longer for local ones.
     """
     if not ai_is_configured(provider, api_key):
         logger.debug("complete_json called without a usable credential; returning None")
@@ -418,6 +530,7 @@ async def complete_json(
         return None
 
     is_local = provider in LOCAL_PROVIDERS
+    is_custom = provider in CUSTOM_PROVIDERS
     local_url = resolve_local_base_url(provider, base_url)
 
     if is_local and not is_safe_local_ai_url(local_url):
@@ -432,11 +545,39 @@ async def complete_json(
             )
         return None
 
+    # The custom provider has no default address, so an empty one is a config
+    # error rather than something to guess at. A blank model is likewise fatal:
+    # there is no default model for an endpoint we know nothing about.
+    custom_base_url = ""
+    if is_custom:
+        custom_base_url = resolve_custom_base_url(base_url)
+        if not custom_base_url:
+            logger.warning("Custom AI provider selected with no base URL")
+            if raise_on_error:
+                raise AIProviderError(_CUSTOM_BLANK_URL_MESSAGE, code="bad_request")
+            return None
+        # Same SSRF guard as the local slugs: this is a user-supplied address the
+        # server will fetch. It permits loopback and private hosts (a gateway on
+        # the LAN is a legitimate target) while refusing credentials, queries,
+        # traversal and metadata hosts.
+        if not is_safe_local_ai_url(custom_base_url):
+            logger.warning(
+                "Rejecting unsafe custom AI base URL: %s", sanitize_log_value(custom_base_url)
+            )
+            if raise_on_error:
+                raise AIProviderError(
+                    f"'{custom_base_url}' is not a valid endpoint address. Use a plain "
+                    "http(s) URL with no credentials or query string, such as "
+                    "https://api.example.com/v1.",
+                    code="bad_request",
+                )
+            return None
+
     model = model or DEFAULT_MODELS.get(provider)
     if not model:
-        # Only reachable for a local provider now, since KNOWN_PROVIDERS was
-        # checked above and every remote slug has a default.
-        logger.warning("No model set for local provider %s", sanitize_log_value(provider))
+        # Reachable for a local provider (no default exists) and for the custom
+        # provider (we cannot know which models the endpoint serves).
+        logger.warning("No model set for provider %s", sanitize_log_value(provider))
         if raise_on_error:
             raise AIProviderError(
                 _LOCAL_BLANK_MODEL_MESSAGE.format(
@@ -459,6 +600,9 @@ async def complete_json(
         return None
 
     if timeout is None:
+        # A custom endpoint is usually a hosted service, so it gets the remote
+        # budget. Treating it as local would leave the user waiting five minutes
+        # on a dead gateway.
         timeout = LOCAL_TIMEOUT_SECONDS if is_local else _TIMEOUT_SECONDS
 
     if provider == "anthropic":
@@ -481,6 +625,23 @@ async def complete_json(
 
         def factory():
             return _call_gemini(prompt, api_key, model, max_tokens, schema, timeout)
+    elif is_custom:
+        # A custom endpoint is assumed to speak the OpenAI chat-completions
+        # contract, which is the de facto standard for gateways and proxies.
+        # json_schema_mode is off: it is the stricter form, and a third-party
+        # gateway is more likely to accept the widely-implemented json_object.
+        # An empty key is sent as "local" because some gateways reject a blank
+        # Authorization header while others ignore it entirely.
+        def factory():
+            return _call_openai_compatible(
+                prompt,
+                api_key or "local",
+                custom_chat_completions_url(custom_base_url),
+                model,
+                max_tokens,
+                schema,
+                timeout,
+            )
     elif is_local:
         # Both local servers speak the OpenAI chat-completions contract, so this
         # is the same adapter the openai/openrouter slugs use. Ollama requires an
@@ -520,7 +681,9 @@ async def complete_json(
             ) from None
         return None
     except httpx.HTTPError as e:
-        code, message = classify_provider_error(provider, e, base_url=local_url, model=model)
+        code, message = classify_provider_error(
+            provider, e, base_url=custom_base_url or local_url, model=model
+        )
         # str(e) embeds the request URL, which is built from `model` (also
         # user-settable config), so it is sanitized alongside provider and body.
         logger.warning(

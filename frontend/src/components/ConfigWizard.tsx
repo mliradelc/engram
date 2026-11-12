@@ -14,7 +14,7 @@ import { requestTmdbValidation } from '../utils/tmdbValidation';
 import { requestAiValidation } from '../utils/aiValidation';
 import RestartControls from './RestartControls';
 import { requestOpenSubtitlesValidation } from '../utils/opensubtitlesValidation';
-import { fetchLocalModels, isLocalProvider, localProviderDefaultUrl } from '../utils/localModels';
+import { fetchLocalModels, isCustomProvider, isLocalProvider, localProviderDefaultUrl } from '../utils/localModels';
 import { requestDiscordTemplateValidation } from '../utils/discordTemplateValidation';
 import { requestDiscordWebhookTest } from '../utils/discordWebhookTest';
 import { formatToolVersion } from '../utils/formatting';
@@ -86,6 +86,7 @@ const AI_PROVIDER_LABELS: Record<string, string> = {
     gemini: 'Google Gemini',
     ollama: 'Ollama',
     lmstudio: 'LM Studio',
+    custom: 'Custom endpoint',
 };
 
 const AI_KEY_PLACEHOLDERS: Record<string, string> = {
@@ -93,6 +94,7 @@ const AI_KEY_PLACEHOLDERS: Record<string, string> = {
     openai: 'sk-...',
     openrouter: 'sk-or-...',
     gemini: 'AIzaSy...',
+    custom: 'Your endpoint API key',
 };
 
 // Shown as the model-field placeholder so the user can see what they are
@@ -213,6 +215,7 @@ interface ConfigData {
     aiApiKey: string;
     aiModel: string;
     aiLocalBaseUrl: string;
+    aiCustomBaseUrl: string;
     discdbContributionsEnabled: boolean;
     discdbContributionTier: number;
     discdbExportPath: string;
@@ -313,6 +316,7 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
         aiApiKey: '',
         aiModel: '',
         aiLocalBaseUrl: '',
+        aiCustomBaseUrl: '',
         discdbContributionsEnabled: false,
         discdbContributionTier: 2,
         discdbExportPath: '',
@@ -509,6 +513,7 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                     aiApiKey: data.ai_api_key === '***' ? '' : (data.ai_api_key || ''),
                     aiModel: data.ai_model || '',
                     aiLocalBaseUrl: data.ai_local_base_url || '',
+                    aiCustomBaseUrl: data.ai_custom_base_url || '',
                     discdbContributionsEnabled: data.discdb_contributions_enabled ?? false,
                     discdbContributionTier: data.discdb_contribution_tier ?? 2,
                     discdbExportPath: data.discdb_export_path || '',
@@ -803,6 +808,9 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                     // override impossible to clear once set.
                     ai_model: config.aiModel.trim(),
                     ai_local_base_url: config.aiLocalBaseUrl.trim(),
+                    // Same reasoning as ai_local_base_url: not a secret, and blank
+                    // is meaningful, so it is always sent.
+                    ai_custom_base_url: config.aiCustomBaseUrl.trim(),
                     discdb_contributions_enabled: config.discdbContributionsEnabled,
                     discdb_contribution_tier: config.discdbContributionTier,
                     discdb_export_path: config.discdbExportPath,
@@ -868,19 +876,26 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
 
     const handleTestAi = async () => {
         const local = isLocalProvider(config.aiProvider);
+        const custom = isCustomProvider(config.aiProvider);
         const key = config.aiApiKey.trim();
-        if (!local && !key && !savedKeys.ai) {
+        if (!local && !custom && !key && !savedKeys.ai) {
             setAiValidation({status: 'invalid', error: 'Please enter a key first'});
             return;
         }
-        if (local && !config.aiModel.trim()) {
+        if (custom && !config.aiCustomBaseUrl.trim()) {
+            setAiValidation({status: 'invalid', error: 'Enter the endpoint address first'});
+            return;
+        }
+        if ((local || custom) && !config.aiModel.trim()) {
             setAiValidation({status: 'invalid', error: 'Select a model first'});
             return;
         }
         // Prefix hint only, never a gate: provider key formats change, and a
         // wrong-provider key is the common mistake after switching providers.
-        // Local providers have no key at all, so the hint does not apply.
-        const expectedPrefix = local ? '' : AI_KEY_PLACEHOLDERS[config.aiProvider]?.replace('...', '');
+        // Local providers have no key at all, so the hint does not apply. Neither
+        // does it for a custom endpoint, whose key format is whatever that service
+        // uses — guessing a prefix there would block a perfectly good key.
+        const expectedPrefix = local || custom ? '' : AI_KEY_PLACEHOLDERS[config.aiProvider]?.replace('...', '');
         if (key && expectedPrefix && !key.startsWith(expectedPrefix)) {
             setAiValidation({
                 status: 'invalid',
@@ -895,7 +910,7 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
             config.aiProvider,
             config.aiApiKey,
             config.aiModel,
-            config.aiLocalBaseUrl,
+            custom ? config.aiCustomBaseUrl : config.aiLocalBaseUrl,
         );
         if (result.status === 'valid') {
             setAiValidation({status: 'valid', model: result.model});
@@ -1692,6 +1707,9 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                             // point at the wrong server. Reset to the
                                             // new slug's default (blank for remote).
                                             handleInputChange('aiLocalBaseUrl', '');
+                                            // The custom endpoint is its own address;
+                                            // never carry it over to another provider.
+                                            handleInputChange('aiCustomBaseUrl', '');
                                             handleInputChange('aiModel', '');
                                             setAiValidation({status: 'idle'});
                                         }}
@@ -1702,8 +1720,17 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                             { value: 'gemini', label: 'Google Gemini' },
                                             { value: 'ollama', label: 'Ollama (local)' },
                                             { value: 'lmstudio', label: 'LM Studio (local)' },
+                                            { value: 'custom', label: 'Custom endpoint (OpenAI-compatible)' },
                                         ]}
                                     />
+                                    {isCustomProvider(config.aiProvider) && (
+                                        <span className="form-hint">
+                                            Point Engram at any service that speaks the OpenAI
+                                            chat-completions API — a gateway, a proxy, or a
+                                            provider not listed above. The address and the
+                                            model id are both required.
+                                        </span>
+                                    )}
                                 </div>
                                 {!isLocalProvider(config.aiProvider) && (
                                 <div className="form-group">
@@ -1723,6 +1750,27 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                     />
                                     <span className="form-hint">
                                         API key for {providerLabel}. Used by title resolution (when TMDB lookup fails) and by episode matching.
+                                    </span>
+                                </div>
+                                )}
+                                {isCustomProvider(config.aiProvider) && (
+                                <div className="form-group">
+                                    <label htmlFor="aiCustomBaseUrl">Endpoint Address</label>
+                                    <input
+                                        id="aiCustomBaseUrl"
+                                        type="text"
+                                        placeholder="https://api.example.com/v1"
+                                        value={config.aiCustomBaseUrl}
+                                        onChange={(e) => {
+                                            handleInputChange('aiCustomBaseUrl', e.target.value);
+                                            setAiValidation({status: 'idle'});
+                                        }}
+                                    />
+                                    <span className="form-hint">
+                                        The base URL of the service, including any path prefix it
+                                        needs (most OpenAI-compatible services end in <code>/v1</code>).
+                                        Engram appends <code>/chat/completions</code> for you.
+                                        Leave the key blank if your endpoint does not require one.
                                     </span>
                                 </div>
                                 )}
@@ -1753,7 +1801,7 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                 )}
                                 <div className="form-group">
                                     <label htmlFor="aiModel">
-                                        {isLocalProvider(config.aiProvider) ? 'Model' : 'Model (optional)'}
+                                        {isLocalProvider(config.aiProvider) || isCustomProvider(config.aiProvider) ? 'Model' : 'Model (optional)'}
                                     </label>
                                     {isLocalProvider(config.aiProvider) && localModels.models.length > 0 ? (
                                         <EngramSelect
@@ -1772,7 +1820,9 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                             placeholder={
                                                 isLocalProvider(config.aiProvider)
                                                     ? 'e.g. llama3.1:8b'
-                                                    : (AI_DEFAULT_MODELS[config.aiProvider] || '')
+                                                    : isCustomProvider(config.aiProvider)
+                                                        ? 'e.g. gpt-4o-mini, mistral-large-latest'
+                                                        : (AI_DEFAULT_MODELS[config.aiProvider] || '')
                                             }
                                             value={config.aiModel}
                                             onChange={(e) => {
@@ -1784,7 +1834,9 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                     <span className="form-hint">
                                         {isLocalProvider(config.aiProvider)
                                             ? "Required. Local providers have no default, because it depends on which models you have installed."
-                                            : "Leave blank to use Engram's default. Set this if your key cannot reach the default model."}
+                                            : isCustomProvider(config.aiProvider)
+                                                ? "Required. Use the exact model id your endpoint expects — Engram cannot guess it."
+                                                : "Leave blank to use Engram's default. Set this if your key cannot reach the default model."}
                                     </span>
                                 </div>
                                 <div className="form-group">
@@ -1792,7 +1844,7 @@ function ConfigWizard({ onClose, onComplete, isOnboarding = true, initialSection
                                         <button
                                             type="button"
                                             onClick={handleTestAi}
-                                            disabled={aiValidation.status === 'testing' || (!isLocalProvider(config.aiProvider) && !config.aiApiKey && !savedKeys.ai)}
+                                            disabled={aiValidation.status === 'testing' || (!isLocalProvider(config.aiProvider) && !isCustomProvider(config.aiProvider) && !config.aiApiKey && !savedKeys.ai)}
                                             className="btn-secondary"
                                             style={{padding: '0.25rem 0.75rem', fontSize: '0.85rem'}}
                                         >

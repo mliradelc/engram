@@ -80,6 +80,7 @@ REVIEW_FIELDS = frozenset(
     {
         "discdb_api_url",
         "ai_local_base_url",
+        "ai_custom_base_url",
         "discord_webhook_url",
         "fingerprint_server_url",
         "makemkv_path",

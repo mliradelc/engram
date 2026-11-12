@@ -1,5 +1,46 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fetchLocalModels, LOCAL_PROVIDERS, localProviderDefaultUrl } from './localModels';
+import {
+    CUSTOM_PROVIDER,
+    fetchLocalModels,
+    isCustomProvider,
+    isLocalProvider,
+    LOCAL_PROVIDERS,
+    localProviderDefaultUrl,
+    needsEndpoint,
+} from './localModels';
+
+describe('isCustomProvider', () => {
+    it('recognises the custom slug', () => {
+        expect(isCustomProvider(CUSTOM_PROVIDER)).toBe(true);
+        expect(isCustomProvider('custom')).toBe(true);
+    });
+
+    it('rejects every built-in provider', () => {
+        for (const p of ['anthropic', 'openai', 'openrouter', 'gemini', 'ollama', 'lmstudio']) {
+            expect(isCustomProvider(p)).toBe(false);
+        }
+    });
+
+    it('is not the same thing as a local provider', () => {
+        // A custom endpoint usually needs a key and has no default address, so
+        // conflating the two would hide the key field and prefill a wrong port.
+        expect(isLocalProvider(CUSTOM_PROVIDER)).toBe(false);
+    });
+});
+
+describe('needsEndpoint', () => {
+    it('is true for local and custom providers', () => {
+        expect(needsEndpoint('ollama')).toBe(true);
+        expect(needsEndpoint('lmstudio')).toBe(true);
+        expect(needsEndpoint(CUSTOM_PROVIDER)).toBe(true);
+    });
+
+    it('is false for hosted providers with fixed URLs', () => {
+        for (const p of ['anthropic', 'openai', 'openrouter', 'gemini']) {
+            expect(needsEndpoint(p)).toBe(false);
+        }
+    });
+});
 
 describe('localProviderDefaultUrl', () => {
     it('knows both default ports', () => {

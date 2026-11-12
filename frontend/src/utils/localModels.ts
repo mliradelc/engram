@@ -23,6 +23,21 @@ export function isLocalProvider(provider: string): boolean {
     return (LOCAL_PROVIDERS as readonly string[]).includes(provider);
 }
 
+/** The user-supplied OpenAI-compatible endpoint. Not local: it usually needs a
+ *  key and has no default address, so the wizard shows it an address field and
+ *  a key field, and requires a model. Mirrors CUSTOM_PROVIDER in
+ *  backend/app/core/ai_client.py. */
+export const CUSTOM_PROVIDER = 'custom';
+
+export function isCustomProvider(provider: string): boolean {
+    return provider === CUSTOM_PROVIDER;
+}
+
+/** True for any provider that needs an address typed in by the user. */
+export function needsEndpoint(provider: string): boolean {
+    return isLocalProvider(provider) || isCustomProvider(provider);
+}
+
 export function localProviderDefaultUrl(provider: string): string {
     return DEFAULT_URLS[provider] ?? '';
 }

@@ -2215,7 +2215,7 @@ class IdentificationCoordinator:
                 )
                 tmdb_signal = tv_retry
 
-        from app.core.ai_client import ai_is_configured
+        from app.core.ai_client import ai_is_configured, resolve_ai_base_url
 
         # AI-powered identification fallback (not for staging). Skipped when the
         # disc network already resolved a confident identity — that result takes
@@ -2241,7 +2241,11 @@ class IdentificationCoordinator:
                     config.ai_provider,
                     config.ai_api_key,
                     getattr(config, "ai_model", "") or None,
-                    base_url=getattr(config, "ai_local_base_url", "") or "",
+                    base_url=resolve_ai_base_url(
+                        config.ai_provider,
+                        getattr(config, "ai_local_base_url", "") or "",
+                        getattr(config, "ai_custom_base_url", "") or "",
+                    ),
                 )
                 if ai_result and ai_result.get("title"):
                     ai_identified_name = ai_result["title"]

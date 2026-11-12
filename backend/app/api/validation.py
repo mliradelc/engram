@@ -66,9 +66,11 @@ class AiValidationRequest(BaseModel):
     this combination work" rather than "did the last saved one work" — which is
     the whole point when the user is testing a model their key might not have.
 
-    ``base_url`` applies only to the local providers and, like the others, is
-    sent as typed rather than as saved, so the button answers "will this
-    endpoint work" before the user commits to it.
+    ``base_url`` applies to the local providers and to the custom provider, and,
+    like the others, is sent as typed rather than as saved, so the button answers
+    "will this endpoint work" before the user commits to it. For the custom
+    provider it is the endpoint address itself; the two are distinguished by
+    ``provider``, not by which field carries them.
     """
 
     provider: str
@@ -874,6 +876,7 @@ async def validate_ai(
     pointed it at.
     """
     from app.core.ai_client import (
+        CUSTOM_PROVIDERS,
         DEFAULT_MODELS,
         KNOWN_PROVIDERS,
         LOCAL_PROVIDERS,
@@ -892,7 +895,9 @@ async def validate_ai(
     api_key = (request.api_key or "").strip()
     model = (request.model or "").strip()
     base_url = (request.base_url or "").strip()
-    if not api_key or not model or (provider in LOCAL_PROVIDERS and not base_url):
+    if not api_key or not model or (provider in LOCAL_PROVIDERS and not base_url) or (
+        provider in CUSTOM_PROVIDERS and not base_url
+    ):
         from app.services.config_service import get_config
 
         # Guarded: this endpoint promises never to 500, and a config read can
@@ -903,11 +908,17 @@ async def validate_ai(
             config = await get_config()
         except Exception:  # noqa: BLE001 — a validator must never 500
             logger.warning("AI validation could not read the stored config", exc_info=True)
-        if config is None and not api_key and provider not in LOCAL_PROVIDERS:
+        if (
+            config is None
+            and not api_key
+            and provider not in LOCAL_PROVIDERS
+            and provider not in CUSTOM_PROVIDERS
+        ):
             # Only fatal when the key itself was what we came for. A failed read
             # with a supplied key just means "no stored model override", which
             # falls back to the provider default like any blank model. Local
-            # providers never needed a key in the first place.
+            # providers never needed a key in the first place, and a custom
+            # endpoint may legitimately run without one.
             return ValidationResponse(
                 valid=False, error="Could not read the saved API key from the database"
             )
@@ -917,7 +928,12 @@ async def validate_ai(
             if not model:
                 model = (getattr(config, "ai_model", "") or "").strip()
             if not base_url:
-                base_url = (getattr(config, "ai_local_base_url", "") or "").strip()
+                # The custom provider's address lives in its own column, so read
+                # the right one rather than falling back to the local server's.
+                if provider in CUSTOM_PROVIDERS:
+                    base_url = (getattr(config, "ai_custom_base_url", "") or "").strip()
+                else:
+                    base_url = (getattr(config, "ai_local_base_url", "") or "").strip()
 
     if not ai_is_configured(provider, api_key):
         return ValidationResponse(
@@ -931,6 +947,23 @@ async def validate_ai(
                 "answer depends on which models you have installed."
             ),
         )
+    if provider in CUSTOM_PROVIDERS:
+        if not base_url:
+            return ValidationResponse(
+                valid=False,
+                error=(
+                    "Enter the endpoint address first. It must be the base URL of an "
+                    "OpenAI-compatible service, such as https://api.example.com/v1"
+                ),
+            )
+        if not model:
+            return ValidationResponse(
+                valid=False,
+                error=(
+                    "Enter the model id your endpoint expects. A custom endpoint has no "
+                    "default, because Engram cannot know which models it serves."
+                ),
+            )
 
     if provider in LOCAL_PROVIDERS:
         # LM Studio answers a request for an unknown model by silently serving

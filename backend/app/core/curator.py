@@ -736,6 +736,7 @@ class EpisodeCurator:
                 ai_api_key=config.ai_api_key,
                 ai_model=getattr(config, "ai_model", "") or None,
                 ai_local_base_url=getattr(config, "ai_local_base_url", "") or "",
+                ai_custom_base_url=getattr(config, "ai_custom_base_url", "") or "",
                 tmdb_api_key=config.tmdb_api_key,
             )
         except Exception as e:

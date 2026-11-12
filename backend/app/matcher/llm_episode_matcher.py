@@ -12,7 +12,7 @@ through the review queue, never auto-organize.
 import logging
 from dataclasses import dataclass
 
-from app.core.ai_client import DEFAULT_MODELS, complete_json
+from app.core.ai_client import DEFAULT_MODELS, complete_json, resolve_ai_base_url
 from app.core.episode_namespace import season_episodes
 from app.core.security import sanitize_log_value
 from app.matcher.episode_identification import _clean_subtitle_text
@@ -88,6 +88,7 @@ async def match_episode_via_llm(
     tmdb_api_key: str,
     ai_model: str | None = None,
     ai_local_base_url: str = "",
+    ai_custom_base_url: str = "",
     raise_on_error: bool = False,
 ) -> LLMEpisodeMatch | None:
     """Run LLM episode matching. Returns None on no-confident-match or empty response.
@@ -98,7 +99,9 @@ async def match_episode_via_llm(
 
     ``ai_local_base_url`` is the user's local-server endpoint
     (AppConfig.ai_local_base_url). It applies only to the local providers; blank
-    means the slug's default port.
+    means the slug's default port. ``ai_custom_base_url`` is the custom
+    provider's endpoint (AppConfig.ai_custom_base_url); ``resolve_ai_base_url``
+    picks whichever one this provider needs.
 
     When ``raise_on_error`` is True, a provider/transport failure raises
     ``AIProviderError`` (instead of being swallowed to None by ``complete_json``)
@@ -145,7 +148,7 @@ async def match_episode_via_llm(
         api_key=ai_api_key,
         model=ai_model or None,
         max_tokens=512,
-        base_url=ai_local_base_url,
+        base_url=resolve_ai_base_url(ai_provider, ai_local_base_url, ai_custom_base_url),
         raise_on_error=raise_on_error,
     )
     if not raw:
