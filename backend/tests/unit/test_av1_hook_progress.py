@@ -714,4 +714,22 @@ def test_retry_worker_never_raises(hook_env, monkeypatch):
 def test_default_retry_roots_skip_empty_and_add_staging_parent(monkeypatch, tmp_path):
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
     roots = av1_hook.default_retry_roots(["/media/tv", "", None])
-    assert roots == [Path("/media/tv"), tmp_path / "staging"]
+    # Empty / unset entries are dropped; the staging parent is always appended.
+    assert Path("/media/tv") in roots
+    assert tmp_path / "staging" in roots
+    assert "" not in [str(r) for r in roots]
+
+
+def test_default_retry_roots_include_real_media_mounts(monkeypatch, tmp_path):
+    """A repointed library_tv_path must not lock retry out of the real library.
+
+    ``library_tv_path`` is routinely set to the curator's staging root, so the
+    configured paths alone leave /media/tv (where the files that need a retry
+    actually live) unauthorised.  The container's media mounts are always roots.
+    """
+    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
+    roots = av1_hook.default_retry_roots([str(tmp_path / "arm_completed")])
+    for media in av1_hook._MEDIA_ROOTS:
+        if Path(media).is_dir():
+            assert Path(media) in roots, f"{media} must be a retry root"
+

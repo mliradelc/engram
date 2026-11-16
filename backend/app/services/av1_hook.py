@@ -795,11 +795,26 @@ def _staging_dir() -> Path:
     return Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
 
 
+# The container's real media mounts.  Always legitimate retry roots: the hook
+# writes its marker beside whatever source file it is given, and these are the
+# directories Jellyfin actually reads from.
+_MEDIA_ROOTS = ("/media/tv", "/media/movies")
+
+
 def default_retry_roots(library_paths: Iterable[str | None]) -> list[Path]:
     """Roots a retried source may live under: the library roots plus the AV1
     staging directory's parent.  Empty / unset paths are skipped (an unset
-    path would otherwise resolve to the working directory and authorise it)."""
+    path would otherwise resolve to the working directory and authorise it).
+
+    The container's real media mounts are always included.  ``library_tv_path``
+    is routinely repointed at the curator's staging root so new discs are filed
+    for review, which leaves the *actual* library (``/media/tv``) outside the
+    configured paths — and those are exactly the files a failed encode needs to
+    retry.  The hook writes its marker beside the source wherever that source
+    lives, so both roots are legitimate.
+    """
     roots = [Path(p) for p in library_paths if p]
+    roots.extend(Path(p) for p in _MEDIA_ROOTS if Path(p).is_dir())
     roots.append(_staging_dir().parent)
     return roots
 
