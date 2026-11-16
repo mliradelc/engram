@@ -273,7 +273,7 @@ def test_av1_presets_are_never_slower_than_6_and_x265_is_never_slower_than_mediu
             if plan.codec == "av1":
                 assert int(plan.preset) >= 6  # i3-7100T: preset 2-4 is not viable
             else:
-                assert plan.preset in ("medium", "fast")
+                assert plan.preset in ("medium", "slow", "fast")
 
 
 def test_unknown_class_name_yields_the_default_plan():
@@ -282,13 +282,54 @@ def test_unknown_class_name_yields_the_default_plan():
 
 def test_class_table_matches_documented_settings():
     clean = cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="hd")
-    assert (clean.codec, clean.crf, clean.preset) == ("av1", 25, "6")
+    assert (clean.codec, clean.crf, clean.preset) == ("av1", 24, "6")
     assert dict(clean.svt_required)["film-grain"] == "4"
     anim = cc.plan_for_class(cc.ANIMATION, res="hd")
     assert (anim.codec, anim.crf, anim.preset) == ("av1", 27, "6")
     assert dict(anim.svt_required)["film-grain"] == "0"
     grainy = cc.plan_for_class(cc.LIVE_ACTION_GRAINY, res="hd")
-    assert (grainy.codec, grainy.crf, grainy.preset) == ("hevc", 21, "medium")
+    assert (grainy.codec, grainy.crf, grainy.preset) == ("hevc", 21, "slow")
+
+
+@pytest.mark.parametrize("optional", [True, False])
+@pytest.mark.parametrize("res", ["sd", "hd", "uhd"])
+def test_every_x265_plan_requires_anti_smoothing_params(res, optional):
+    plans = [cc.plan_for_class(n, res=res, hdr_meta=HDR_META, grainy_hdr=True)
+             for n in cc.CLASSES]
+    hevc = [p for p in plans if p.codec == "hevc"]
+    assert {p.class_name for p in hevc} >= {cc.LIVE_ACTION_GRAINY, cc.HDR}
+    for plan in hevc:
+        req = dict(plan.x265_required)
+        assert req["no-sao"] == "1" and req["strong-intra-smoothing"] == "0"
+        args = plan.video_args(4, optional=optional)  # optional=False is the fallback path
+        params = args[args.index("-x265-params") + 1].split(":")
+        assert "no-sao=1" in params and "strong-intra-smoothing=0" in params
+
+
+@pytest.mark.parametrize("res", ["sd", "hd", "uhd"])
+def test_no_plan_emits_av1_preset_8(res):
+    plans = [cc.plan_for_class(n, res=res, hdr_meta=HDR_META) for n in cc.CLASSES]
+    plans.append(cc.classify(probe(idet=INTERLACED_IDET, width=720 if res == "sd" else 1920),
+                             deinterlace=True))
+    assert any(p.codec == "av1" for p in plans)
+    for p in plans:
+        if p.codec == "av1":
+            assert p.preset == "6"
+
+
+def test_x265_grainy_preset_by_resolution():
+    got = {r: cc.plan_for_class(cc.LIVE_ACTION_GRAINY, res=r).preset for r in ("sd", "hd", "uhd")}
+    assert got == {"sd": "medium", "hd": "slow", "uhd": "fast"}
+
+
+def test_uhd_av1_has_no_grain_synthesis_but_hd_does():
+    assert dict(cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="uhd").svt_required)["film-grain"] == "0"
+    assert dict(cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="hd").svt_required)["film-grain"] == "4"
+
+
+def test_clean_crf_is_24_hd_and_23_sd():
+    assert cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="hd").crf == 24
+    assert cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="sd").crf == 23
 
 
 @pytest.mark.parametrize("optional", [True, False])
@@ -356,7 +397,7 @@ def test_sample_times_are_spread_across_the_title_not_the_first_seconds():
 def test_describe_logs_class_evidence_and_outcome():
     line = cc.classify(probe(grain=0.8)).describe()
     assert "class=live_action_grainy" in line and "grain=0.80" in line
-    assert "x265 crf=21 preset=medium" in line
+    assert "x265 crf=21 preset=slow" in line
 
 
 def test_module_imports_with_stdlib_only():

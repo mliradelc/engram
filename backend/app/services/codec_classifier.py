@@ -83,8 +83,8 @@ Where this module deliberately departs from a source:
   original is already in the library, so skipping loses nothing.  Opt in with
   ``deinterlace=True`` (hook env ``ENGRAM_CODEC_INTERLACED=deinterlace``).
 
-Presets: preset 6 is the floor for AV1 (i3-7100T, software only); UHD uses 8.
-Preset 2-4 is never emitted.  x265 uses ``medium`` (``fast`` at UHD).
+Presets: preset 6 is the floor for AV1 (i3-7100T, software only); UHD also uses 6.
+Preset 2-4 is never emitted.  x265 uses ``slow`` at HD, ``medium`` at SD, ``fast`` at UHD.
 
 Calibration honesty: the grain/animation thresholds below were fitted on
 synthetic sources (ffmpeg ``noise`` over gradients; test patterns).  They are
@@ -323,6 +323,11 @@ def _fmt(x: float) -> str:
     return f"{x:.4f}".rstrip("0").rstrip(".") or "0"
 
 
+def _x265_preset(res: str) -> str:
+    """slow for HD grainy BD (accepted time cost on the i3-7100T), medium SD, fast UHD."""
+    return {"sd": "medium", "hd": "slow"}.get(res, "fast")
+
+
 def _x265(res: str, crf: int, *, hdr: bool, hdr_meta: dict | None, evidence: dict,
           class_name: str, reason: str) -> CodecPlan:
     optional = [("aq-mode", "3")]  # aq-mode 3 biases bits toward dark scenes
@@ -331,8 +336,14 @@ def _x265(res: str, crf: int, *, hdr: bool, hdr_meta: dict | None, evidence: dic
         optional += _hdr_metadata_params(hdr_meta)[1]
     return CodecPlan(
         class_name=class_name, codec="hevc", reason=reason, crf=crf,
-        preset="fast" if res == "uhd" else "medium",
-        x265_required=[("log-level", "error")], x265_optional=optional,
+        preset=_x265_preset(res),
+        # no-sao / strong-intra-smoothing=0 are required, not optional: the hook's
+        # fallback drops optional params, and without these two smoothing filters
+        # off the grainy class defeats its own purpose (x265 3.5 default tools:
+        # b-intra strong-intra-smoothing deblock sao).
+        x265_required=[("log-level", "error"), ("no-sao", "1"),
+                       ("strong-intra-smoothing", "0")],
+        x265_optional=optional,
         hdr=hdr, evidence=evidence,
     )
 
@@ -348,10 +359,10 @@ def plan_for_class(
 ) -> CodecPlan:
     """Build the settings for one class.  Complete and valid for every class."""
     ev = dict(evidence or {})
-    preset = "8" if res == "uhd" else "6"
-    # SVT-AV1 warns that film grain at preset >6 is a large compute overhead,
-    # so UHD (preset 8) gets no synthesis.
-    grain_ok = preset == "6"
+    preset = "6"
+    # UHD gets no film-grain synthesis: the synthesis/grain-table compute cost at
+    # 4K is too high for this software-only CPU, independent of the preset number.
+    grain_ok = res != "uhd"
 
     if class_name == PASSTHROUGH or class_name == INTERLACED:
         return CodecPlan(class_name=class_name, codec="none", reason=reason or class_name,
@@ -377,7 +388,7 @@ def plan_for_class(
                          svt_required=req, svt_optional=opt + svt_meta, hdr=True, evidence=ev)
 
     # live_action_clean (also the safe default for any unknown name)
-    crf = 23 if res == "sd" else 25  # JET: SD sources want a lower CRF
+    crf = 23 if res == "sd" else 24  # JET: SD sources want a lower CRF
     req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2, luma_bias=True)
     return CodecPlan(LIVE_ACTION_CLEAN, "av1", reason or "default", crf, preset,
                      svt_required=req, svt_optional=opt, evidence=ev)
@@ -392,7 +403,7 @@ def deinterlaced_plan(res: str, evidence: dict) -> CodecPlan:
     req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
     return CodecPlan(
         INTERLACED, "av1", "interlaced source, deinterlace opted in",
-        24, "8" if res == "uhd" else "6",
+        24, "6",
         svt_required=req, svt_optional=opt,
         video_filters=["bwdif=mode=send_frame:parity=auto:deint=interlaced"],
         evidence=evidence,
