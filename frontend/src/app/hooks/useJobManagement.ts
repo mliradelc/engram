@@ -5,9 +5,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from 'sonner';
 import { useWebSocket } from '../../hooks/useWebSocket';
-import { apiFetch, apiFetchVoid, seasonAnswerBody, skipRipTitle, unskipRipTitle } from '../../api/client';
+import { ApiError, apiFetch, apiFetchVoid, seasonAnswerBody, skipRipTitle, unskipRipTitle } from '../../api/client';
 import { recoveryErrorMessage, retryFromStaging } from '../../api/recoveryClient';
-import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage } from '../../types';
+import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage, EncodeFailure, EncodingStatus, EncodeRetryRequest, EncodeRetryResponse } from '../../types';
 import type { ArmedIdentity } from '../components/ArmedDriveCard';
 
 // Trailing-debounce window for refetches triggered by a burst of unknown
@@ -118,14 +118,57 @@ export function applyEncodeProgress(
     return next;
 }
 
-/** Build the encode map from a `GET /api/encoding` snapshot. */
-export function encodesFromSnapshot(rows: EncodeProgress[]): Map<string, EncodeProgress> {
+/**
+ * Build the in-flight encode map from a `GET /api/encoding` snapshot
+ * (`{active, failed}`). A bare array (the pre-retry payload) is still accepted
+ * so a stale backend does not blank the panel.
+ */
+export function encodesFromSnapshot(
+    snapshot: EncodingStatus | EncodeProgress[] | null | undefined,
+): Map<string, EncodeProgress> {
+    const rows = Array.isArray(snapshot) ? snapshot : snapshot?.active ?? [];
     const next = new Map<string, EncodeProgress>();
     for (const row of rows) {
         if ((row.percent ?? 0) >= 100) continue;
         next.set(row.file, { ...row, percent: row.percent ?? 0 });
     }
     return next;
+}
+
+/** The recently-failed encodes from a `GET /api/encoding` snapshot, newest first. */
+export function failuresFromSnapshot(
+    snapshot: EncodingStatus | EncodeProgress[] | null | undefined,
+): EncodeFailure[] {
+    if (!snapshot || Array.isArray(snapshot)) return [];
+    return snapshot.failed ?? [];
+}
+
+/**
+ * Optimistic state for a Retry click: the failed row leaves `failed` and shows
+ * in `active` at 0% until the backend's own `encode_progress` takes over.
+ * Pure, so it can be tested and rolled back.
+ */
+export function applyRetryOptimistic(
+    encodes: Map<string, EncodeProgress>,
+    failures: EncodeFailure[],
+    failure: EncodeFailure,
+): { encodes: Map<string, EncodeProgress>; failures: EncodeFailure[] } {
+    const nextEncodes = new Map(encodes);
+    if (!nextEncodes.has(failure.file)) {
+        nextEncodes.set(failure.file, {
+            file: failure.file,
+            destination_folder: failure.destination_folder,
+            percent: 0,
+            eta: null,
+            speed: null,
+            codec: null,
+            started_at: Date.now() / 1000,
+        });
+    }
+    return {
+        encodes: nextEncodes,
+        failures: failures.filter((f) => f.source !== failure.source),
+    };
 }
 
 export function useJobManagement(devMode: boolean = false) {
@@ -146,6 +189,9 @@ export function useJobManagement(devMode: boolean = false) {
     // Seeded from GET /api/encoding (late-joining tab), then folded from
     // `encode_progress` messages.
     const [encodes, setEncodes] = useState<Map<string, EncodeProgress>>(() => new Map());
+    // Recently-failed encodes (backend ring buffer, newest first); each row
+    // offers Retry. REST-only: refreshed on seed, reconnect and every `done`.
+    const [encodeFailures, setEncodeFailures] = useState<EncodeFailure[]>([]);
 
     // Use WebSocket URL that works with Vite proxy
     // When running on localhost:5173, connects to ws://localhost:5173/ws (proxied to backend)
@@ -275,12 +321,36 @@ export function useJobManagement(devMode: boolean = false) {
     // Seed in-flight encodes from REST: a tab opened mid-encode has no WS history.
     const syncEncodes = useCallback(async () => {
         try {
-            const rows = await apiFetch<EncodeProgress[]>('/api/encoding');
-            setEncodes(encodesFromSnapshot(rows ?? []));
+            const snapshot = await apiFetch<EncodingStatus | EncodeProgress[]>('/api/encoding');
+            setEncodes(encodesFromSnapshot(snapshot));
+            setEncodeFailures(failuresFromSnapshot(snapshot));
         } catch {
             // Non-critical — the panel fills in from the next encode_progress.
         }
     }, []);
+
+    // Retry a failed encode. Optimistically moves the row to `active`; on a
+    // refusal, rolls back by resyncing from the server (which knows the truth).
+    const retryEncode = useCallback(async (failure: EncodeFailure) => {
+        setEncodes((prev) => applyRetryOptimistic(prev, [], failure).encodes);
+        setEncodeFailures((prev) => applyRetryOptimistic(new Map(), prev, failure).failures);
+        try {
+            const body: EncodeRetryRequest = { file: failure.source };
+            await apiFetch<EncodeRetryResponse>('/api/encoding/retry', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            toast.success(`Retrying encode of ${failure.file}`);
+        } catch (error) {
+            if (error instanceof ApiError && error.status === 409) {
+                toast.warning(`Already encoding ${failure.file}`);
+            } else {
+                toast.error(`Could not retry ${failure.file}. ${errorText(error)}`);
+            }
+            await syncEncodes();
+        }
+    }, [syncEncodes]);
 
     // Resync on (re)connect so the UI recovers from any drift while disconnected.
     const handleSocketOpen = useCallback(() => {
@@ -568,6 +638,9 @@ export function useJobManagement(devMode: boolean = false) {
 
                 case 'encode_progress':
                     setEncodes(prev => applyEncodeProgress(prev, message));
+                    // A finished encode may have failed; failures are REST-only,
+                    // and the backend records one before sending `done`.
+                    if (message.done) void syncEncodes();
                     break;
 
                 case 'subtitle_event':
@@ -617,7 +690,7 @@ export function useJobManagement(devMode: boolean = false) {
         });
 
         return unsubscribe;
-    }, [addMessageListener, devMode, scheduleUnknownJobRefetch]);
+    }, [addMessageListener, devMode, scheduleUnknownJobRefetch, syncEncodes]);
 
     return {
         jobs,
@@ -627,6 +700,8 @@ export function useJobManagement(devMode: boolean = false) {
         parkedDiscs,
         armedDrives,
         encodes,
+        encodeFailures,
+        retryEncode,
         cancelJob,
         ejectJob,
         advanceJob,

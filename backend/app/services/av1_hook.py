@@ -56,6 +56,14 @@ passed its event loop, publishes throttled ``encode_progress`` WebSocket
 messages through a publisher the coordinator registers with
 ``set_progress_publisher``.  The registry is deliberately process-local: a
 restart kills the encode, so a persisted row would only ever be a lie.
+
+Failures and retry: an encode that fails (``transcode_to_av1`` returns None)
+is recorded in a bounded in-memory ring buffer (``FAILURE_BUFFER_SIZE``,
+``failures_snapshot()``), served next to the active rows by
+``encoding_status()``.  ``retry_encode`` re-runs ``after_organize`` for such a
+source after deleting its marker; it goes through the same ``_encode_slot``
+permit and ``_ENCODING`` registry as any other encode, so the concurrency cap
+holds and the panel shows the retried file.
 """
 
 from __future__ import annotations
@@ -69,6 +77,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from functools import lru_cache
@@ -80,6 +89,7 @@ logger = logging.getLogger(__name__)
 MARKER_SUFFIX = ".engram-av1.json"
 ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
 PROGRESS_PUBLISH_INTERVAL = 2.0  # seconds between encode_progress messages per file
+FAILURE_BUFFER_SIZE = 20  # recently-failed encodes kept for the panel's Retry rows
 
 
 def _cfg(name: str, default: str) -> str:
@@ -170,6 +180,52 @@ def encoding_snapshot() -> list[dict[str, Any]]:
         rows = [dict(v) for v in _ENCODING.values()]
     rows.sort(key=lambda r: (r.get("started_at") or 0.0, r.get("file") or ""))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Failure ring buffer
+# ---------------------------------------------------------------------------
+
+# Newest last.  Entries: {file, source, destination_folder, reason, failed_at}.
+# ``source`` is the absolute source path a Retry posts back.  Guarded by
+# ``_encoding_lock`` like the active registry.
+_FAILED: deque[dict[str, Any]] = deque(maxlen=FAILURE_BUFFER_SIZE)
+
+
+def _forget_failure_locked(source: str) -> None:
+    """Drop every buffered failure for ``source``.  Caller holds ``_encoding_lock``."""
+    for stale in [e for e in _FAILED if e.get("source") == source]:
+        _FAILED.remove(stale)
+
+
+def _record_failure(src: Path, dest: Path, reason: str) -> None:
+    """Remember a failed encode for the panel, one row per source.  Never raises."""
+    try:
+        entry = {
+            "file": src.name,
+            "source": str(src),
+            "destination_folder": str(dest.parent),
+            "reason": reason,
+            "failed_at": time.time(),
+        }
+        with _encoding_lock:
+            _forget_failure_locked(str(src))
+            _FAILED.append(entry)
+    except Exception:  # noqa: BLE001 - fail-open: the buffer is cosmetic
+        logger.debug("AV1 hook: could not record failure for %s", src, exc_info=True)
+
+
+def failures_snapshot() -> list[dict[str, Any]]:
+    """Copy of the recently-failed encodes, newest first."""
+    with _encoding_lock:
+        rows = [dict(e) for e in _FAILED]
+    rows.reverse()
+    return rows
+
+
+def encoding_status() -> dict[str, list[dict[str, Any]]]:
+    """``GET /api/encoding`` payload: in-flight encodes and recent failures."""
+    return {"active": encoding_snapshot(), "failed": failures_snapshot()}
 
 
 def _parse_speed(raw: str | None) -> float | None:
@@ -506,22 +562,26 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
 def _encode_and_verify(
     cmd: list[str], src: Path, tmp: Path, *, key: str, duration: float | None, loop,
     expect_codec: str, active,
-) -> bool:
-    """Run the encode and verify ``tmp``.  True when ``tmp`` may be published.
+) -> str | None:
+    """Run the encode and verify ``tmp``.
 
-    Called with the encode permit held.  On any failure ``tmp`` is removed.
+    Returns None when ``tmp`` may be published, otherwise a short human-readable
+    failure reason (shown on the panel's failed row).  Called with the encode
+    permit held.  On any failure ``tmp`` is removed.
     """
     try:
         run = _run_encode(cmd, key=key, duration=duration, loop=loop)
     except subprocess.TimeoutExpired:
         logger.error("AV1 hook: encode timed out for %s", src.name)
         tmp.unlink(missing_ok=True)
-        return False
+        return "Encode timed out"
 
     if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-        logger.error("AV1 hook: encode failed for %s: %s", src.name, (run.stderr or "")[-500:])
+        stderr = (run.stderr or "").strip()
+        logger.error("AV1 hook: encode failed for %s: %s", src.name, stderr[-500:])
         tmp.unlink(missing_ok=True)
-        return False
+        last = stderr.splitlines()[-1][-200:] if stderr else ""
+        return f"ffmpeg exited {run.returncode}" + (f": {last}" if last else "")
 
     # Verify before publishing: codec must be what was asked for and track counts must match.
     src_probe = _probe(src)
@@ -529,28 +589,28 @@ def _encode_and_verify(
     if _video_codec(out_probe) != expect_codec:
         logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
         tmp.unlink(missing_ok=True)
-        return False
+        return f"Output is not {expect_codec}"
     if active is not None:
         out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
         if out_v.get("pix_fmt") != active.pix_fmt:
             logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
                          out_v.get("pix_fmt"), active.pix_fmt, src.name)
             tmp.unlink(missing_ok=True)
-            return False
+            return f"Output pixel format is not {active.pix_fmt}"
         # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
         if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
             logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
                          src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
             tmp.unlink(missing_ok=True)
-            return False
+            return "HDR transfer not preserved"
     if _track_counts(out_probe) != _track_counts(src_probe):
         logger.error(
             "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
             src.name, _track_counts(src_probe), _track_counts(out_probe),
         )
         tmp.unlink(missing_ok=True)
-        return False
-    return True
+        return "Audio/subtitle track count mismatch"
+    return None
 
 
 def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Path | None:
@@ -616,19 +676,26 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
         with _encoding_lock:
             _ENCODING[key] = entry
         _publish(loop, dict(entry))
+        failure: str | None = "Encode did not complete"
         try:
-            ok = _encode_and_verify(
+            failure = _encode_and_verify(
                 cmd, src, tmp, key=key, duration=duration, loop=loop,
                 expect_codec=expect_codec, active=active,
             )
         finally:
+            # Recorded before the terminal publish, so a client that re-fetches
+            # GET /api/encoding on ``done`` already sees the failed row.
+            if failure is not None:
+                _record_failure(src, dest, failure)
             with _encoding_lock:
                 final = _ENCODING.pop(key, entry)
             _publish(loop, dict(final), done=True)
-        if not ok:
+        if failure is not None:
             return None
 
     tmp.replace(dest)
+    with _encoding_lock:
+        _forget_failure_locked(str(src))
     logger.info(
         "AV1 hook: %s -> %s (%.1f MB -> %.1f MB)",
         src.name, dest.name, src.stat().st_size / 1e6, dest.stat().st_size / 1e6,
@@ -693,3 +760,121 @@ def after_organize(
             _write_marker(src, dest, plan.class_name if plan is not None else None)
     except Exception:  # noqa: BLE001 - fail-open by design
         logger.exception("AV1 hook: unexpected error for %s", final_path)
+
+
+# ---------------------------------------------------------------------------
+# Retry
+# ---------------------------------------------------------------------------
+
+
+class RetryError(Exception):
+    """A retry request was refused.  ``status`` is the HTTP code the route answers."""
+
+    status = 400
+
+
+class RetryNotFound(RetryError):
+    """The path is not an existing ``.mkv`` inside the allowed roots."""
+
+    status = 404
+
+
+class RetryConflict(RetryError):
+    """The file is already encoding, a retry for it is queued, or the hook is off."""
+
+    status = 409
+
+
+# Destination keys of accepted retries that have not finished yet.  A queued
+# retry is not in ``_ENCODING`` (that lists permit holders only), so without
+# this a double-click would start two encodes of one file.
+_RETRY_PENDING: set[str] = set()
+
+
+def _staging_dir() -> Path:
+    return Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
+
+
+def default_retry_roots(library_paths: Iterable[str | None]) -> list[Path]:
+    """Roots a retried source may live under: the library roots plus the AV1
+    staging directory's parent.  Empty / unset paths are skipped (an unset
+    path would otherwise resolve to the working directory and authorise it)."""
+    roots = [Path(p) for p in library_paths if p]
+    roots.append(_staging_dir().parent)
+    return roots
+
+
+def _within(path: Path, roots: Iterable[Path]) -> bool:
+    """True if resolved ``path`` sits inside one of the resolved ``roots``."""
+    for root in roots:
+        try:
+            path.relative_to(Path(root).resolve(strict=False))
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+def _run_retry(src: Path, key: str, loop) -> None:
+    """Worker-thread body of a retry.  Never raises."""
+    try:
+        after_organize(str(src), loop=loop)
+    except Exception:  # noqa: BLE001 - after_organize is fail-open; belt and braces
+        logger.exception("AV1 hook: retry failed for %s", src)
+    finally:
+        with _encoding_lock:
+            _RETRY_PENDING.discard(key)
+
+
+def retry_encode(
+    path: str | os.PathLike[str],
+    *,
+    loop=None,
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+) -> None:
+    """Force a re-encode of ``path`` in the background.
+
+    Validates synchronously and raises ``RetryNotFound`` (404) or
+    ``RetryConflict`` (409) so the route stays thin.  Once accepted it deletes
+    the marker (so ``_already_done`` no longer short-circuits) and runs
+    ``after_organize`` on its own daemon thread, returning immediately: an
+    encode takes over an hour, and a dedicated thread keeps it off the default
+    executor.  The encode is the ordinary ``after_organize`` ->
+    ``transcode_to_av1`` path, so it takes the same ``_encode_slot`` permit and
+    shows in ``_ENCODING`` like any other; there is no second code path.
+
+    ``roots``: the source must resolve inside one of these.  The route passes
+    ``default_retry_roots(library paths)``.  None means the AV1 staging parent
+    only, so a caller that forgets the roots fails closed.
+    """
+    try:
+        src = Path(path).resolve(strict=False)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        raise RetryNotFound(f"Not a file: {path}") from exc
+    allowed = [Path(r) for r in roots] if roots is not None else default_retry_roots(())
+    if not _within(src, allowed):
+        logger.warning("AV1 hook: refusing retry outside the library roots: %s", src)
+        raise RetryNotFound(f"Not a file in the library: {path}")
+    if not src.is_file() or src.suffix.lower() != ".mkv":
+        raise RetryNotFound(f"Not an existing .mkv file: {path}")
+    if not is_enabled():
+        raise RetryConflict("The AV1 hook is disabled (ENGRAM_AV1_HOOK is not 1)")
+
+    key = str(_staging_dir() / src.name)
+    with _encoding_lock:
+        if key in _ENCODING or key in _RETRY_PENDING:
+            raise RetryConflict(f"Already encoding {src.name}")
+        _RETRY_PENDING.add(key)
+        # Leave the failed list now; a new failure re-adds the row.
+        _forget_failure_locked(str(src))
+
+    try:
+        _marker_path(src).unlink(missing_ok=True)
+        threading.Thread(
+            target=_run_retry, args=(src, key, loop), name="av1-retry", daemon=True
+        ).start()
+    except Exception:
+        with _encoding_lock:
+            _RETRY_PENDING.discard(key)
+        raise
+    logger.info("AV1 hook: retry queued for %s", src.name)

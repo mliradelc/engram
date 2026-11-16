@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,11 +21,19 @@ async def client():
         yield ac
 
 
-async def test_encoding_endpoint_empty(client, monkeypatch):
+@pytest.fixture(autouse=True)
+def _reset_registries(monkeypatch):
     monkeypatch.setattr(av1_hook, "_ENCODING", {})
+    monkeypatch.setattr(
+        av1_hook, "_FAILED", av1_hook.deque(maxlen=av1_hook.FAILURE_BUFFER_SIZE)
+    )
+    monkeypatch.setattr(av1_hook, "_RETRY_PENDING", set())
+
+
+async def test_encoding_endpoint_empty(client):
     resp = await client.get("/api/encoding")
     assert resp.status_code == 200
-    assert resp.json() == []
+    assert resp.json() == {"active": [], "failed": []}
 
 
 async def test_encoding_endpoint_returns_snapshot(client, monkeypatch):
@@ -39,7 +49,97 @@ async def test_encoding_endpoint_returns_snapshot(client, monkeypatch):
     monkeypatch.setattr(av1_hook, "_ENCODING", {"/staging/av1-out/Show - S01E01.mkv": row})
     resp = await client.get("/api/encoding")
     assert resp.status_code == 200
-    assert resp.json() == [row]
+    assert resp.json() == {"active": [row], "failed": []}
+
+
+async def test_encoding_endpoint_lists_failures(client, tmp_path):
+    src = tmp_path / "Show - S01E02.mkv"
+    av1_hook._record_failure(src, tmp_path / "out" / src.name, "ffmpeg exited 1")
+    resp = await client.get("/api/encoding")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["active"] == []
+    [failed] = body["failed"]
+    assert failed["file"] == src.name
+    assert failed["source"] == str(src)
+    assert failed["destination_folder"] == str(tmp_path / "out")
+    assert failed["reason"] == "ffmpeg exited 1"
+    assert isinstance(failed["failed_at"], float)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/encoding/retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def retry_env(tmp_path, monkeypatch):
+    """Hook on, library root under tmp_path, config read stubbed, no real encode."""
+    from app.services import config_service
+
+    lib = tmp_path / "tv"
+    lib.mkdir()
+    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
+
+    async def fake_get_config():
+        return SimpleNamespace(library_tv_path=str(lib), library_movies_path="")
+
+    monkeypatch.setattr(config_service, "get_config", fake_get_config)
+    runs: list[tuple] = []
+    monkeypatch.setattr(av1_hook, "_run_retry", lambda src, key, loop: runs.append((src, loop)))
+    return SimpleNamespace(lib=lib, runs=runs)
+
+
+async def test_retry_returns_202_and_queues(client, retry_env):
+    src = retry_env.lib / "Show - S01E01.mkv"
+    src.write_bytes(b"x")
+    marker = av1_hook._marker_path(src)
+    marker.write_text("{}")
+    resp = await client.post("/api/encoding/retry", json={"file": str(src)})
+    assert resp.status_code == 202
+    assert resp.json() == {"queued": True, "file": str(src)}
+    assert not marker.exists()
+    for _ in range(100):
+        if retry_env.runs:
+            break
+        await asyncio.sleep(0.01)
+    [(ran_src, loop)] = retry_env.runs
+    assert ran_src == src.resolve()
+    assert loop is not None  # the handler's running loop, for progress publishing
+
+
+async def test_retry_returns_404_for_missing_file(client, retry_env):
+    resp = await client.post(
+        "/api/encoding/retry", json={"file": str(retry_env.lib / "nope.mkv")}
+    )
+    assert resp.status_code == 404
+    assert retry_env.runs == []
+
+
+async def test_retry_returns_404_outside_library_roots(client, retry_env, tmp_path):
+    outside = tmp_path / "etc" / "secret.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+    resp = await client.post("/api/encoding/retry", json={"file": str(outside)})
+    assert resp.status_code == 404
+    assert retry_env.runs == []
+
+
+async def test_retry_returns_409_while_encoding(client, retry_env):
+    src = retry_env.lib / "Show - S01E01.mkv"
+    src.write_bytes(b"x")
+    key = str(av1_hook._staging_dir() / src.name)
+    av1_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
+    resp = await client.post("/api/encoding/retry", json={"file": str(src)})
+    assert resp.status_code == 409
+    assert "Already encoding" in resp.json()["detail"]
+    assert retry_env.runs == []
+
+
+async def test_retry_rejects_an_empty_body(client, retry_env):
+    resp = await client.post("/api/encoding/retry", json={"file": ""})
+    assert resp.status_code == 422
 
 
 async def test_broadcast_encode_progress_is_flat_with_every_field():

@@ -161,7 +161,7 @@ function MainDashboard() {
   }, [showImport]);
 
   // Job management with WebSocket
-  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
+  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, encodeFailures, retryEncode, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
 
   // Footer facts (#720): the detected optical drives and the effective ASR device.
   // Both are hardware/runtime facts that change rarely, so refresh on (re)connect
@@ -516,12 +516,6 @@ function MainDashboard() {
         </div>
       )}
 
-      {/* Post-organize AV1/x265 encodes in flight (GET /api/encoding + the
-          encode_progress broadcast). Shows "Nothing encoding" when idle. */}
-      <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 mt-4">
-        <EncodeProgressPanel encodes={encodes} />
-      </div>
-
       {/* Platform guidance banner for Linux/macOS users */}
       <AnimatePresence>
         {platform && platform !== "win32" && jobs.length === 0 && !bannerDismissed && (
@@ -693,6 +687,13 @@ function MainDashboard() {
           }}
         >
         <div style={{ minWidth: 0 }}>
+        {/* Post-organize AV1/x265 encodes (GET /api/encoding + the
+            encode_progress broadcast): a full card at the top of the job
+            column, so it is seen without scrolling. Always rendered, idle
+            included; failed encodes list here with Retry. */}
+        <div style={{ marginBottom: 14 }}>
+          <EncodeProgressPanel encodes={encodes} failures={encodeFailures} onRetry={retryEncode} />
+        </div>
         {filteredDiscs.length === 0 ? (
           <motion.div
             initial={{ opacity: 0, y: 20 }}

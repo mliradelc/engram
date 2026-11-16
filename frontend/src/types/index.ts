@@ -240,6 +240,36 @@ export interface EncodeProgress {
     started_at?: number;
 }
 
+/**
+ * One recently-failed encode (in-memory ring buffer of the last 20, newest
+ * first). `source` is the absolute path of the filed .mkv; it is what
+ * `POST /api/encoding/retry` takes.
+ */
+export interface EncodeFailure {
+    file: string;
+    source: string;
+    destination_folder: string;
+    reason: string;
+    failed_at: number;
+}
+
+/** `GET /api/encoding` payload. */
+export interface EncodingStatus {
+    active: EncodeProgress[];
+    failed: EncodeFailure[];
+}
+
+/** `POST /api/encoding/retry` body. */
+export interface EncodeRetryRequest {
+    file: string;
+}
+
+/** `POST /api/encoding/retry` 202 response. */
+export interface EncodeRetryResponse {
+    queued: boolean;
+    file: string;
+}
+
 export interface TitlesDiscovered {
     type: 'titles_discovered';
     job_id: number;

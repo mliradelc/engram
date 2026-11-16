@@ -498,18 +498,54 @@ RECENT_TERMINAL_JOB_LIMIT = 10
 
 # Routes
 @router.get("/encoding")
-async def list_encoding() -> list[dict]:
-    """Files the post-organize AV1/x265 hook is encoding right now.
+async def list_encoding() -> dict[str, list[dict]]:
+    """Post-organize AV1/x265 encodes: ``{"active": [...], "failed": [...]}``.
 
-    Seeds a client that connected mid-encode; ``encode_progress`` WebSocket
-    messages update it from there. In-memory and process-local by design: a
-    queued file is not listed, and nothing survives a restart (neither does
-    the encode). Rows: file, destination_folder, percent, eta, speed, codec,
-    started_at.
+    ``active`` seeds a client that connected mid-encode; ``encode_progress``
+    WebSocket messages update it from there. Rows: file, destination_folder,
+    percent, eta, speed, codec, started_at. ``failed`` is a ring buffer of the
+    last 20 failed encodes, newest first: file, source, destination_folder,
+    reason, failed_at (``source`` is what ``POST /api/encoding/retry`` takes).
+    In-memory and process-local by design: a queued file is not listed, and
+    nothing survives a restart (neither does the encode).
     """
     from app.services import av1_hook
 
-    return av1_hook.encoding_snapshot()
+    return av1_hook.encoding_status()
+
+
+class EncodeRetryRequest(BaseModel):
+    file: str = Field(..., min_length=1, description="Absolute path of the source .mkv")
+
+
+@router.post(
+    "/encoding/retry",
+    status_code=202,
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def retry_encoding(body: EncodeRetryRequest) -> dict:
+    """Force a re-encode of an already-filed ``.mkv`` (e.g. one whose encode failed).
+
+    202 once queued (the encode runs in the background and shows on the panel
+    when it holds a slot); 404 when the path is not an existing ``.mkv`` under
+    the library roots or the AV1 staging parent (this route is LAN-reachable,
+    so it must not encode arbitrary files); 409 when the file is already
+    encoding or the hook is disabled.
+    """
+    from app.services import av1_hook
+    from app.services.config_service import get_config
+
+    config = await get_config()
+    roots = av1_hook.default_retry_roots([config.library_tv_path, config.library_movies_path])
+    loop = asyncio.get_running_loop()
+    try:
+        av1_hook.retry_encode(body.file, loop=loop, roots=roots)
+    except av1_hook.RetryError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except OSError as exc:
+        logger.error("Encode retry failed for %s: %s", sanitize_log_value(body.file), exc)
+        raise HTTPException(status_code=500, detail="Could not queue the retry") from exc
+    return {"queued": True, "file": body.file}
 
 
 @router.get("/jobs", response_model=list[JobResponse])
