@@ -497,6 +497,21 @@ RECENT_TERMINAL_JOB_LIMIT = 10
 
 
 # Routes
+@router.get("/encoding")
+async def list_encoding() -> list[dict]:
+    """Files the post-organize AV1/x265 hook is encoding right now.
+
+    Seeds a client that connected mid-encode; ``encode_progress`` WebSocket
+    messages update it from there. In-memory and process-local by design: a
+    queued file is not listed, and nothing survives a restart (neither does
+    the encode). Rows: file, destination_folder, percent, eta, speed, codec,
+    started_at.
+    """
+    from app.services import av1_hook
+
+    return av1_hook.encoding_snapshot()
+
+
 @router.get("/jobs", response_model=list[JobResponse])
 async def list_jobs(session: AsyncSession = Depends(get_session)) -> list[JobResponse]:
     """List active disc jobs (excludes cleared/archived jobs).

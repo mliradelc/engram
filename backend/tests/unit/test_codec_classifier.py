@@ -462,8 +462,11 @@ def test_kill_switch_reproduces_the_original_command_exactly(hook, monkeypatch):
     av1_hook.after_organize(str(src), context={"content_type": "tv"})
     (cmd,) = _encode_cmds(calls)
     staging = tmp / "stage"
+    # Encoding arguments are the original ones; only the progress-reporting flags
+    # (-nostdin -nostats -progress pipe:1) were added, which do not affect the output.
     assert cmd == [
-        "ffmpeg", "-v", "error", "-y", "-i", str(src),
+        "ffmpeg", "-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y",
+        "-i", str(src),
         "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?",
         "-c:v", "libsvtav1", "-crf", "30", "-preset", "8",
         "-svtav1-params", "tune=0:lp=2",

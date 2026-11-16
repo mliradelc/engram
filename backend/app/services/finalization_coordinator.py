@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 from app.services import av1_hook  # noqa: E402  (post-organize AV1 hook)
 
+# The hook never imports the API layer; it publishes encode progress through this.
+av1_hook.set_progress_publisher(ws_manager.broadcast_encode_progress)
+
 
 def _av1_context(job, disc_title) -> dict | None:
     """Identification context for the AV1 hook's codec classifier.
@@ -2429,10 +2432,13 @@ class FinalizationCoordinator:
                     # Encode after the state is durable: a ~80 min encode must not gate the
                     # commit, or the title reads REVIEW/file_exists after its file has moved.
                     if _av1_pending:
+                        # Captured here, in async context: the worker thread has no loop.
+                        _av1_loop = asyncio.get_running_loop()
                         await asyncio.to_thread(
                             av1_hook.after_organize,
                             _av1_pending,
                             context=_av1_context(job, disc_title),
+                            loop=_av1_loop,
                         )
                         _av1_pending = None
                     await ws_manager.broadcast_title_update(
@@ -2692,10 +2698,13 @@ class FinalizationCoordinator:
                 # Encode after the state is durable: a ~80 min encode must not gate the
                 # commit, or the title reads REVIEW/file_exists after its file has moved.
                 if _av1_pending:
+                    # Captured here, in async context: the worker thread has no loop.
+                    _av1_loop = asyncio.get_running_loop()
                     await asyncio.to_thread(
                         av1_hook.after_organize,
                         _av1_pending,
                         context=_av1_context(job, disc_title),
+                        loop=_av1_loop,
                     )
                     _av1_pending = None
                 await ws_manager.broadcast_title_update(

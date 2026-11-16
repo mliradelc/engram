@@ -345,6 +345,44 @@ class ConnectionManager:
             }
         )
 
+    async def broadcast_encode_progress(
+        self,
+        *,
+        file: str,
+        destination_folder: str,
+        percent: float | None,
+        eta: int | None,
+        speed: str | None = None,
+        codec: str | None = None,
+        done: bool = False,
+    ) -> None:
+        """Broadcast progress of one post-organize AV1/x265 encode.
+
+        A distinct message type, parallel to backup_progress: an encode is not
+        tied to a job phase (the job is already COMPLETED or organizing when
+        the hook runs) and is keyed by file, not job id.
+
+        Flat, and every field is always present: a null ``percent``/``eta``
+        means "not known for this sample" (ffmpeg reports no speed on its first
+        block), so the client keeps what it is showing. ``done`` marks the
+        file's last message - finished, failed or timed out - and always comes
+        with ``percent`` 100 so a client that only checks the percent drops
+        the row too. Sent from av1_hook's worker thread via
+        ``run_coroutine_threadsafe``, throttled there to one per 2 s per file.
+        """
+        await self.broadcast(
+            {
+                "type": "encode_progress",
+                "file": file,
+                "destination_folder": destination_folder,
+                "percent": percent,
+                "eta": eta,
+                "speed": speed,
+                "codec": codec,
+                "done": done,
+            }
+        )
+
 
 # Singleton instance
 manager = ConnectionManager()

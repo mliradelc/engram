@@ -210,6 +210,36 @@ export interface BackupProgressMessage {
     eta: number | null;
 }
 
+/**
+ * Progress of one post-organize AV1/x265 encode, keyed by `file` (not a job:
+ * the hook runs after the title is filed). Every field is always present; a
+ * null `percent`/`eta` means "not known for this sample" (ffmpeg reports no
+ * speed on its first block) and must not erase what the panel shows. `done`
+ * marks the file's last message (finished, failed or timed out) and always
+ * carries `percent` 100.
+ */
+export interface EncodeProgressMessage {
+    type: 'encode_progress';
+    file: string;
+    destination_folder: string;
+    percent: number | null;
+    eta: number | null;
+    speed: string | null;
+    codec: string | null;
+    done?: boolean;
+}
+
+/** One in-flight encode, as returned by `GET /api/encoding` and folded from WS. */
+export interface EncodeProgress {
+    file: string;
+    destination_folder: string;
+    percent: number;
+    eta: number | null;
+    speed: string | null;
+    codec: string | null;
+    started_at?: number;
+}
+
 export interface TitlesDiscovered {
     type: 'titles_discovered';
     job_id: number;
@@ -302,6 +332,7 @@ export type WebSocketMessage =
     | TitleUpdate
     | SubtitleEvent
     | BackupProgressMessage
+    | EncodeProgressMessage
     | TitlesDiscovered
     | UpdateStatusMessage
     | FingerprintDisclosureRequiredMessage

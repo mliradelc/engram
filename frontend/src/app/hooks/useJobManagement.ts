@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { apiFetch, apiFetchVoid, seasonAnswerBody, skipRipTitle, unskipRipTitle } from '../../api/client';
 import { recoveryErrorMessage, retryFromStaging } from '../../api/recoveryClient';
-import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage } from '../../types';
+import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage } from '../../types';
 import type { ArmedIdentity } from '../components/ArmedDriveCard';
 
 // Trailing-debounce window for refetches triggered by a burst of unknown
@@ -86,6 +86,48 @@ export function applyBackupProgress(jobs: Job[], data: Omit<BackupProgressMessag
     return next;
 }
 
+/**
+ * Fold an `encode_progress` message into the in-flight encode map (keyed by
+ * file). Returns a NEW map when anything changed, the same one otherwise.
+ *
+ * An entry is removed on `percent >= 100` or `done` (the backend sends one
+ * terminal message per file, success or failure). Null `percent`/`eta`/`speed`
+ * are coalesced against the existing entry: null means "unknown this sample".
+ */
+export function applyEncodeProgress(
+    encodes: Map<string, EncodeProgress>,
+    data: Omit<EncodeProgressMessage, 'type'>,
+): Map<string, EncodeProgress> {
+    if (data.done || (data.percent ?? 0) >= 100) {
+        if (!encodes.has(data.file)) return encodes;
+        const next = new Map(encodes);
+        next.delete(data.file);
+        return next;
+    }
+    const prev = encodes.get(data.file);
+    const next = new Map(encodes);
+    next.set(data.file, {
+        file: data.file,
+        destination_folder: data.destination_folder,
+        percent: data.percent ?? prev?.percent ?? 0,
+        eta: data.eta ?? prev?.eta ?? null,
+        speed: data.speed ?? prev?.speed ?? null,
+        codec: data.codec ?? prev?.codec ?? null,
+        started_at: prev?.started_at,
+    });
+    return next;
+}
+
+/** Build the encode map from a `GET /api/encoding` snapshot. */
+export function encodesFromSnapshot(rows: EncodeProgress[]): Map<string, EncodeProgress> {
+    const next = new Map<string, EncodeProgress>();
+    for (const row of rows) {
+        if ((row.percent ?? 0) >= 100) continue;
+        next.set(row.file, { ...row, percent: row.percent ?? 0 });
+    }
+    return next;
+}
+
 export function useJobManagement(devMode: boolean = false) {
     const [jobs, setJobs] = useState<Job[]>([]);
     const [titlesMap, setTitlesMap] = useState<Record<number, DiscTitle[]>>({});
@@ -100,6 +142,10 @@ export function useJobManagement(devMode: boolean = false) {
     // `drive_armed` broadcast (identity present = armed, null = disarmed or
     // consumed by an insert).
     const [armedDrives, setArmedDrives] = useState<Record<string, ArmedIdentity>>({});
+    // Files the post-organize AV1/x265 hook is encoding, keyed by file name.
+    // Seeded from GET /api/encoding (late-joining tab), then folded from
+    // `encode_progress` messages.
+    const [encodes, setEncodes] = useState<Map<string, EncodeProgress>>(() => new Map());
 
     // Use WebSocket URL that works with Vite proxy
     // When running on localhost:5173, connects to ws://localhost:5173/ws (proxied to backend)
@@ -226,6 +272,16 @@ export function useJobManagement(devMode: boolean = false) {
         }
     }, []);
 
+    // Seed in-flight encodes from REST: a tab opened mid-encode has no WS history.
+    const syncEncodes = useCallback(async () => {
+        try {
+            const rows = await apiFetch<EncodeProgress[]>('/api/encoding');
+            setEncodes(encodesFromSnapshot(rows ?? []));
+        } catch {
+            // Non-critical — the panel fills in from the next encode_progress.
+        }
+    }, []);
+
     // Resync on (re)connect so the UI recovers from any drift while disconnected.
     const handleSocketOpen = useCallback(() => {
         if (initialConnectRef.current) {
@@ -239,8 +295,9 @@ export function useJobManagement(devMode: boolean = false) {
         void syncUpdateStatus();
         void syncParkedDiscs();
         void syncArmedDrives();
+        void syncEncodes();
         fetchRef.current?.();
-    }, [syncUpdateStatus, syncParkedDiscs, syncArmedDrives]);
+    }, [syncUpdateStatus, syncParkedDiscs, syncArmedDrives, syncEncodes]);
 
     const { isConnected, addMessageListener } = useWebSocket(wsUrl, { onOpen: handleSocketOpen });
 
@@ -258,8 +315,9 @@ export function useJobManagement(devMode: boolean = false) {
             void syncUpdateStatus();
             void syncParkedDiscs();
             void syncArmedDrives();
+            void syncEncodes();
         }
-    }, [devMode, fetchJobsAndTitles, syncUpdateStatus, syncParkedDiscs, syncArmedDrives]);
+    }, [devMode, fetchJobsAndTitles, syncUpdateStatus, syncParkedDiscs, syncArmedDrives, syncEncodes]);
 
     async function cancelJob(jobId: string) {
         try {
@@ -508,6 +566,10 @@ export function useJobManagement(devMode: boolean = false) {
                     setJobs(prev => applyBackupProgress(prev, message));
                     break;
 
+                case 'encode_progress':
+                    setEncodes(prev => applyEncodeProgress(prev, message));
+                    break;
+
                 case 'subtitle_event':
                     setJobs(prev => prev.map(job =>
                         job.id === message.job_id
@@ -564,6 +626,7 @@ export function useJobManagement(devMode: boolean = false) {
         updateStatus,
         parkedDiscs,
         armedDrives,
+        encodes,
         cancelJob,
         ejectJob,
         advanceJob,

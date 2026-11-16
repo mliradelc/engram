@@ -35,6 +35,7 @@ import { disarmDrive as disarmDriveRequest } from "../api/client";
 import { toast } from "sonner";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ParkedDiscBanner } from "./components/ParkedDiscBanner";
+import { EncodeProgressPanel } from "./components/EncodeProgressPanel";
 import { AsrStatusBadge } from "./components/AsrStatusBadge";
 import {
   Splash,
@@ -160,7 +161,7 @@ function MainDashboard() {
   }, [showImport]);
 
   // Job management with WebSocket
-  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
+  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
 
   // Footer facts (#720): the detected optical drives and the effective ASR device.
   // Both are hardware/runtime facts that change rarely, so refresh on (re)connect
@@ -514,6 +515,12 @@ function MainDashboard() {
           </AnimatePresence>
         </div>
       )}
+
+      {/* Post-organize AV1/x265 encodes in flight (GET /api/encoding + the
+          encode_progress broadcast). Shows "Nothing encoding" when idle. */}
+      <div className="w-full max-w-[1600px] mx-auto px-4 sm:px-6 mt-4">
+        <EncodeProgressPanel encodes={encodes} />
+      </div>
 
       {/* Platform guidance banner for Linux/macOS users */}
       <AnimatePresence>

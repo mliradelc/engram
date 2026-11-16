@@ -22,7 +22,7 @@ Design constraints, each deliberate:
 Codec choice is made per file by ``codec_classifier`` (see CODEC-CLASSIFIER.md):
 the media is probed and classified, and the Engram identification context is a
 hint only.  ``ENGRAM_CODEC_CLASSIFIER=0`` restores the original fixed CRF/preset
-command byte-for-byte.  The same fixed command is the fallback whenever the
+encoding arguments byte-for-byte.  The same fixed command is the fallback whenever the
 classifier or its encoder pre-check fails, so a classifier fault never costs the
 transcode, let alone the rip.
 
@@ -48,10 +48,19 @@ ffmpeg encode (plus verification probe of its output) is gated by a
 process-wide ``threading.Semaphore``.  ``after_organize`` already runs in a
 worker thread, so blocking is correct.  The gate sits above the codec choice
 and is therefore codec-agnostic; probing/classification never holds a permit.
+
+Encode progress: ffmpeg runs with ``-progress pipe:1 -nostats``; a reader thread
+parses the key=value stream into percent/ETA, keeps it in an in-memory registry
+(``encoding_snapshot()``, served by ``GET /api/encoding``) and, when the caller
+passed its event loop, publishes throttled ``encode_progress`` WebSocket
+messages through a publisher the coordinator registers with
+``set_progress_publisher``.  The registry is deliberately process-local: a
+restart kills the encode, so a persisted row would only ever be a lie.
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import logging
@@ -59,15 +68,18 @@ import os
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 MARKER_SUFFIX = ".engram-av1.json"
 ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
+PROGRESS_PUBLISH_INTERVAL = 2.0  # seconds between encode_progress messages per file
 
 
 def _cfg(name: str, default: str) -> str:
@@ -132,6 +144,206 @@ def _encode_slot(name: str) -> Iterator[None]:
         sem.release()
 
 
+# ---------------------------------------------------------------------------
+# Encode progress: parser, registry, publishing
+# ---------------------------------------------------------------------------
+
+_ENCODING: dict[str, dict[str, Any]] = {}
+# key: destination path (str) - unique per file, survives queueing
+# value: {file, destination_folder, percent, eta, speed, codec, started_at}
+_encoding_lock = threading.Lock()
+
+# Coroutine function ``(**fields) -> Awaitable`` broadcasting one progress sample.
+# Registered by the finalization coordinator so this module never imports the API layer.
+_progress_publisher: Callable[..., Any] | None = None
+
+
+def set_progress_publisher(publisher: Callable[..., Any] | None) -> None:
+    """Register the coroutine function used to broadcast ``encode_progress``."""
+    global _progress_publisher
+    _progress_publisher = publisher
+
+
+def encoding_snapshot() -> list[dict[str, Any]]:
+    """Copy of every encode currently holding a permit, oldest first."""
+    with _encoding_lock:
+        rows = [dict(v) for v in _ENCODING.values()]
+    rows.sort(key=lambda r: (r.get("started_at") or 0.0, r.get("file") or ""))
+    return rows
+
+
+def _parse_speed(raw: str | None) -> float | None:
+    """``"0.216x"`` -> 0.216; absent, ``N/A``, zero or garbage -> None (unknown)."""
+    if not raw:
+        return None
+    try:
+        value = float(raw.strip().rstrip("x"))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _parse_out_time_seconds(block: dict[str, str]) -> float | None:
+    # out_time_ms is microseconds too (a long-standing ffmpeg quirk): fallback only.
+    for key in ("out_time_us", "out_time_ms"):
+        raw = block.get(key)
+        if raw is None:
+            continue
+        try:
+            return max(int(raw), 0) / 1e6
+        except ValueError:
+            continue
+    return None
+
+
+def compute_progress(
+    out_time_seconds: float | None, speed: float | None, duration_seconds: float | None
+) -> tuple[float | None, int | None]:
+    """Return ``(percent, eta_seconds)``; either is None when it cannot be known.
+
+    percent is clamped to 0..100 and eta to >= 0.  ETA needs a known speed: a
+    missing or ``N/A`` speed omits it rather than showing a wrong one.
+    """
+    if out_time_seconds is None or not duration_seconds or duration_seconds <= 0:
+        return None, None
+    percent = min(max(out_time_seconds / duration_seconds * 100.0, 0.0), 100.0)
+    eta = None
+    if speed is not None and speed > 0:
+        eta = int(round(max(duration_seconds - out_time_seconds, 0.0) / speed))
+    return round(percent, 1), eta
+
+
+def iter_progress(
+    lines: Iterable[str], duration_seconds: float | None
+) -> Iterator[dict[str, Any]]:
+    """Parse an ffmpeg ``-progress`` stream, yielding one sample per ``progress=`` line.
+
+    Each sample is ``{percent, eta, speed, done}``.  ``speed`` is ffmpeg's raw
+    string (e.g. ``"0.216x"``) or None when unknown.  ``done`` marks
+    ``progress=end``, where percent is forced to 100 and eta to 0.
+    """
+    block: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key != "progress":
+            block[key] = value
+            continue
+        speed = _parse_speed(block.get("speed"))
+        percent, eta = compute_progress(_parse_out_time_seconds(block), speed, duration_seconds)
+        done = value == "end"
+        if done:
+            percent, eta = 100.0, 0
+        yield {
+            "percent": percent,
+            "eta": eta,
+            "speed": block.get("speed") if speed is not None else None,
+            "done": done,
+        }
+        block = {}
+
+
+def _publish(loop, entry: dict[str, Any], *, done: bool = False) -> None:
+    """Fire-and-forget one ``encode_progress`` message.  Never raises.
+
+    ``done`` marks the file's last message (encode finished, failed or timed
+    out); it carries percent 100 so a client drops the row.
+    """
+    publisher = _progress_publisher
+    if loop is None or publisher is None:
+        return
+    try:
+        if loop.is_closed():
+            return
+        asyncio.run_coroutine_threadsafe(
+            publisher(
+                file=entry["file"],
+                destination_folder=entry["destination_folder"],
+                percent=100.0 if done else entry["percent"],
+                eta=0 if done else entry["eta"],
+                speed=entry["speed"],
+                codec=entry["codec"],
+                done=done,
+            ),
+            loop,
+        )
+    except Exception:  # noqa: BLE001 - fail-open: progress is cosmetic
+        logger.debug("AV1 hook: could not publish encode progress", exc_info=True)
+
+
+def _consume_progress(fd: int, key: str, duration: float | None, loop) -> None:
+    """Reader thread: drain ffmpeg's progress pipe into the registry.  Never raises.
+
+    Reads to EOF even after an internal error, so ffmpeg can never block on a
+    full stdout pipe.  Publishes at most once per ``PROGRESS_PUBLISH_INTERVAL``.
+    """
+    last_publish: float | None = None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as stream:
+            try:
+                for sample in iter_progress(stream, duration):
+                    with _encoding_lock:
+                        entry = _ENCODING.get(key)
+                        if entry is None:
+                            continue
+                        if sample["percent"] is not None:
+                            entry["percent"] = sample["percent"]
+                        entry["eta"] = sample["eta"]
+                        entry["speed"] = sample["speed"]
+                        snapshot = dict(entry)
+                    now = time.monotonic()
+                    if last_publish is None or now - last_publish >= PROGRESS_PUBLISH_INTERVAL:
+                        last_publish = now
+                        _publish(loop, snapshot)
+            except Exception:  # noqa: BLE001 - fail-open: keep draining the pipe
+                logger.debug("AV1 hook: progress parse failed for %s", key, exc_info=True)
+                for _ in stream:
+                    pass
+    except Exception:  # noqa: BLE001 - fail-open: progress is cosmetic
+        logger.debug("AV1 hook: progress reader failed for %s", key, exc_info=True)
+
+
+def _run_encode(
+    cmd: list[str], *, key: str, duration: float | None, loop
+) -> subprocess.CompletedProcess:
+    """Run ffmpeg with its ``-progress`` stream on a pipe drained by a reader thread.
+
+    stdout goes to our own pipe (progress); stderr is captured by ``run`` and
+    drained concurrently by ``communicate``, so neither stream can deadlock the
+    encode and the failure log keeps its ``-v error`` text.  ``run`` keeps the
+    timeout/kill semantics; ``subprocess.TimeoutExpired`` propagates as before.
+    """
+    read_fd, write_fd = os.pipe()
+    reader = threading.Thread(
+        target=_consume_progress, args=(read_fd, key, duration, loop),
+        name="av1-progress", daemon=True,
+    )
+    try:
+        reader.start()
+    except Exception:  # noqa: BLE001 - no progress, but the encode still runs
+        os.close(read_fd)
+        logger.debug("AV1 hook: could not start progress reader", exc_info=True)
+    try:
+        return subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.PIPE,
+            text=True, timeout=ENCODE_TIMEOUT_SECONDS,
+        )
+    finally:
+        os.close(write_fd)  # the reader hits EOF once ffmpeg has exited as well
+        if reader.is_alive():
+            reader.join(timeout=5)
+
+
+def _duration_seconds(probe: dict) -> float | None:
+    try:
+        value = float((probe.get("format") or {}).get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def classifier_enabled() -> bool:
     """Kill switch: ``ENGRAM_CODEC_CLASSIFIER=0`` restores the fixed CRF/preset path."""
     return _cfg("ENGRAM_CODEC_CLASSIFIER", "1").strip() != "0"
@@ -170,7 +382,7 @@ def _probe(path: Path) -> dict:
         "ffprobe", "-v", "error", "-print_format", "json",
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,pix_fmt,color_transfer"
-        ":stream_disposition=default",
+        ":stream_disposition=default:format=duration",
         str(path),
     ]
     try:
@@ -291,13 +503,66 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
     return _legacy_video_args(threads), "av1", None
 
 
-def transcode_to_av1(src: Path, staging_dir: Path, plan=None) -> Path | None:
+def _encode_and_verify(
+    cmd: list[str], src: Path, tmp: Path, *, key: str, duration: float | None, loop,
+    expect_codec: str, active,
+) -> bool:
+    """Run the encode and verify ``tmp``.  True when ``tmp`` may be published.
+
+    Called with the encode permit held.  On any failure ``tmp`` is removed.
+    """
+    try:
+        run = _run_encode(cmd, key=key, duration=duration, loop=loop)
+    except subprocess.TimeoutExpired:
+        logger.error("AV1 hook: encode timed out for %s", src.name)
+        tmp.unlink(missing_ok=True)
+        return False
+
+    if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        logger.error("AV1 hook: encode failed for %s: %s", src.name, (run.stderr or "")[-500:])
+        tmp.unlink(missing_ok=True)
+        return False
+
+    # Verify before publishing: codec must be what was asked for and track counts must match.
+    src_probe = _probe(src)
+    out_probe = _probe(tmp)
+    if _video_codec(out_probe) != expect_codec:
+        logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
+        tmp.unlink(missing_ok=True)
+        return False
+    if active is not None:
+        out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
+        if out_v.get("pix_fmt") != active.pix_fmt:
+            logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
+                         out_v.get("pix_fmt"), active.pix_fmt, src.name)
+            tmp.unlink(missing_ok=True)
+            return False
+        # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
+        if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
+            logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
+                         src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
+            tmp.unlink(missing_ok=True)
+            return False
+    if _track_counts(out_probe) != _track_counts(src_probe):
+        logger.error(
+            "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
+            src.name, _track_counts(src_probe), _track_counts(out_probe),
+        )
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Path | None:
     """Encode ``src`` in ``staging_dir``.  Returns the output path or None.
 
     With ``plan`` (a ``codec_classifier.CodecPlan``) the codec and settings come
     from the classifier; with ``plan=None`` the fixed legacy settings are used.
     Despite the name, a plan may select HEVC (grainy live action); the output is
     verified against whatever codec was actually requested.
+
+    ``loop`` is the caller's running event loop; with it, progress is published
+    over the WebSocket.  None (e.g. a direct call) skips publishing silently.
     """
     threads = _cfg("ENGRAM_AV1_THREADS", "4")
 
@@ -314,7 +579,7 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None) -> Path | None:
         video_args, expect_codec, active = _select_video_args(plan, threads)
 
     cmd = [
-        "ffmpeg", "-v", "error", "-y",
+        "ffmpeg", "-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y",
         "-i", str(src),
         "-map", "0:v:0",
         "-map", "0:a?",
@@ -330,50 +595,38 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None) -> Path | None:
     else:
         logger.info("AV1 hook: encoding %s -> %s (crf=%s preset=%s)", src.name, dest.name,
                     _cfg("ENGRAM_AV1_CRF", "22"), _cfg("ENGRAM_AV1_PRESET", "6"))
+    # Duration for progress: probed before the encode and outside the permit
+    # (probing never holds one).  The post-encode verification probes are separate.
+    duration = _duration_seconds(_probe(src))
+    key = str(dest)
+
     # Permit first, then the subprocess with its own timeout; released before publishing.
     with _encode_slot(src.name):
+        # Registered only once the permit is held (a queued file is not encoding)
+        # and removed in ``finally`` so a failed or timed-out encode leaves no row.
+        entry: dict[str, Any] = {
+            "file": src.name,
+            "destination_folder": str(dest.parent),
+            "percent": 0.0,
+            "eta": None,
+            "speed": None,
+            "codec": expect_codec,
+            "started_at": time.time(),
+        }
+        with _encoding_lock:
+            _ENCODING[key] = entry
+        _publish(loop, dict(entry))
         try:
-            run = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=ENCODE_TIMEOUT_SECONDS
+            ok = _encode_and_verify(
+                cmd, src, tmp, key=key, duration=duration, loop=loop,
+                expect_codec=expect_codec, active=active,
             )
-        except subprocess.TimeoutExpired:
-            logger.error("AV1 hook: encode timed out for %s", src.name)
-            tmp.unlink(missing_ok=True)
+        finally:
+            with _encoding_lock:
+                final = _ENCODING.pop(key, entry)
+            _publish(loop, dict(final), done=True)
+        if not ok:
             return None
-
-        if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-            logger.error("AV1 hook: encode failed for %s: %s", src.name, (run.stderr or "")[-500:])
-            tmp.unlink(missing_ok=True)
-            return None
-
-        # Verify before publishing: codec must be what was asked for and track counts must match.
-        src_probe = _probe(src)
-        out_probe = _probe(tmp)
-        if _video_codec(out_probe) != expect_codec:
-            logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
-            tmp.unlink(missing_ok=True)
-            return None
-        if active is not None:
-            out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
-            if out_v.get("pix_fmt") != active.pix_fmt:
-                logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
-                             out_v.get("pix_fmt"), active.pix_fmt, src.name)
-                tmp.unlink(missing_ok=True)
-                return None
-            # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
-            if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
-                logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
-                             src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
-                tmp.unlink(missing_ok=True)
-                return None
-        if _track_counts(out_probe) != _track_counts(src_probe):
-            logger.error(
-                "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
-                src.name, _track_counts(src_probe), _track_counts(out_probe),
-            )
-            tmp.unlink(missing_ok=True)
-            return None
-
 
     tmp.replace(dest)
     logger.info(
@@ -400,12 +653,16 @@ def _classify(src: Path, context: dict | None):
         return None
 
 
-def after_organize(final_path: str | None, *, context: dict | None = None) -> None:
+def after_organize(
+    final_path: str | None, *, context: dict | None = None, loop=None
+) -> None:
     """Entry point called once a title has been filed.
 
     ``context`` is the optional Engram identification context (content_type,
     is_extra, duration_seconds, video_resolution, ...).  The classifier treats it
-    as a hint only; media probes win.  Never raises: a hook failure must not fail
+    as a hint only; media probes win.  ``loop`` is the caller's running event
+    loop, captured in async context *before* ``asyncio.to_thread``; it is used
+    only to publish encode progress and may be None.  Never raises: a hook failure must not fail
     the job.
     """
     if not is_enabled():
@@ -431,7 +688,7 @@ def after_organize(final_path: str | None, *, context: dict | None = None) -> No
             return
 
         staging = Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
-        dest = transcode_to_av1(src, staging, plan)
+        dest = transcode_to_av1(src, staging, plan, loop=loop)
         if dest is not None:
             _write_marker(src, dest, plan.class_name if plan is not None else None)
     except Exception:  # noqa: BLE001 - fail-open by design
