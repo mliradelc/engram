@@ -34,6 +34,29 @@ logger = logging.getLogger(__name__)
 
 from app.services import av1_hook  # noqa: E402  (post-organize AV1 hook)
 
+
+def _av1_context(job, disc_title) -> dict | None:
+    """Identification context for the AV1 hook's codec classifier.
+
+    A hint only: the classifier trusts its own media probes over any of this.
+    Never raises, because building a hint must not be able to disturb filing.
+    """
+    try:
+        content_type = getattr(job, "content_type", None)
+        return {
+            "content_type": getattr(content_type, "value", content_type),
+            "detected_title": job.detected_title,
+            "tmdb_id": job.tmdb_id,
+            "tmdb_year": job.tmdb_year,
+            "video_resolution": disc_title.video_resolution,
+            "duration_seconds": disc_title.duration_seconds,
+            "is_extra": disc_title.is_extra,
+            "audio_languages": disc_title.audio_languages,
+            "subtitle_languages": disc_title.subtitle_languages,
+        }
+    except Exception:  # noqa: BLE001 - a hint must never break filing
+        return None
+
 _MATCHER_REFUSAL_CODES = {REFERENCES_UNREADABLE_ERROR_CODE, AUDIO_LANGUAGE_ERROR_CODE}
 
 
@@ -1572,6 +1595,9 @@ class FinalizationCoordinator:
                     title_index=cap["title_index"],
                     tmdb_id=_tmdb_id_str,
                     year=_tmdb_year,
+                    conflict_resolution=_tv_conflict_strategy(
+                        cap.get("conflict_resolution")
+                    ),
                 )
             elif _lib_path:
                 org_result = await asyncio.to_thread(
@@ -2302,6 +2328,7 @@ class FinalizationCoordinator:
                     success_count += 1
                     continue
 
+                _av1_pending = None
                 source_file = Path(disc_title.output_filename)
                 if source_file.exists():
                     _lib_path = _library_path_for_job(job, "tv")
@@ -2322,6 +2349,9 @@ class FinalizationCoordinator:
                             title_index=disc_title.title_index,
                             tmdb_id=_tmdb_id_str,
                             year=_tmdb_year,
+                            conflict_resolution=_tv_conflict_strategy(
+                                disc_title.conflict_resolution
+                            ),
                         )
                         extra_index += 1
                     else:
@@ -2368,9 +2398,10 @@ class FinalizationCoordinator:
                             disc_title.episode_group_id = ordering_group_id
                         disc_title.state = TitleState.COMPLETED
                         logger.info(f"Organized: {org_result['final_path']}")
-                        await asyncio.to_thread(
-                            av1_hook.after_organize, org_result.get("final_path")
-                        )
+                        # The AV1 encode takes ~80 min per episode. Run it AFTER the commit below:
+                        # holding the session open across it left the title at REVIEW with a stale
+                        # file_exists flag even though the file had already moved.
+                        _av1_pending = org_result.get("final_path")
                     elif org_result.get("error_code") == "FILE_EXISTS":
                         conflict_count += 1
                         disc_title.state = TitleState.REVIEW
@@ -2395,6 +2426,15 @@ class FinalizationCoordinator:
 
                     session.add(disc_title)
                     await session.commit()
+                    # Encode after the state is durable: a ~80 min encode must not gate the
+                    # commit, or the title reads REVIEW/file_exists after its file has moved.
+                    if _av1_pending:
+                        await asyncio.to_thread(
+                            av1_hook.after_organize,
+                            _av1_pending,
+                            context=_av1_context(job, disc_title),
+                        )
+                        _av1_pending = None
                     await ws_manager.broadcast_title_update(
                         job_id,
                         disc_title.id,
@@ -2549,6 +2589,7 @@ class FinalizationCoordinator:
                 if not disc_title.output_filename:
                     continue
 
+                _av1_pending = None
                 source_file = Path(disc_title.output_filename)
                 if not source_file.exists():
                     logger.warning(f"Source file not found: {source_file}")
@@ -2572,6 +2613,9 @@ class FinalizationCoordinator:
                         title_index=disc_title.title_index,
                         tmdb_id=_tmdb_id_str,
                         year=_tmdb_year,
+                        conflict_resolution=_tv_conflict_strategy(
+                            disc_title.conflict_resolution
+                        ),
                     )
                     extra_index += 1
                 else:
@@ -2617,9 +2661,10 @@ class FinalizationCoordinator:
                         disc_title.episode_group_id = ordering_group_id
                     disc_title.state = TitleState.COMPLETED
                     logger.info(f"Organized: {org_result['final_path']}")
-                    await asyncio.to_thread(
-                        av1_hook.after_organize, org_result.get("final_path")
-                    )
+                    # The AV1 encode takes ~80 min per episode. Run it AFTER the commit below:
+                    # holding the session open across it left the title at REVIEW with a stale
+                    # file_exists flag even though the file had already moved.
+                    _av1_pending = org_result.get("final_path")
                 elif org_result.get("error_code") == "FILE_EXISTS":
                     conflict_count += 1
                     disc_title.state = TitleState.REVIEW
@@ -2644,6 +2689,15 @@ class FinalizationCoordinator:
 
                 session.add(disc_title)
                 await session.commit()
+                # Encode after the state is durable: a ~80 min encode must not gate the
+                # commit, or the title reads REVIEW/file_exists after its file has moved.
+                if _av1_pending:
+                    await asyncio.to_thread(
+                        av1_hook.after_organize,
+                        _av1_pending,
+                        context=_av1_context(job, disc_title),
+                    )
+                    _av1_pending = None
                 await ws_manager.broadcast_title_update(
                     job_id,
                     disc_title.id,
