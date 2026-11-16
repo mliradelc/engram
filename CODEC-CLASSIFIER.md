@@ -122,6 +122,7 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
 | `ENGRAM_AV1_THREADS` | SVT `lp` / x265 `pools`; applies on every path |
 | `ENGRAM_AV1_CRF`, `ENGRAM_AV1_PRESET` | **fallback path only** (kill switch, classifier failure, or encoder rejecting the class settings). They no longer influence classified encodes |
 | `ENGRAM_AV1_STAGING` | output directory (unchanged) |
+| `ENGRAM_AV1_MAX_CONCURRENT` | max simultaneous ffmpeg encodes process-wide, any codec (default `1` = serial; `0`, negative or non-integer = unlimited). Extra encodes block (INFO log) until a slot frees; the wait does not count against the encode timeout |
 
 Unset `ENGRAM_CODEC_CLASSIFIER` means the classifier is on. To revert without a rebuild, set
 `ENGRAM_CODEC_CLASSIFIER=0` in the container environment and restart the service.

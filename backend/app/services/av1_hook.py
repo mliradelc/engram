@@ -36,6 +36,18 @@ Configuration (environment):
                              bwdif; anything else leaves them untouched.
     ENGRAM_AV1_CRF           fixed-path SVT-AV1 CRF (default 22)      } fallback
     ENGRAM_AV1_PRESET        fixed-path SVT-AV1 preset (default 6)    } path only
+    ENGRAM_AV1_MAX_CONCURRENT
+                             max simultaneous ffmpeg encodes across the whole
+                             process, any codec (default 1 = strictly serial;
+                             0, negative or non-integer = unlimited).
+
+Encode concurrency: every job's organize sweep is its own asyncio task, so
+several sweeps can reach ``transcode_to_av1`` at once.  On a small host that
+starved the CPU and memory (four parallel encodes took the API down), so the
+ffmpeg encode (plus verification probe of its output) is gated by a
+process-wide ``threading.Semaphore``.  ``after_organize`` already runs in a
+worker thread, so blocking is correct.  The gate sits above the codec choice
+and is therefore codec-agnostic; probing/classification never holds a permit.
 """
 
 from __future__ import annotations
@@ -46,6 +58,9 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -57,6 +72,64 @@ ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
 
 def _cfg(name: str, default: str) -> str:
     return os.environ.get(name, default)
+
+
+def _max_concurrent() -> int:
+    """Parse ``ENGRAM_AV1_MAX_CONCURRENT``.  0 means unlimited; never raises.
+
+    Invalid or negative values mean unlimited (the pre-gate behaviour) rather than
+    an error: a typo in an env var must not stop transcoding or the job.
+    """
+    raw = _cfg("ENGRAM_AV1_MAX_CONCURRENT", "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(value, 0)
+
+
+_gate_lock = threading.Lock()
+_gate_limit: int | None = None
+_gate_sem: threading.Semaphore | None = None
+_gate_busy = 0  # encodes currently holding a permit (for the queued log line)
+
+
+def _get_gate(limit: int) -> threading.Semaphore:
+    """Return the process-wide semaphore for ``limit``, rebuilding if the limit changed."""
+    global _gate_limit, _gate_sem
+    with _gate_lock:
+        if _gate_sem is None or _gate_limit != limit:
+            _gate_sem = threading.Semaphore(limit)
+            _gate_limit = limit
+        return _gate_sem
+
+
+@contextmanager
+def _encode_slot(name: str) -> Iterator[None]:
+    """Hold an encode permit for the duration of the block, blocking if none is free.
+
+    Acquired BEFORE the encode timeout starts, so queue wait never consumes the
+    encode budget.  Always released, including on exceptions.  No-op when unlimited.
+    """
+    global _gate_busy
+    limit = _max_concurrent()
+    if limit == 0:
+        yield
+        return
+    sem = _get_gate(limit)
+    if not sem.acquire(blocking=False):
+        with _gate_lock:
+            busy = _gate_busy
+        logger.info("AV1 hook: waiting for encode slot (%d/%d busy) for %s", busy, limit, name)
+        sem.acquire()
+    with _gate_lock:
+        _gate_busy += 1
+    try:
+        yield
+    finally:
+        with _gate_lock:
+            _gate_busy -= 1
+        sem.release()
 
 
 def classifier_enabled() -> bool:
@@ -257,45 +330,50 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None) -> Path | None:
     else:
         logger.info("AV1 hook: encoding %s -> %s (crf=%s preset=%s)", src.name, dest.name,
                     _cfg("ENGRAM_AV1_CRF", "22"), _cfg("ENGRAM_AV1_PRESET", "6"))
-    try:
-        run = subprocess.run(cmd, capture_output=True, text=True, timeout=ENCODE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        logger.error("AV1 hook: encode timed out for %s", src.name)
-        tmp.unlink(missing_ok=True)
-        return None
-
-    if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-        logger.error("AV1 hook: encode failed for %s: %s", src.name, (run.stderr or "")[-500:])
-        tmp.unlink(missing_ok=True)
-        return None
-
-    # Verify before publishing: codec must be what was asked for and track counts must match.
-    src_probe = _probe(src)
-    out_probe = _probe(tmp)
-    if _video_codec(out_probe) != expect_codec:
-        logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
-        tmp.unlink(missing_ok=True)
-        return None
-    if active is not None:
-        out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
-        if out_v.get("pix_fmt") != active.pix_fmt:
-            logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
-                         out_v.get("pix_fmt"), active.pix_fmt, src.name)
+    # Permit first, then the subprocess with its own timeout; released before publishing.
+    with _encode_slot(src.name):
+        try:
+            run = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=ENCODE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("AV1 hook: encode timed out for %s", src.name)
             tmp.unlink(missing_ok=True)
             return None
-        # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
-        if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
-            logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
-                         src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
+
+        if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            logger.error("AV1 hook: encode failed for %s: %s", src.name, (run.stderr or "")[-500:])
             tmp.unlink(missing_ok=True)
             return None
-    if _track_counts(out_probe) != _track_counts(src_probe):
-        logger.error(
-            "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
-            src.name, _track_counts(src_probe), _track_counts(out_probe),
-        )
-        tmp.unlink(missing_ok=True)
-        return None
+
+        # Verify before publishing: codec must be what was asked for and track counts must match.
+        src_probe = _probe(src)
+        out_probe = _probe(tmp)
+        if _video_codec(out_probe) != expect_codec:
+            logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
+            tmp.unlink(missing_ok=True)
+            return None
+        if active is not None:
+            out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
+            if out_v.get("pix_fmt") != active.pix_fmt:
+                logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
+                             out_v.get("pix_fmt"), active.pix_fmt, src.name)
+                tmp.unlink(missing_ok=True)
+                return None
+            # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
+            if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
+                logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
+                             src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
+                tmp.unlink(missing_ok=True)
+                return None
+        if _track_counts(out_probe) != _track_counts(src_probe):
+            logger.error(
+                "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
+                src.name, _track_counts(src_probe), _track_counts(out_probe),
+            )
+            tmp.unlink(missing_ok=True)
+            return None
+
 
     tmp.replace(dest)
     logger.info(
