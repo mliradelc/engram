@@ -61,9 +61,15 @@ Failures and retry: an encode that fails (``transcode_to_av1`` returns None)
 is recorded in a bounded in-memory ring buffer (``FAILURE_BUFFER_SIZE``,
 ``failures_snapshot()``), served next to the active rows by
 ``encoding_status()``.  ``retry_encode`` re-runs ``after_organize`` for such a
-source after deleting its marker; it goes through the same ``_encode_slot``
-permit and ``_ENCODING`` registry as any other encode, so the concurrency cap
-holds and the panel shows the retried file.
+source after stripping its marker's done record; it goes through the same
+``_encode_slot`` permit and ``_ENCODING`` registry as any other encode, so the
+concurrency cap holds and the panel shows the retried file.
+
+Codec-class override: an operator may pin one of :data:`OFFERED_CLASSES` for a
+source (``set_override``) or force one on a retry.  The pin lives in the marker
+under ``override`` (with the source's size/mtime, so a changed source makes it
+stale and ignored), survives a completed encode and a retry, and is never held
+only in memory.  ``hdr`` and ``interlaced`` are never accepted from an operator.
 """
 
 from __future__ import annotations
@@ -160,7 +166,8 @@ def _encode_slot(name: str) -> Iterator[None]:
 
 _ENCODING: dict[str, dict[str, Any]] = {}
 # key: destination path (str) - unique per file, survives queueing
-# value: {file, destination_folder, percent, eta, speed, codec, started_at}
+# value: {file, destination_folder, percent, eta, speed, codec, codec_class, forced,
+#         started_at}
 _encoding_lock = threading.Lock()
 
 # Coroutine function ``(**fields) -> Awaitable`` broadcasting one progress sample.
@@ -186,7 +193,8 @@ def encoding_snapshot() -> list[dict[str, Any]]:
 # Failure ring buffer
 # ---------------------------------------------------------------------------
 
-# Newest last.  Entries: {file, source, destination_folder, reason, failed_at}.
+# Newest last.  Entries: {file, source, destination_folder, reason, codec_class,
+# forced, failed_at}.
 # ``source`` is the absolute source path a Retry posts back.  Guarded by
 # ``_encoding_lock`` like the active registry.
 _FAILED: deque[dict[str, Any]] = deque(maxlen=FAILURE_BUFFER_SIZE)
@@ -198,7 +206,9 @@ def _forget_failure_locked(source: str) -> None:
         _FAILED.remove(stale)
 
 
-def _record_failure(src: Path, dest: Path, reason: str) -> None:
+def _record_failure(
+    src: Path, dest: Path, reason: str, *, codec_class: str | None = None, forced: bool = False
+) -> None:
     """Remember a failed encode for the panel, one row per source.  Never raises."""
     try:
         entry = {
@@ -206,6 +216,8 @@ def _record_failure(src: Path, dest: Path, reason: str) -> None:
             "source": str(src),
             "destination_folder": str(dest.parent),
             "reason": reason,
+            "codec_class": codec_class,
+            "forced": forced,
             "failed_at": time.time(),
         }
         with _encoding_lock:
@@ -492,32 +504,190 @@ def _marker_path(src: Path) -> Path:
 
 
 def _already_done(src: Path) -> bool:
-    """True when a marker matches this exact source revision."""
-    marker = _marker_path(src)
-    if not marker.exists():
+    """True when the marker's *done record* matches this exact source revision.
+
+    Reads only the top-level ``size``/``mtime``.  The ``override`` pin carries its
+    own size/mtime (for staleness) and must never count as "done", or a pin set
+    on a fresh rip would make the hook skip the very encode it is meant to steer.
+    """
+    data = _read_marker(src)
+    if not data:
         return False
     try:
-        data = json.loads(marker.read_text())
         st = src.stat()
-        return data.get("size") == st.st_size and data.get("mtime") == int(st.st_mtime)
+    except OSError:
+        return False
+    return data.get("size") == st.st_size and data.get("mtime") == int(st.st_mtime)
+
+
+# Serialises every read-modify-write of a marker.  The marker now holds a user
+# choice (the pin) next to the done record, so a PUT racing an encode's final
+# ``_write_marker`` must not lose either half.
+_marker_lock = threading.RLock()
+
+# Top-level keys of the done record.  ``override`` is the only other key.
+_DONE_FIELDS = ("size", "mtime", "av1", "codec_class", "forced")
+
+
+def _read_marker(src: Path) -> dict[str, Any]:
+    """The marker as a dict; {} when missing, unreadable or not a JSON object."""
+    try:
+        data = json.loads(_marker_path(src).read_text())
     except (OSError, ValueError):
-        return False
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _write_marker(src: Path, dest: Path | None, codec_class: str | None = None) -> None:
-    """Record that ``src`` has been dealt with.  ``dest`` is None for a passthrough."""
+def _store_marker(src: Path, data: dict[str, Any]) -> None:
+    """Atomically replace the marker with ``data`` (temp + ``os.replace``).
+
+    An empty ``data`` deletes the marker instead.  Raises ``OSError``.
+    """
+    marker = _marker_path(src)
+    if not data:
+        marker.unlink(missing_ok=True)
+        return
+    tmp = marker.with_name(marker.name + ".tmp")
     try:
-        st = src.stat()
-        data = {
-            "size": st.st_size,
-            "mtime": int(st.st_mtime),
-            "av1": str(dest) if dest is not None else None,
-        }
-        if codec_class:
-            data["codec_class"] = codec_class
-        _marker_path(src).write_text(json.dumps(data))
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, marker)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _override_fresh(override: Any, st: os.stat_result) -> bool:
+    """True when a pin was set on this exact source revision (D5)."""
+    return (
+        isinstance(override, dict)
+        and override.get("size") == st.st_size
+        and override.get("mtime") == int(st.st_mtime)
+    )
+
+
+def _write_marker(
+    src: Path, dest: Path | None, codec_class: str | None = None, *, forced: bool = False
+) -> None:
+    """Record that ``src`` has been dealt with.  ``dest`` is None for a passthrough.
+
+    Merges: a fresh ``override`` pin already in the marker is kept, so a
+    successful encode does not erase the operator's choice.  A stale pin (the
+    source changed since it was set) is dropped here.
+    """
+    try:
+        with _marker_lock:
+            st = src.stat()
+            data: dict[str, Any] = {
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "av1": str(dest) if dest is not None else None,
+            }
+            if codec_class:
+                data["codec_class"] = codec_class
+            if forced:
+                data["forced"] = True
+            override = _read_marker(src).get("override")
+            if _override_fresh(override, st):
+                data["override"] = override
+            _store_marker(src, data)
     except OSError:
         logger.warning("AV1 hook: could not write marker for %s", src)
+
+
+def _strip_done(src: Path) -> None:
+    """Drop the done record, keeping only the ``override`` pin.  Raises ``OSError``.
+
+    A marker left with nothing in it is deleted.  This is what a retry does
+    instead of unlinking the marker, which would delete the pin it is applying.
+    """
+    with _marker_lock:
+        override = _read_marker(src).get("override")
+        _store_marker(src, {"override": override} if isinstance(override, dict) else {})
+
+
+def _store_override(src: Path, codec_class: str) -> dict[str, Any]:
+    """Persist a pin for the current revision of ``src``.  Raises ``OSError``."""
+    with _marker_lock:
+        st = src.stat()
+        override = {
+            "codec_class": codec_class,
+            "set_at": time.time(),
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+        }
+        data = _read_marker(src)
+        data["override"] = override
+        _store_marker(src, data)
+        return override
+
+
+# ---------------------------------------------------------------------------
+# Forced codec class (operator override)
+# ---------------------------------------------------------------------------
+
+# The only classes the API/UI may offer or accept.  ``interlaced`` is decided
+# from the source by the classifier's idet probe, and ``hdr`` is unreachable
+# for DVD / 1080p Blu-ray (both SDR) and invites a washed-out publish, so
+# neither is ever accepted from an operator.  ``codec_classifier.CLASSES``
+# keeps all six internally.
+OFFERED_CLASSES: tuple[str, ...] = (
+    "passthrough", "animation", "live_action_grainy", "live_action_clean",
+)
+_HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})  # PQ, HLG
+
+
+def forced_class_problem(codec_class: str | None, probe: dict) -> str | None:
+    """Why ``codec_class`` may not be forced on a source with ``probe``; None if it may."""
+    if codec_class not in OFFERED_CLASSES:
+        return (f"Codec class {codec_class!r} cannot be forced; "
+                f"choose one of: {', '.join(OFFERED_CLASSES)}")
+    if codec_class == "passthrough":
+        return None
+    video = _video_stream(probe)
+    if not video:
+        return "Could not probe the source's video stream"
+    if str(video.get("codec_name") or "").lower() == "av1":
+        return "Source is already AV1; re-encoding would add a second lossy generation"
+    if str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS:
+        return "Source is HDR; only passthrough may be forced on it"
+    return None
+
+
+def forced_plan(src: Path, codec_class: str, probe: dict | None = None):
+    """A ``CodecPlan`` for ``codec_class`` at the source's own resolution.
+
+    Probes ``src`` (unless ``probe`` is given) for its dimensions; the classes
+    that may be forced depend on resolution only.  Returns None when the
+    classifier module cannot be loaded.  Raises ``ValueError`` for a class
+    outside :data:`OFFERED_CLASSES`.
+    """
+    if codec_class not in OFFERED_CLASSES:
+        raise ValueError(f"codec class {codec_class!r} cannot be forced")
+    mod = _load_classifier()
+    if mod is None:
+        return None
+    video = _video_stream(probe if probe is not None else _probe(src))
+    res = mod.resolution_class(video.get("width"), video.get("height"))
+    return mod.plan_for_class(
+        codec_class, res=res, evidence={"res": res, "forced": True},
+        reason=f"forced by operator ({codec_class})",
+    )
+
+
+def _plan_forced(plan) -> bool:
+    return plan is not None and bool((getattr(plan, "evidence", None) or {}).get("forced"))
+
+
+def _would_encode_in_place(src: Path, staging_dir: Path) -> bool:
+    """True when the encode's destination is the source itself.
+
+    ``dest = staging_dir / src.name`` and ``tmp.replace(dest)``: for a source
+    sitting directly in ``ENGRAM_AV1_STAGING`` that overwrites the original.
+    """
+    try:
+        return (staging_dir / src.name).resolve(strict=False) == src.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return True  # cannot tell: fail closed
 
 
 def _legacy_video_args(threads: str) -> list[str]:
@@ -645,6 +815,12 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
     """
     threads = _cfg("ENGRAM_AV1_THREADS", "4")
 
+    # Never in-place, on every path (classifier, forced, and the kill switch).
+    if _would_encode_in_place(src, staging_dir):
+        logger.error(
+            "AV1 hook: refusing to encode %s in place (destination is the source)", src)
+        return None
+
     staging_dir.mkdir(parents=True, exist_ok=True)
     dest = staging_dir / src.name
 
@@ -668,11 +844,14 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
         "-c:s", "copy",
         str(tmp),
     ]
+    codec_class = active.class_name if active is not None else None
+    forced = _plan_forced(active)
     if active is not None:
-        logger.info("AV1 hook: encoding %s -> %s (class=%s)", src.name, dest.name,
-                    active.class_name)
+        logger.info("AV1 hook: encoding %s -> %s (class=%s%s)", src.name, dest.name,
+                    active.class_name, ", forced" if forced else "")
     else:
-        logger.info("AV1 hook: encoding %s -> %s (crf=%s preset=%s)", src.name, dest.name,
+        logger.info("AV1 hook: encoding %s -> %s (class=fixed crf=%s preset=%s)",
+                    src.name, dest.name,
                     _cfg("ENGRAM_AV1_CRF", "22"), _cfg("ENGRAM_AV1_PRESET", "6"))
     # Duration for progress: probed before the encode and outside the permit
     # (probing never holds one).  The post-encode verification probes are separate.
@@ -690,6 +869,8 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
             "eta": None,
             "speed": None,
             "codec": expect_codec,
+            "codec_class": codec_class,
+            "forced": forced,
             "started_at": time.time(),
         }
         with _encoding_lock:
@@ -705,7 +886,7 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
             # Recorded before the terminal publish, so a client that re-fetches
             # GET /api/encoding on ``done`` already sees the failed row.
             if failure is not None:
-                _record_failure(src, dest, failure)
+                _record_failure(src, dest, failure, codec_class=codec_class, forced=forced)
             with _encoding_lock:
                 final = _ENCODING.pop(key, entry)
             _publish(loop, dict(final), done=True)
@@ -739,8 +920,28 @@ def _classify(src: Path, context: dict | None):
         return None
 
 
+def _pinned_class(src: Path) -> str | None:
+    """The marker's pinned class when the pin matches this source revision.  Never raises."""
+    override = _read_marker(src).get("override")
+    if not isinstance(override, dict):
+        return None
+    try:
+        st = src.stat()
+    except OSError:
+        return None
+    if not _override_fresh(override, st):
+        logger.info("AV1 hook: ignoring stale codec-class pin for %s (source changed)", src.name)
+        return None
+    cls = override.get("codec_class")
+    return cls if isinstance(cls, str) else None
+
+
 def after_organize(
-    final_path: str | None, *, context: dict | None = None, loop=None
+    final_path: str | None,
+    *,
+    context: dict | None = None,
+    loop=None,
+    forced_class: str | None = None,
 ) -> None:
     """Entry point called once a title has been filed.
 
@@ -750,6 +951,13 @@ def after_organize(
     loop, captured in async context *before* ``asyncio.to_thread``; it is used
     only to publish encode progress and may be None.  Never raises: a hook failure must not fail
     the job.
+
+    ``forced_class`` (one of :data:`OFFERED_CLASSES`) replaces the classifier's
+    decision and takes precedence over a pin stored in the marker; without it a
+    fresh pin applies.  Either is ignored under ``ENGRAM_CODEC_CLASSIFIER=0``,
+    which keeps the fixed command.  A forced class still probes the source for
+    its resolution, and is refused (nothing encoded, no marker) on an AV1 or
+    HDR source unless it is ``passthrough``.
     """
     if not is_enabled():
         return
@@ -773,16 +981,45 @@ def after_organize(
             logger.info("AV1 hook: already converted, skipping %s", src.name)
             return
 
-        plan = _classify(src, context)
-        if plan is not None and plan.is_passthrough:
-            logger.info("AV1 hook: leaving %s untouched (%s)", src.name, plan.reason)
-            _write_marker(src, None, plan.class_name)
+        staging = _staging_dir()
+        if _would_encode_in_place(src, staging):
+            logger.error(
+                "AV1 hook: refusing to encode %s in place (it is in ENGRAM_AV1_STAGING)", src)
             return
 
-        staging = Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
+        cls = forced_class or _pinned_class(src)
+        if cls is not None and not classifier_enabled():
+            logger.warning(
+                "AV1 hook: ignoring forced class=%s for %s: ENGRAM_CODEC_CLASSIFIER=0 "
+                "keeps the fixed settings", cls, src.name)
+            cls = None
+
+        forced = cls is not None
+        if forced:
+            probe = _probe(src)
+            problem = forced_class_problem(cls, probe)
+            if problem is not None:
+                logger.error("AV1 hook: refusing forced class=%s for %s: %s",
+                             cls, src.name, problem)
+                return
+            plan = forced_plan(src, cls, probe)
+            if plan is None:
+                logger.error("AV1 hook: classifier unavailable; cannot force class=%s for %s",
+                             cls, src.name)
+                return
+            logger.info("AV1 hook: codec class forced: %s (%s)", plan.describe(), src.name)
+        else:
+            plan = _classify(src, context)
+
+        if plan is not None and plan.is_passthrough:
+            logger.info("AV1 hook: leaving %s untouched (%s)", src.name, plan.reason)
+            _write_marker(src, None, plan.class_name, forced=forced)
+            return
+
         dest = transcode_to_av1(src, staging, plan, loop=loop)
         if dest is not None:
-            _write_marker(src, dest, plan.class_name if plan is not None else None)
+            _write_marker(src, dest, plan.class_name if plan is not None else None,
+                          forced=forced)
     except Exception:  # noqa: BLE001 - fail-open by design
         logger.exception("AV1 hook: unexpected error for %s", final_path)
 
@@ -808,6 +1045,14 @@ class RetryConflict(RetryError):
     """The file is already encoding, a retry for it is queued, or the hook is off."""
 
     status = 409
+
+
+class RetryInvalid(RetryError):
+    """The request is well-formed but unsafe: a class that may not be forced on
+    this source, a class outside :data:`OFFERED_CLASSES`, or a source inside
+    ``ENGRAM_AV1_STAGING`` (where the encode would overwrite it)."""
+
+    status = 422
 
 
 # Destination keys of accepted retries that have not finished yet.  A queued
@@ -889,26 +1134,12 @@ def _run_retry(src: Path, key: str, loop) -> None:
             _RETRY_PENDING.discard(key)
 
 
-def retry_encode(
-    path: str | os.PathLike[str],
-    *,
-    loop=None,
-    roots: Iterable[str | os.PathLike[str]] | None = None,
-) -> None:
-    """Force a re-encode of ``path`` in the background.
+def _resolve_source(
+    path: str | os.PathLike[str], roots: Iterable[str | os.PathLike[str]] | None
+) -> Path:
+    """Resolve ``path`` to an existing ``.mkv`` inside ``roots`` or raise ``RetryNotFound``.
 
-    Validates synchronously and raises ``RetryNotFound`` (404) or
-    ``RetryConflict`` (409) so the route stays thin.  Once accepted it deletes
-    the marker (so ``_already_done`` no longer short-circuits) and runs
-    ``after_organize`` on its own daemon thread, returning immediately: an
-    encode takes over an hour, and a dedicated thread keeps it off the default
-    executor.  The encode is the ordinary ``after_organize`` ->
-    ``transcode_to_av1`` path, so it takes the same ``_encode_slot`` permit and
-    shows in ``_ENCODING`` like any other; there is no second code path.
-
-    ``roots``: the source must resolve inside one of these.  The route passes
-    ``default_retry_roots(library paths)``.  None means the AV1 staging parent
-    only, so a caller that forgets the roots fails closed.
+    ``roots`` None means Engram's domain only (fail closed).
     """
     try:
         src = Path(path).resolve(strict=False)
@@ -916,12 +1147,68 @@ def retry_encode(
         raise RetryNotFound(f"Not a file: {path}") from exc
     allowed = [Path(r) for r in roots] if roots is not None else default_retry_roots(())
     if not _within(src, allowed):
-        logger.warning("AV1 hook: refusing retry outside Engram's domain: %s", src)
+        logger.warning("AV1 hook: refusing request outside Engram's domain: %s", src)
         raise RetryNotFound(f"Not a file in Engram's domain: {path}")
     if not src.is_file() or src.suffix.lower() != ".mkv":
         raise RetryNotFound(f"Not an existing .mkv file: {path}")
+    return src
+
+
+def _refuse_in_place(src: Path) -> None:
+    if _would_encode_in_place(src, _staging_dir()):
+        raise RetryInvalid(
+            f"{src.name} is in ENGRAM_AV1_STAGING; encoding it would overwrite the source")
+
+
+def _validate_forced(src: Path, codec_class: str) -> None:
+    """Raise ``RetryInvalid`` unless ``codec_class`` may be forced on ``src``.  Probes."""
+    if codec_class not in OFFERED_CLASSES:  # before the probe: no ffprobe for junk input
+        raise RetryInvalid(forced_class_problem(codec_class, {}))
+    problem = forced_class_problem(codec_class, _probe(src))
+    if problem is not None:
+        raise RetryInvalid(problem)
+
+
+def retry_encode(
+    path: str | os.PathLike[str],
+    *,
+    loop=None,
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+    codec_class: str | None = None,
+) -> None:
+    """Force a re-encode of ``path`` in the background.
+
+    Validates synchronously and raises ``RetryNotFound`` (404),
+    ``RetryConflict`` (409) or ``RetryInvalid`` (422) so the route stays thin.
+    Once accepted it strips the marker's done record (so ``_already_done`` no
+    longer short-circuits) while keeping its ``override`` pin, and runs
+    ``after_organize`` on its own daemon thread, returning immediately: an
+    encode takes over an hour, and a dedicated thread keeps it off the default
+    executor.  The encode is the ordinary ``after_organize`` ->
+    ``transcode_to_av1`` path, so it takes the same ``_encode_slot`` permit and
+    shows in ``_ENCODING`` like any other; there is no second code path.
+
+    ``codec_class`` (one of :data:`OFFERED_CLASSES`) is persisted as the pin
+    before the encode is queued, so the choice is on disk, never only in
+    memory: the worker reads it back from the marker.  Refused with 409 under
+    ``ENGRAM_CODEC_CLASSIFIER=0``.
+
+    ``roots``: the source must resolve inside one of these.  The route passes
+    ``default_retry_roots(library paths)``.  None means the AV1 staging parent
+    only, so a caller that forgets the roots fails closed.
+
+    May run ffprobe (with ``codec_class``); call it off the event loop.
+    """
+    src = _resolve_source(path, roots)
     if not is_enabled():
         raise RetryConflict("The AV1 hook is disabled (ENGRAM_AV1_HOOK is not 1)")
+    _refuse_in_place(src)
+    if codec_class is not None:
+        if not classifier_enabled():
+            raise RetryConflict(
+                "The codec classifier is disabled (ENGRAM_CODEC_CLASSIFIER=0); "
+                "a codec class cannot be forced")
+        _validate_forced(src, codec_class)
 
     key = str(_staging_dir() / src.name)
     with _encoding_lock:
@@ -932,7 +1219,10 @@ def retry_encode(
         _forget_failure_locked(str(src))
 
     try:
-        _marker_path(src).unlink(missing_ok=True)
+        with _marker_lock:
+            if codec_class is not None:
+                _store_override(src, codec_class)
+            _strip_done(src)
         threading.Thread(
             target=_run_retry, args=(src, key, loop), name="av1-retry", daemon=True
         ).start()
@@ -940,4 +1230,110 @@ def retry_encode(
         with _encoding_lock:
             _RETRY_PENDING.discard(key)
         raise
-    logger.info("AV1 hook: retry queued for %s", src.name)
+    logger.info("AV1 hook: retry queued for %s%s", src.name,
+                f" (class={codec_class}, forced)" if codec_class else "")
+
+
+# ---------------------------------------------------------------------------
+# Codec-class pin (override)
+# ---------------------------------------------------------------------------
+
+
+def override_status(
+    path: str | os.PathLike[str],
+    *,
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+) -> dict[str, Any]:
+    """``GET /api/encoding/override`` payload for ``path``.
+
+    Outside the domain this answers ``in_domain: false`` without reading any
+    marker.  Inside it, a missing file raises ``RetryNotFound``.  ``override``
+    is the stored pin plus ``stale`` (True when the source changed since it
+    was set; a stale pin is ignored and dropped by the next encode).
+    """
+    status: dict[str, Any] = {
+        "file": str(path),
+        "in_domain": False,
+        "done": False,
+        "applied_class": None,
+        "forced": False,
+        "override": None,
+        "classifier_enabled": classifier_enabled(),
+        "classes": list(OFFERED_CLASSES),
+    }
+    try:
+        _resolve_source(path, roots)
+    except RetryNotFound:
+        try:
+            resolved = Path(path).resolve(strict=False)
+            allowed = [Path(r) for r in roots] if roots is not None else default_retry_roots(())
+            inside = _within(resolved, allowed)
+        except (OSError, ValueError, TypeError, RuntimeError):
+            inside = False
+        if inside:
+            raise  # in the domain but not an existing .mkv
+        return status
+    src = Path(path).resolve(strict=False)
+    status["file"] = str(src)
+    status["in_domain"] = True
+    data = _read_marker(src)
+    done = _already_done(src)
+    status["done"] = done
+    if done:
+        status["applied_class"] = data.get("codec_class")
+        status["forced"] = bool(data.get("forced"))
+    override = data.get("override")
+    if isinstance(override, dict):
+        try:
+            stale = not _override_fresh(override, src.stat())
+        except OSError:
+            stale = True
+        status["override"] = {
+            "codec_class": override.get("codec_class"),
+            "set_at": override.get("set_at"),
+            "size": override.get("size"),
+            "mtime": override.get("mtime"),
+            "stale": stale,
+        }
+    return status
+
+
+def set_override(
+    path: str | os.PathLike[str],
+    codec_class: str,
+    *,
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+) -> dict[str, Any]:
+    """Pin ``codec_class`` for ``path``.  Records only: never starts an encode (D2).
+
+    The pin applies to the next encode of this source revision (a retry, or
+    the first ``after_organize`` if the file has not been encoded yet).
+    Raises ``RetryNotFound`` (404) or ``RetryInvalid`` (422).  Probes the source.
+    """
+    src = _resolve_source(path, roots)
+    _refuse_in_place(src)
+    _validate_forced(src, codec_class)
+    _store_override(src, codec_class)
+    logger.info("AV1 hook: codec class pinned: class=%s for %s", codec_class, src.name)
+    return override_status(src, roots=roots)
+
+
+def clear_override(
+    path: str | os.PathLike[str],
+    *,
+    roots: Iterable[str | os.PathLike[str]] | None = None,
+) -> bool:
+    """Remove the pin for ``path``; the classifier decides again.  Returns whether one existed.
+
+    A marker that held nothing but the pin is deleted.  Raises ``RetryNotFound``
+    (404) outside the domain.
+    """
+    src = _resolve_source(path, roots)
+    with _marker_lock:
+        data = _read_marker(src)
+        if "override" not in data:
+            return False
+        data.pop("override")
+        _store_marker(src, data)
+    logger.info("AV1 hook: codec class pin cleared for %s", src.name)
+    return True
