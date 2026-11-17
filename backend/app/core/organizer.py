@@ -1064,6 +1064,7 @@ def organize_tv_extras(
     *,
     year: int | None = None,
     tmdb_id: str | None = None,
+    conflict_resolution: str = "ask",
 ) -> dict:
     """Organize a ripped TV extra/bonus content into the library Extras folder.
 
@@ -1120,13 +1121,19 @@ def organize_tv_extras(
 
     logger.info(f"Organizing TV extra: {source_file.name} -> {dest_file}")
 
-    existing = _existing_media(dest_file)
-    if existing is not None:
+    # Honour the caller's strategy: a re-ripped disc produces several distinct
+    # featurettes that share one "Disc N Extra tNN" name, so a hard FILE_EXISTS
+    # here made every extra after the first unresolvable. Episodes already honour
+    # this; extras previously did not.
+    dest_file, early = resolve_conflict(dest_file, conflict_resolution)
+    if early:
+        if early.get("skipped"):
+            return {"success": True, "final_path": None, "error": None, "skipped": True}
         return {
             "success": False,
             "final_path": None,
-            "error": f"Destination file already exists: {existing}",
-            "error_code": "FILE_EXISTS",
+            "error": early.get("error", "Destination file already exists"),
+            "error_code": early.get("error_code", "FILE_EXISTS"),
         }
 
     try:
