@@ -228,6 +228,25 @@ def encoding_status() -> dict[str, list[dict[str, Any]]]:
     return {"active": encoding_snapshot(), "failed": failures_snapshot()}
 
 
+def dismiss_failure(source: str | None = None) -> int:
+    """Drop buffered failure rows for ``source`` (all of them when None).
+
+    Returns the number of rows removed.  The buffer is process-local and purely
+    cosmetic, so a stale row — one whose source is no longer in Engram's domain,
+    or a failure the operator has decided not to retry — can simply be cleared
+    instead of waiting for the ring buffer to age out.
+    """
+    with _encoding_lock:
+        if source is None:
+            removed = len(_FAILED)
+            _FAILED.clear()
+            return removed
+        stale = [e for e in _FAILED if e.get("source") == source]
+        for entry in stale:
+            _FAILED.remove(entry)
+        return len(stale)
+
+
 def _parse_speed(raw: str | None) -> float | None:
     """``"0.216x"`` -> 0.216; absent, ``N/A``, zero or garbage -> None (unknown)."""
     if not raw:
@@ -744,6 +763,12 @@ def after_organize(
             return
         if src.suffix.lower() != ".mkv":
             return
+        if not in_domain(src):
+            logger.warning(
+                "AV1 hook: refusing to encode %s — outside Engram's domain "
+                "(only rips in staging and their AV1 output are Engram's)", src,
+            )
+            return
         if _already_done(src):
             logger.info("AV1 hook: already converted, skipping %s", src.name)
             return
@@ -795,28 +820,51 @@ def _staging_dir() -> Path:
     return Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
 
 
-# The container's real media mounts.  Always legitimate retry roots: the hook
-# writes its marker beside whatever source file it is given, and these are the
-# directories Jellyfin actually reads from.
-_MEDIA_ROOTS = ("/media/tv", "/media/movies")
+# Engram's domain: the only places a file may be encoded from.  A rip lands in
+# the curator's staging root (``library_tv_path``/``library_movies_path``); an
+# encode's output lands under ``ENGRAM_AV1_STAGING``.  Nothing else on the NAS is
+# Engram's to touch — the library holds files Engram never produced (legacy rips,
+# downloads, anime releases), and re-encoding those silently rewrites the
+# principal's collection with a different codec and a lossy generation.
+_DOMAIN_ROOTS = ("/media/_staging",)
+
+
+def domain_roots(library_paths: Iterable[str | None] = ()) -> list[Path]:
+    """Roots a file must live under for Engram to encode it.
+
+    Deliberately *not* ``/media/tv`` or ``/media/movies``: those are the library,
+    which is read-only as far as the hook is concerned.  ``library_paths`` are
+    honoured only when they resolve inside :data:`_DOMAIN_ROOTS`, so a
+    misconfigured ``library_tv_path` cannot widen the domain back to the library.
+    """
+    roots: list[Path] = [Path(p) for p in _DOMAIN_ROOTS if Path(p).is_dir()]
+    for raw in library_paths:
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate.is_dir() and _within(candidate, roots):
+            roots.append(candidate)
+    staging = _staging_dir()
+    if staging.is_dir():
+        roots.append(staging)
+    return roots
+
+
+def in_domain(path: str | os.PathLike[str], library_paths: Iterable[str | None] = ()) -> bool:
+    """True when ``path`` is a file Engram is allowed to encode."""
+    try:
+        return _within(Path(path).resolve(strict=False), domain_roots(library_paths))
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False
 
 
 def default_retry_roots(library_paths: Iterable[str | None]) -> list[Path]:
-    """Roots a retried source may live under: the library roots plus the AV1
-    staging directory's parent.  Empty / unset paths are skipped (an unset
-    path would otherwise resolve to the working directory and authorise it).
+    """Roots a retried source may live under.  See :func:`domain_roots`.
 
-    The container's real media mounts are always included.  ``library_tv_path``
-    is routinely repointed at the curator's staging root so new discs are filed
-    for review, which leaves the *actual* library (``/media/tv``) outside the
-    configured paths — and those are exactly the files a failed encode needs to
-    retry.  The hook writes its marker beside the source wherever that source
-    lives, so both roots are legitimate.
+    Kept as the name the route calls; the policy it encodes is now "Engram's
+    domain only", not "anywhere Jellyfin reads from".
     """
-    roots = [Path(p) for p in library_paths if p]
-    roots.extend(Path(p) for p in _MEDIA_ROOTS if Path(p).is_dir())
-    roots.append(_staging_dir().parent)
-    return roots
+    return domain_roots(library_paths)
 
 
 def _within(path: Path, roots: Iterable[Path]) -> bool:
@@ -868,8 +916,8 @@ def retry_encode(
         raise RetryNotFound(f"Not a file: {path}") from exc
     allowed = [Path(r) for r in roots] if roots is not None else default_retry_roots(())
     if not _within(src, allowed):
-        logger.warning("AV1 hook: refusing retry outside the library roots: %s", src)
-        raise RetryNotFound(f"Not a file in the library: {path}")
+        logger.warning("AV1 hook: refusing retry outside Engram's domain: %s", src)
+        raise RetryNotFound(f"Not a file in Engram's domain: {path}")
     if not src.is_file() or src.suffix.lower() != ".mkv":
         raise RetryNotFound(f"Not an existing .mkv file: {path}")
     if not is_enabled():

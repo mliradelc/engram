@@ -518,6 +518,31 @@ class EncodeRetryRequest(BaseModel):
     file: str = Field(..., min_length=1, description="Absolute path of the source .mkv")
 
 
+class EncodeDismissRequest(BaseModel):
+    file: str | None = Field(
+        default=None,
+        description="Absolute source path to clear; omit to clear every failed row",
+    )
+
+
+@router.post(
+    "/encoding/dismiss",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def dismiss_encoding(body: EncodeDismissRequest | None = None) -> dict:
+    """Clear failed-encode rows from the panel without restarting the app.
+
+    The failure buffer is in-memory and process-local, so a row whose source is
+    outside Engram's domain (or a failure the operator has decided not to
+    retry) otherwise lingers until the process restarts.  Returns the number of
+    rows removed.
+    """
+    from app.services import av1_hook
+
+    source = body.file if body is not None else None
+    return {"dismissed": av1_hook.dismiss_failure(source)}
+
+
 @router.post(
     "/encoding/retry",
     status_code=202,
