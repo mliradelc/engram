@@ -1501,94 +1501,97 @@ class EpisodeMatcher:
             raise NoAudioStreamError(f"{mkv_file} has no audio track to transcribe")
 
         chunk_path = self._chunk_path(mkv_file, start_time, duration)
-        if not chunk_path.exists():
-            # Name the stream explicitly: left to itself ffmpeg takes the
-            # default-flagged track, which on a dub disc can be the wrong language.
-            stream_index = self._audio_stream_index(mkv_file)
-            stream_map = ["-map", f"0:a:{stream_index}"] if stream_index is not None else []
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-ss",
-                str(start_time),
-                "-t",
-                str(duration),
-                "-i",
-                str(mkv_file),
-                *stream_map,
-                "-vn",  # Disable video
-                "-sn",  # Disable subtitles
-                "-dn",  # Disable data streams
-                "-acodec",
-                "pcm_s16le",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-y",  # Overwrite output files without asking
-                str(chunk_path),
-            ]
+        # Always extract, never reuse a wav already on disk. Within a process the
+        # audio_chunks memo above is the cache; a file found here can only come
+        # from another process (a crashed run, a killed ffmpeg, an earlier rip at
+        # the same staging path, a test), so it is a half-written or wrong-source
+        # chunk. The name hashes only the source path, not its contents. ffmpeg's
+        # -y overwrites it.
+        # Name the stream explicitly: left to itself ffmpeg takes the
+        # default-flagged track, which on a dub disc can be the wrong language.
+        stream_index = self._audio_stream_index(mkv_file)
+        stream_map = ["-map", f"0:a:{stream_index}"] if stream_index is not None else []
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-ss",
+            str(start_time),
+            "-t",
+            str(duration),
+            "-i",
+            str(mkv_file),
+            *stream_map,
+            "-vn",  # Disable video
+            "-sn",  # Disable subtitles
+            "-dn",  # Disable data streams
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-y",  # Overwrite output files without asking
+            str(chunk_path),
+        ]
 
-            try:
-                logger.debug(
-                    f"Extracting audio segment from {mkv_file} at {start_time}s (duration: {duration}s) using FFmpeg"
-                )
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 30)
+        try:
+            logger.debug(
+                f"Extracting audio segment from {mkv_file} at {start_time}s (duration: {duration}s) using FFmpeg"
+            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=duration + 30)
 
-                if result.returncode != 0:
-                    # A file with no audio fails every chunk the same way; say so
-                    # once and remember it rather than logging ten opaque errors.
-                    if has_audio_stream(mkv_file) is False:
-                        self._no_audio_sources.add(source_identity)
-                        error_msg = (
-                            f"{mkv_file} has no audio track to transcribe; skipping "
-                            "audio matching for it (MakeMKV may have left out a track "
-                            "its language selection excluded)"
-                        )
-                        logger.warning(error_msg)
-                        raise NoAudioStreamError(error_msg)
-                    error_msg = f"FFmpeg failed with return code {result.returncode}"
-                    tail = _stderr_tail(result.stderr)
-                    if tail:
-                        error_msg += f". Error: {tail}"
-                    logger.error(error_msg)
-                    logger.debug(f"FFmpeg command: {' '.join(cmd)}")
-                    raise RuntimeError(error_msg)
-
-                # Check if the output file was actually created and has content
-                if not chunk_path.exists():
-                    error_msg = f"FFmpeg completed but output file was not created: {chunk_path}"
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-
-                # Check if the file has meaningful content (at least 1KB)
-                if chunk_path.stat().st_size < 1024:
-                    error_msg = f"Generated audio chunk is too small ({chunk_path.stat().st_size} bytes), likely corrupted"
+            if result.returncode != 0:
+                # A file with no audio fails every chunk the same way; say so
+                # once and remember it rather than logging ten opaque errors.
+                if has_audio_stream(mkv_file) is False:
+                    self._no_audio_sources.add(source_identity)
+                    error_msg = (
+                        f"{mkv_file} has no audio track to transcribe; skipping "
+                        "audio matching for it (MakeMKV may have left out a track "
+                        "its language selection excluded)"
+                    )
                     logger.warning(error_msg)
-                    # Don't raise an error for small files, but log the warning
-
-                logger.debug(f"Successfully extracted {chunk_path.stat().st_size} byte audio file")
-
-            except subprocess.TimeoutExpired as e:
-                error_msg = f"FFmpeg timed out while extracting audio from {mkv_file}"
+                    raise NoAudioStreamError(error_msg)
+                error_msg = f"FFmpeg failed with return code {result.returncode}"
+                tail = _stderr_tail(result.stderr)
+                if tail:
+                    error_msg += f". Error: {tail}"
                 logger.error(error_msg)
-                raise RuntimeError(error_msg) from e
+                logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+                raise RuntimeError(error_msg)
 
-            except NoAudioStreamError:
-                raise
-
-            except Exception as e:
-                error_msg = f"Failed to extract audio from {mkv_file}: {str(e)}"
+            # Check if the output file was actually created and has content
+            if not chunk_path.exists():
+                error_msg = f"FFmpeg completed but output file was not created: {chunk_path}"
                 logger.error(error_msg)
-                # Clean up partial file if it exists
-                if chunk_path.exists():
-                    try:
-                        chunk_path.unlink()
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            f"Failed to clean up partial file {chunk_path}: {cleanup_error}"
-                        )
-                raise RuntimeError(error_msg) from e
+                raise RuntimeError(error_msg)
+
+            # Check if the file has meaningful content (at least 1KB)
+            if chunk_path.stat().st_size < 1024:
+                error_msg = f"Generated audio chunk is too small ({chunk_path.stat().st_size} bytes), likely corrupted"
+                logger.warning(error_msg)
+                # Don't raise an error for small files, but log the warning
+
+            logger.debug(f"Successfully extracted {chunk_path.stat().st_size} byte audio file")
+
+        except subprocess.TimeoutExpired as e:
+            error_msg = f"FFmpeg timed out while extracting audio from {mkv_file}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+        except NoAudioStreamError:
+            raise
+
+        except Exception as e:
+            error_msg = f"Failed to extract audio from {mkv_file}: {str(e)}"
+            logger.error(error_msg)
+            # Clean up partial file if it exists
+            if chunk_path.exists():
+                try:
+                    chunk_path.unlink()
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up partial file {chunk_path}: {cleanup_error}")
+            raise RuntimeError(error_msg) from e
 
         chunk_path_str = str(chunk_path)
         self.audio_chunks[cache_key] = chunk_path_str

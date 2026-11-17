@@ -1577,6 +1577,9 @@ class TestPlannedAudioStream:
         from app.matcher.episode_identification import EpisodeMatcher
 
         matcher = EpisodeMatcher(cache_dir=tmp_path, show_name="Test Show")
+        # Keep the fake wavs these tests write out of the system temp dir.
+        matcher.temp_dir = tmp_path / "chunks"
+        matcher.temp_dir.mkdir(exist_ok=True)
         stream = (
             AudioStream(stream_index, "en", "", 2, False, False)
             if stream_index is not None
