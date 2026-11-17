@@ -418,6 +418,8 @@ def test_after_organize_forwards_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
+    # The fixture file stands in for a rip in Engram's staging root.
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
     seen = {}
 
     def fake_transcode(src, staging, plan=None, *, loop=None):
@@ -428,6 +430,37 @@ def test_after_organize_forwards_loop(tmp_path, monkeypatch):
     sentinel = object()
     av1_hook.after_organize(str(_src(tmp_path)), loop=sentinel)
     assert seen["loop"] is sentinel
+
+
+def test_after_organize_refuses_a_library_path(tmp_path, monkeypatch, caplog):
+    """A file in the library (``/media/tv``) is never Engram's to encode.
+
+    Regression for the hook re-encoding files it never produced: the domain is
+    the staging root plus ``ENGRAM_AV1_STAGING``, and a library path is refused
+    before classification, encoding, or any marker write.
+    """
+    media = tmp_path / "media"
+    (media / "_staging").mkdir(parents=True)
+    show = media / "tv" / "Show" / "Season 01"
+    show.mkdir(parents=True)
+    src = show / "Show - S01E01.mkv"
+    src.write_bytes(b"legacy rip")
+    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
+    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(media / "_staging"),))
+    calls = []
+    monkeypatch.setattr(av1_hook, "transcode_to_av1", lambda *a, **k: calls.append(a))
+
+    with caplog.at_level("WARNING", logger=av1_hook.logger.name):
+        av1_hook.after_organize(str(src))
+
+    assert calls == []
+    assert not av1_hook._marker_path(src).exists()
+    assert any(
+        "refusing to encode" in r.getMessage() and "outside Engram's domain" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -518,16 +551,23 @@ def test_failure_is_recorded_before_the_terminal_publish(tmp_path, monkeypatch):
 
 @pytest.fixture
 def hook_env(tmp_path, monkeypatch):
+    """Hook on, and Engram's domain pointed at a fixture staging root.
+
+    Returns that root.  The retry worker runs ``after_organize``, which refuses
+    anything outside ``_DOMAIN_ROOTS``, so the fixture must be inside the domain
+    for a retry to reach the encoder at all.
+    """
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
-    lib = tmp_path / "library"
-    lib.mkdir()
-    return lib
+    staging_root = tmp_path / "_staging"
+    staging_root.mkdir()
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(staging_root),))
+    return staging_root
 
 
-def _library_src(lib: Path, name: str = "Show - S01E01.mkv") -> Path:
-    p = lib / name
+def _staged_src(root: Path, name: str = "Show - S01E01.mkv") -> Path:
+    p = root / name
     p.write_bytes(b"src")
     return p
 
@@ -550,7 +590,7 @@ def _wait_for(pred, timeout: float = 5.0) -> bool:
 
 
 def test_retry_deletes_marker_and_starts_an_encode(hook_env, monkeypatch):
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     marker = _write_done_marker(src)
     calls = []
     done = threading.Event()
@@ -572,7 +612,7 @@ def test_retry_deletes_marker_and_starts_an_encode(hook_env, monkeypatch):
 def test_retry_goes_through_the_shared_gate_and_registry(hook_env, monkeypatch):
     """A retried file takes an encode permit and shows in the active registry."""
     monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     _write_done_marker(src)
     gate = threading.Event()
     monkeypatch.setattr(subprocess, "run", ProgressRun(_blocks()[:2], gate=gate))
@@ -588,7 +628,7 @@ def test_retry_goes_through_the_shared_gate_and_registry(hook_env, monkeypatch):
 
 
 def test_retry_moves_the_row_out_of_failed(hook_env, monkeypatch):
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     av1_hook._record_failure(src.resolve(), av1_hook._staging_dir() / src.name, "boom")
     assert len(av1_hook.failures_snapshot()) == 1
     started = threading.Event()
@@ -628,7 +668,7 @@ def test_retry_refuses_a_directory(hook_env):
 def test_retry_refuses_paths_outside_the_roots(hook_env, tmp_path):
     outside = tmp_path / "elsewhere"
     outside.mkdir()
-    src = _library_src(outside)
+    src = _staged_src(outside)
     with pytest.raises(av1_hook.RetryNotFound):
         av1_hook.retry_encode(src, roots=[hook_env])
     # ``..`` cannot climb out of a root either.
@@ -637,23 +677,27 @@ def test_retry_refuses_paths_outside_the_roots(hook_env, tmp_path):
 
 
 def test_retry_refuses_a_sibling_prefix_root(hook_env, tmp_path):
-    sibling = tmp_path / "library-old"
+    sibling = tmp_path / "_staging-old"
     sibling.mkdir()
-    src = _library_src(sibling)
+    src = _staged_src(sibling)
     with pytest.raises(av1_hook.RetryNotFound):
         av1_hook.retry_encode(src, roots=[hook_env])
 
 
 def test_retry_without_roots_fails_closed(hook_env, tmp_path, monkeypatch):
-    """No roots: only the AV1 staging parent is allowed."""
+    """No roots: only Engram's domain is allowed, never a file outside it."""
+    elsewhere = tmp_path / "media" / "_staging"
+    elsewhere.mkdir(parents=True)
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(elsewhere),))
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     with pytest.raises(av1_hook.RetryNotFound):
         av1_hook.retry_encode(src)
+    assert not av1_hook._RETRY_PENDING
 
 
 def test_retry_refused_while_the_file_is_encoding(hook_env, monkeypatch):
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     marker = _write_done_marker(src)
     key = str(av1_hook._staging_dir() / src.name)
     av1_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
@@ -667,7 +711,7 @@ def test_retry_refused_while_the_file_is_encoding(hook_env, monkeypatch):
 
 
 def test_second_retry_refused_while_the_first_is_queued(hook_env, monkeypatch):
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     release = threading.Event()
     started = threading.Event()
     calls = []
@@ -694,14 +738,14 @@ def test_second_retry_refused_while_the_first_is_queued(hook_env, monkeypatch):
 
 def test_retry_refused_when_the_hook_is_disabled(hook_env, monkeypatch):
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "0")
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
     with pytest.raises(av1_hook.RetryConflict):
         av1_hook.retry_encode(src, roots=[hook_env])
     assert not av1_hook._RETRY_PENDING
 
 
 def test_retry_worker_never_raises(hook_env, monkeypatch):
-    src = _library_src(hook_env)
+    src = _staged_src(hook_env)
 
     def boom(*a, **k):
         raise RuntimeError("encoder exploded")
@@ -711,25 +755,42 @@ def test_retry_worker_never_raises(hook_env, monkeypatch):
     assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
 
 
-def test_default_retry_roots_skip_empty_and_add_staging_parent(monkeypatch, tmp_path):
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
-    roots = av1_hook.default_retry_roots(["/media/tv", "", None])
-    # Empty / unset entries are dropped; the staging parent is always appended.
-    assert Path("/media/tv") in roots
-    assert tmp_path / "staging" in roots
-    assert "" not in [str(r) for r in roots]
+def test_default_retry_roots_skip_empty_and_honour_only_in_domain_paths(monkeypatch, tmp_path):
+    """Empty/unset library paths are dropped; a configured one counts only inside the domain."""
+    domain = tmp_path / "media" / "_staging"
+    inside = domain / "tv"
+    outside = tmp_path / "media" / "tv"
+    staging = tmp_path / "staging" / "av1-out"
+    for d in (inside, outside, staging):
+        d.mkdir(parents=True)
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(staging))
+
+    roots = av1_hook.default_retry_roots([str(inside), str(outside), "", None])
+
+    assert roots == [domain, inside, staging]
+    assert outside not in roots
 
 
-def test_default_retry_roots_include_real_media_mounts(monkeypatch, tmp_path):
-    """A repointed library_tv_path must not lock retry out of the real library.
-
-    ``library_tv_path`` is routinely set to the curator's staging root, so the
-    configured paths alone leave /media/tv (where the files that need a retry
-    actually live) unauthorised.  The container's media mounts are always roots.
+def test_domain_roots_are_staging_only_never_the_library(monkeypatch, tmp_path):
+    """The domain is the staging root plus ENGRAM_AV1_STAGING; /media/tv and
+    /media/movies are the library and stay out even when configured as library paths.
     """
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
-    roots = av1_hook.default_retry_roots([str(tmp_path / "arm_completed")])
-    for media in av1_hook._MEDIA_ROOTS:
-        if Path(media).is_dir():
-            assert Path(media) in roots, f"{media} must be a retry root"
+    assert av1_hook._DOMAIN_ROOTS == ("/media/_staging",)
+    assert not {"/media/tv", "/media/movies"} & set(av1_hook._DOMAIN_ROOTS)
 
+    media = tmp_path / "media"
+    domain, tv, movies = media / "_staging", media / "tv", media / "movies"
+    staging = tmp_path / "staging" / "av1-out"
+    for d in (domain, tv, movies, staging):
+        d.mkdir(parents=True)
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(staging))
+
+    roots = av1_hook.domain_roots([str(tv), str(movies)])
+
+    assert roots == [domain, staging]
+    assert av1_hook.in_domain(domain / "Show - S01E01.mkv", [str(tv), str(movies)])
+    assert av1_hook.in_domain(staging / "Show - S01E01.mkv")
+    assert not av1_hook.in_domain(tv / "Show - S01E01.mkv", [str(tv), str(movies)])
+    assert not av1_hook.in_domain(movies / "Film (2010).mkv", [str(tv), str(movies)])

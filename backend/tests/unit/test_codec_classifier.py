@@ -438,6 +438,9 @@ def hook(monkeypatch, tmp_path):
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "stage"))
     monkeypatch.delenv("ENGRAM_CODEC_CLASSIFIER", raising=False)
+    # The fixture source stands in for a rip in Engram's staging root; the hook
+    # refuses anything outside ``_DOMAIN_ROOTS``.
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
     src = tmp_path / "Movie (2000).mkv"
     src.write_bytes(b"source")
     yield src, tmp_path
@@ -819,6 +822,7 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "stage"))
     monkeypatch.setenv("ENGRAM_AV1_THREADS", "2")
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))  # src is a staged rip
     # Force a fast preset on whatever class the media lands in; settings otherwise intact.
     real = av1_hook._load_classifier()
     orig = real.plan_for_file

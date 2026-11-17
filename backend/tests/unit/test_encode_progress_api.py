@@ -74,11 +74,18 @@ async def test_encoding_endpoint_lists_failures(client, tmp_path):
 
 @pytest.fixture
 def retry_env(tmp_path, monkeypatch):
-    """Hook on, library root under tmp_path, config read stubbed, no real encode."""
+    """Hook on, config read stubbed, no real encode.
+
+    Engram's domain is pointed at a fixture staging root and ``library_tv_path``
+    is configured inside it (the curator's staging layout), so the route's
+    ``default_retry_roots`` honours it.  A path outside the domain still 404s.
+    """
     from app.services import config_service
 
-    lib = tmp_path / "tv"
-    lib.mkdir()
+    domain = tmp_path / "_staging"
+    lib = domain / "tv"
+    lib.mkdir(parents=True)
+    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
     monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
     monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
 
