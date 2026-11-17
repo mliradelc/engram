@@ -159,6 +159,66 @@ def test_empty_section_rejected_in_print_mode(ecl, tmp_path, capsys):
     assert capsys.readouterr().out.strip() == ""
 
 
+# Fork tags (v0.45.0-fork.3) carry a suffix the upstream CHANGELOG never has a
+# heading for; they must fall back to the base version's section, while an
+# unknown base must still fail.
+
+
+def test_candidate_versions_fork_tag(ecl):
+    assert ecl.candidate_versions("0.10.0-fork.3") == ["0.10.0-fork.3", "0.10.0"]
+    assert ecl.candidate_versions("v0.10.0-fork.3") == ["0.10.0-fork.3", "0.10.0"]
+
+
+def test_candidate_versions_plain_version(ecl):
+    assert ecl.candidate_versions("0.10.0") == ["0.10.0"]
+    assert ecl.candidate_versions("v0.10.0") == ["0.10.0"]
+
+
+def test_resolve_section_fork_tag_falls_back_to_base(ecl):
+    resolved = ecl.resolve_section(_SAMPLE, "0.10.0-fork.3")
+    assert resolved is not None
+    matched, body = resolved
+    assert matched == "0.10.0"
+    assert body == ecl.extract_section(_SAMPLE, "0.10.0")
+
+
+def test_resolve_section_prefers_fork_heading_when_present(ecl):
+    text = "## [0.10.0-fork.1]\n\n- fork entry\n\n## [0.10.0]\n\n- upstream entry\n"
+    matched, body = ecl.resolve_section(text, "0.10.0-fork.1")
+    assert matched == "0.10.0-fork.1"
+    assert "fork entry" in body
+    assert "upstream entry" not in body
+
+
+def test_resolve_section_unknown_base_returns_none(ecl):
+    assert ecl.resolve_section(_SAMPLE, "9.9.9-fork.1") is None
+
+
+def test_main_fork_tag_prints_base_body(ecl, tmp_path, capsys):
+    path = _write_sample(tmp_path)
+    rc = ecl.main(["--version", "v0.10.0-fork.3", "--changelog", str(path)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Bulk actions in the review queue" in out
+    assert "## [0.10.0]" not in out
+
+
+def test_main_fork_tag_check_reports_matched_version(ecl, tmp_path, capsys):
+    path = _write_sample(tmp_path)
+    rc = ecl.main(["--version", "0.10.0-fork.3", "--changelog", str(path), "--check"])
+    assert rc == 0
+    assert "ok: CHANGELOG has a section for 0.10.0 (tag 0.10.0-fork.3)" in capsys.readouterr().out
+
+
+def test_main_fork_tag_unknown_base_fails(ecl, tmp_path, capsys):
+    path = _write_sample(tmp_path)
+    rc = ecl.main(["--version", "9.9.9-fork.1", "--changelog", str(path)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out.strip() == ""
+    assert "9.9.9-fork.1" in captured.err
+
+
 @pytest.mark.skipif(
     not _REAL_CHANGELOG.exists() or not _PYPROJECT.exists(),
     reason="real CHANGELOG.md / pyproject.toml not present",

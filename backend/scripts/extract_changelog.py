@@ -54,6 +54,34 @@ def extract_section(changelog_text: str, version: str) -> str | None:
     return "\n".join(body).strip()
 
 
+def candidate_versions(version: str) -> list[str]:
+    """Versions to try for a tag, most specific first.
+
+    A fork tag such as ``0.45.0-fork.3`` tries its own heading first and then
+    the base version ``0.45.0`` (split on the first ``-``). A plain version
+    yields only itself. A leading ``v`` is tolerated.
+    """
+    version = _normalize_version(version)
+    candidates = [version]
+    base, sep, _suffix = version.partition("-")
+    if sep and base and base != version:
+        candidates.append(base)
+    return candidates
+
+
+def resolve_section(changelog_text: str, version: str) -> tuple[str, str] | None:
+    """Return ``(matched_version, body)`` for the first non-empty candidate section.
+
+    Returns ``None`` when no candidate has a non-empty section, so an unknown
+    base version still fails rather than producing an empty release body.
+    """
+    for candidate in candidate_versions(version):
+        section = extract_section(changelog_text, candidate)
+        if section:
+            return candidate, section
+    return None
+
+
 def _default_changelog() -> Path:
     """Repo-root ``CHANGELOG.md`` — scripts/ -> backend/ -> repo root."""
     return Path(__file__).resolve().parent.parent.parent / "CHANGELOG.md"
@@ -96,20 +124,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read changelog {args.changelog}: {exc}", file=sys.stderr)
         return 1
 
-    section = extract_section(text, args.version)
-    # `not section` catches both a missing header (None) and a header with an
-    # empty body (""), e.g. a stub `## [X.Y.Z]` added before the entry is
-    # written — an empty release body is as broken as a missing one.
-    if not section:
+    # resolve_section skips both a missing header and a header with an empty
+    # body (e.g. a stub `## [X.Y.Z]` added before the entry is written) — an
+    # empty release body is as broken as a missing one. A fork tag such as
+    # 0.45.0-fork.3 falls back to the base 0.45.0 section.
+    resolved = resolve_section(text, args.version)
+    if resolved is None:
+        tried = ", ".join(candidate_versions(args.version))
         print(
             f"error: no non-empty CHANGELOG section for version {args.version!r} "
-            f"in {args.changelog}",
+            f"(tried: {tried}) in {args.changelog}",
             file=sys.stderr,
         )
         return 1
+    matched, section = resolved
 
     if args.check:
-        print(f"ok: CHANGELOG has a section for {args.version}")
+        requested = _normalize_version(args.version)
+        if matched == requested:
+            print(f"ok: CHANGELOG has a section for {matched}")
+        else:
+            print(f"ok: CHANGELOG has a section for {matched} (tag {requested})")
         return 0
 
     print(section)
