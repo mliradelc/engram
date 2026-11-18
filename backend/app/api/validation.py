@@ -895,8 +895,11 @@ async def validate_ai(
     api_key = (request.api_key or "").strip()
     model = (request.model or "").strip()
     base_url = (request.base_url or "").strip()
-    if not api_key or not model or (provider in LOCAL_PROVIDERS and not base_url) or (
-        provider in CUSTOM_PROVIDERS and not base_url
+    if (
+        not api_key
+        or not model
+        or (provider in LOCAL_PROVIDERS and not base_url)
+        or (provider in CUSTOM_PROVIDERS and not base_url)
     ):
         from app.services.config_service import get_config
 

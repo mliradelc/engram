@@ -117,9 +117,7 @@ async def test_retry_returns_202_and_queues(client, retry_env):
 
 
 async def test_retry_returns_404_for_missing_file(client, retry_env):
-    resp = await client.post(
-        "/api/encoding/retry", json={"file": str(retry_env.lib / "nope.mkv")}
-    )
+    resp = await client.post("/api/encoding/retry", json={"file": str(retry_env.lib / "nope.mkv")})
     assert resp.status_code == 404
     assert retry_env.runs == []
 

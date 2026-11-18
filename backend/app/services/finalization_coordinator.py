@@ -60,6 +60,7 @@ def _encode_context(job, disc_title) -> dict | None:
     except Exception:  # noqa: BLE001 - a hint must never break filing
         return None
 
+
 _MATCHER_REFUSAL_CODES = {REFERENCES_UNREADABLE_ERROR_CODE, AUDIO_LANGUAGE_ERROR_CODE}
 
 
@@ -1598,9 +1599,7 @@ class FinalizationCoordinator:
                     title_index=cap["title_index"],
                     tmdb_id=_tmdb_id_str,
                     year=_tmdb_year,
-                    conflict_resolution=_tv_conflict_strategy(
-                        cap.get("conflict_resolution")
-                    ),
+                    conflict_resolution=_tv_conflict_strategy(cap.get("conflict_resolution")),
                 )
             elif _lib_path:
                 org_result = await asyncio.to_thread(
@@ -2619,9 +2618,7 @@ class FinalizationCoordinator:
                         title_index=disc_title.title_index,
                         tmdb_id=_tmdb_id_str,
                         year=_tmdb_year,
-                        conflict_resolution=_tv_conflict_strategy(
-                            disc_title.conflict_resolution
-                        ),
+                        conflict_resolution=_tv_conflict_strategy(disc_title.conflict_resolution),
                     )
                     extra_index += 1
                 else:

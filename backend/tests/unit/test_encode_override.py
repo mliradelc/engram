@@ -52,16 +52,22 @@ _REAL_TRANSCODE = encode_hook.transcode_file
 AV1_SRC = {"streams": [{"codec_type": "video", "codec_name": "av1", "width": 1920, "height": 1080}]}
 
 
-PROGRESSIVE_SRC = {"field_order": "progressive",
-                   "idet": {"tff": 2, "bff": 1, "progressive": 200, "undetermined": 9}}
-INTERLACED_SRC = {"field_order": "tt",
-                  "idet": {"tff": 180, "bff": 4, "progressive": 20, "undetermined": 6}}
+PROGRESSIVE_SRC = {
+    "field_order": "progressive",
+    "idet": {"tff": 2, "bff": 1, "progressive": 200, "undetermined": 9},
+}
+INTERLACED_SRC = {
+    "field_order": "tt",
+    "idet": {"tff": 180, "bff": 4, "progressive": 20, "undetermined": 6},
+}
 
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     monkeypatch.setattr(encode_hook, "_ENCODING", {})
-    monkeypatch.setattr(encode_hook, "_FAILED", encode_hook.deque(maxlen=encode_hook.FAILURE_BUFFER_SIZE))
+    monkeypatch.setattr(
+        encode_hook, "_FAILED", encode_hook.deque(maxlen=encode_hook.FAILURE_BUFFER_SIZE)
+    )
     monkeypatch.setattr(encode_hook, "_RETRY_PENDING", set())
 
 
@@ -535,7 +541,9 @@ def test_retry_and_put_refuse_a_source_in_encode_staging(env):
 def test_kill_switch_classify_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     monkeypatch.setattr(
-        encode_hook, "_load_classifier", lambda: pytest.fail("classifier loaded despite kill switch")
+        encode_hook,
+        "_load_classifier",
+        lambda: pytest.fail("classifier loaded despite kill switch"),
     )
     assert encode_hook._classify(tmp_path / "x.mkv", None) is None
 

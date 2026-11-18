@@ -103,7 +103,9 @@ class TestResolveAiBaseUrl:
     def test_remote_builtin_needs_no_address(self):
         from app.core.ai_client import resolve_ai_base_url
 
-        assert resolve_ai_base_url("openai", "http://box:11434/v1", "https://gw.example.com/v1") == ""
+        assert (
+            resolve_ai_base_url("openai", "http://box:11434/v1", "https://gw.example.com/v1") == ""
+        )
 
 
 class TestCustomProviderIsKnown:

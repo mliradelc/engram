@@ -277,8 +277,7 @@ class CodecPlan:
         """One log line: class, the evidence that drove it, and the outcome."""
         ev = self.evidence
         bits = [f"class={self.class_name}"]
-        for key in ("grain", "animation", "interlaced", "telecined", "hdr", "res",
-                    "fps_class"):
+        for key in ("grain", "animation", "interlaced", "telecined", "hdr", "res", "fps_class"):
             if key in ev and ev[key] is not None:
                 val = ev[key]
                 bits.append(f"{key}={val:.2f}" if isinstance(val, float) else f"{key}={val}")
@@ -354,7 +353,14 @@ def validate_plan(plan: CodecPlan) -> list[str]:
 
 
 X265_PRESETS = {
-    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower",
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
 }
 
 # --------------------------------------------------------------------------
@@ -409,19 +415,23 @@ def _hdr_metadata_params(hdr_meta: dict | None) -> tuple[list, list]:
         try:
             g, b, r, wp = md["green"], md["blue"], md["red"], md["white_point"]
             lmax, lmin = md["max_luminance"], md["min_luminance"]
-            svt.append((
-                "mastering-display",
-                f"G({_fmt(g[0])},{_fmt(g[1])})B({_fmt(b[0])},{_fmt(b[1])})"
-                f"R({_fmt(r[0])},{_fmt(r[1])})WP({_fmt(wp[0])},{_fmt(wp[1])})"
-                f"L({_fmt(lmax)},{_fmt(lmin)})",
-            ))
+            svt.append(
+                (
+                    "mastering-display",
+                    f"G({_fmt(g[0])},{_fmt(g[1])})B({_fmt(b[0])},{_fmt(b[1])})"
+                    f"R({_fmt(r[0])},{_fmt(r[1])})WP({_fmt(wp[0])},{_fmt(wp[1])})"
+                    f"L({_fmt(lmax)},{_fmt(lmin)})",
+                )
+            )
             c = 50000
-            x265.append((
-                "master-display",
-                f"G({round(g[0]*c)},{round(g[1]*c)})B({round(b[0]*c)},{round(b[1]*c)})"
-                f"R({round(r[0]*c)},{round(r[1]*c)})WP({round(wp[0]*c)},{round(wp[1]*c)})"
-                f"L({round(lmax*10000)},{round(lmin*10000)})",
-            ))
+            x265.append(
+                (
+                    "master-display",
+                    f"G({round(g[0] * c)},{round(g[1] * c)})B({round(b[0] * c)},{round(b[1] * c)})"
+                    f"R({round(r[0] * c)},{round(r[1] * c)})WP({round(wp[0] * c)},{round(wp[1] * c)})"
+                    f"L({round(lmax * 10000)},{round(lmin * 10000)})",
+                )
+            )
         except (KeyError, TypeError, IndexError):
             pass
     cl = hdr_meta.get("content_light")
@@ -444,23 +454,34 @@ def _x265_preset(res: str) -> str:
     return {"sd": "medium", "hd": "slow"}.get(res, "fast")
 
 
-def _x265(res: str, crf: int, *, hdr: bool, hdr_meta: dict | None, evidence: dict,
-          class_name: str, reason: str) -> CodecPlan:
+def _x265(
+    res: str,
+    crf: int,
+    *,
+    hdr: bool,
+    hdr_meta: dict | None,
+    evidence: dict,
+    class_name: str,
+    reason: str,
+) -> CodecPlan:
     optional = [("aq-mode", "3")]  # aq-mode 3 biases bits toward dark scenes
     if hdr:
         optional += [("hdr10-opt", "1"), ("repeat-headers", "1")]
         optional += _hdr_metadata_params(hdr_meta)[1]
     return CodecPlan(
-        class_name=class_name, codec="hevc", reason=reason, crf=crf,
+        class_name=class_name,
+        codec="hevc",
+        reason=reason,
+        crf=crf,
         preset=_x265_preset(res),
         # no-sao / strong-intra-smoothing=0 are required, not optional: the hook's
         # fallback drops optional params, and without these two smoothing filters
         # off the grainy class defeats its own purpose (x265 3.5 default tools:
         # b-intra strong-intra-smoothing deblock sao).
-        x265_required=[("log-level", "error"), ("no-sao", "1"),
-                       ("strong-intra-smoothing", "0")],
+        x265_required=[("log-level", "error"), ("no-sao", "1"), ("strong-intra-smoothing", "0")],
         x265_optional=optional,
-        hdr=hdr, evidence=evidence,
+        hdr=hdr,
+        evidence=evidence,
     )
 
 
@@ -479,8 +500,14 @@ def plan_for_class(
     ``source_pix_fmt`` (the probed source's) decides the output bit depth; the
     class never does.
     """
-    plan = _plan_for_class(class_name, res=res, hdr_meta=hdr_meta, grainy_hdr=grainy_hdr,
-                           evidence=evidence, reason=reason)
+    plan = _plan_for_class(
+        class_name,
+        res=res,
+        hdr_meta=hdr_meta,
+        grainy_hdr=grainy_hdr,
+        evidence=evidence,
+        reason=reason,
+    )
     plan.source_pix_fmt = source_pix_fmt
     return plan
 
@@ -501,53 +528,107 @@ def _plan_for_class(
     grain_ok = res != "uhd"
 
     if class_name == PASSTHROUGH:
-        return CodecPlan(class_name=class_name, codec="none", reason=reason or class_name,
-                         evidence=ev)
+        return CodecPlan(
+            class_name=class_name, codec="none", reason=reason or class_name, evidence=ev
+        )
 
     if class_name == INTERLACED:
         # bwdif, then a conservative AV1 encode.  Film grain synthesis is off:
         # grain on interlaced sources is unmeasured (field combing inflates the
         # grain estimate).
         req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
-        return CodecPlan(INTERLACED, "av1", reason or "interlaced source, deinterlaced",
-                         24, preset, svt_required=req, svt_optional=opt,
-                         video_filters=[DEINTERLACE_FILTER], evidence=ev)
+        return CodecPlan(
+            INTERLACED,
+            "av1",
+            reason or "interlaced source, deinterlaced",
+            24,
+            preset,
+            svt_required=req,
+            svt_optional=opt,
+            video_filters=[DEINTERLACE_FILTER],
+            evidence=ev,
+        )
 
     if class_name == ANIMATION:
         req, opt = _av1_base(res, grain=0, vb_strength=1, luma_bias=True)
-        return CodecPlan(class_name, "av1", reason or "flat/low-palette content", 27, preset,
-                         svt_required=req, svt_optional=opt, evidence=ev)
+        return CodecPlan(
+            class_name,
+            "av1",
+            reason or "flat/low-palette content",
+            27,
+            preset,
+            svt_required=req,
+            svt_optional=opt,
+            evidence=ev,
+        )
 
     if class_name == LIVE_ACTION_GRAINY:
         crf = 20 if res == "sd" else 21
-        return _x265(res, crf, hdr=False, hdr_meta=None, evidence=ev,
-                     class_name=class_name, reason=reason or "heavy real grain")
+        return _x265(
+            res,
+            crf,
+            hdr=False,
+            hdr_meta=None,
+            evidence=ev,
+            class_name=class_name,
+            reason=reason or "heavy real grain",
+        )
 
     if class_name == HDR:
         if grainy_hdr:
-            return _x265(res, 20, hdr=True, hdr_meta=hdr_meta, evidence=ev,
-                         class_name=class_name, reason=reason or "grainy HDR")
+            return _x265(
+                res,
+                20,
+                hdr=True,
+                hdr_meta=hdr_meta,
+                evidence=ev,
+                class_name=class_name,
+                reason=reason or "grainy HDR",
+            )
         req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2, luma_bias=False)
         svt_meta = _hdr_metadata_params(hdr_meta)[0]
-        return CodecPlan(class_name, "av1", reason or "HDR", 24, preset,
-                         svt_required=req, svt_optional=opt + svt_meta, hdr=True, evidence=ev)
+        return CodecPlan(
+            class_name,
+            "av1",
+            reason or "HDR",
+            24,
+            preset,
+            svt_required=req,
+            svt_optional=opt + svt_meta,
+            hdr=True,
+            evidence=ev,
+        )
 
     # live_action_clean (also the safe default for any unknown name)
     crf = 23 if res == "sd" else 24  # JET: SD sources want a lower CRF
     req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2, luma_bias=True)
-    return CodecPlan(LIVE_ACTION_CLEAN, "av1", reason or "default", crf, preset,
-                     svt_required=req, svt_optional=opt, evidence=ev)
+    return CodecPlan(
+        LIVE_ACTION_CLEAN,
+        "av1",
+        reason or "default",
+        crf,
+        preset,
+        svt_required=req,
+        svt_optional=opt,
+        evidence=ev,
+    )
 
 
-def deinterlaced_plan(res: str, evidence: dict, source_pix_fmt: str | None = None,
-                      reason: str = "", video_filter: str = DEINTERLACE_FILTER) -> CodecPlan:
+def deinterlaced_plan(
+    res: str,
+    evidence: dict,
+    source_pix_fmt: str | None = None,
+    reason: str = "",
+    video_filter: str = DEINTERLACE_FILTER,
+) -> CodecPlan:
     """The plan for an interlaced (or undecided) source: bwdif, then AV1.
 
     ``video_filter`` is :func:`deinterlace_filter`'s answer; a telecined source
     passes :data:`IVTC_FILTER` and gets ``fieldmatch,decimate`` instead.
     """
-    plan = plan_for_class(INTERLACED, res=res, evidence=evidence, reason=reason,
-                          source_pix_fmt=source_pix_fmt)
+    plan = plan_for_class(
+        INTERLACED, res=res, evidence=evidence, reason=reason, source_pix_fmt=source_pix_fmt
+    )
     return _with_deint_filter(plan, video_filter)
 
 
@@ -576,8 +657,9 @@ def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") 
     height = int(_num(p.get("height"), 0) or 0) or None
     res = resolution_class(width, height)
     ev: dict = {"res": res, "forced": True}
-    plan = plan_for_class(class_name, res=res, evidence=ev, reason=reason,
-                          source_pix_fmt=p.get("pix_fmt"))
+    plan = plan_for_class(
+        class_name, res=res, evidence=ev, reason=reason, source_pix_fmt=p.get("pix_fmt")
+    )
     if plan.is_passthrough:
         return plan  # nothing is encoded, so there is nothing to deinterlace
     vf, inter_ev = deinterlace_filter(p)
@@ -670,8 +752,10 @@ def telecine_verdict(probe: dict) -> tuple[bool, float | None, str]:
     idet = probe.get("idet")
     if not isinstance(idet, dict):
         return False, None, "no_repeated_fields"
-    neither, top, bottom = (int(_num(idet.get(k), 0) or 0)
-                            for k in ("repeated_neither", "repeated_top", "repeated_bottom"))
+    neither, top, bottom = (
+        int(_num(idet.get(k), 0) or 0)
+        for k in ("repeated_neither", "repeated_top", "repeated_bottom")
+    )
     counted = neither + top + bottom
     if counted < IDET_MIN_FRAMES:
         return False, None, "repeated_fields_too_few"
@@ -712,9 +796,12 @@ def deinterlace_filter(probe: dict | None) -> tuple[str | None, dict]:
         tele, tfrac, tbasis = telecine_verdict(p)
     except Exception:  # noqa: BLE001 - unproven telecine is no telecine
         tele, tfrac, tbasis = False, None, "error"
-    ev: dict = {"interlaced": "yes" if inter else ("no" if inter is False else "unknown"),
-                "interlaced_basis": basis,
-                "telecined": "yes" if tele else "no", "telecine_basis": tbasis}
+    ev: dict = {
+        "interlaced": "yes" if inter else ("no" if inter is False else "unknown"),
+        "interlaced_basis": basis,
+        "telecined": "yes" if tele else "no",
+        "telecine_basis": tbasis,
+    }
     if frac is not None:
         ev["interlaced_frac"] = round(frac, 3)
     if tfrac is not None:
@@ -758,8 +845,9 @@ def _classify(probe: dict, context: dict) -> CodecPlan:
         return plan_for_class(PASSTHROUGH, res=res, evidence=ev, reason="source already AV1")
     if context.get("is_extra") and duration is not None and duration < SHORT_EXTRA_SECONDS:
         ev["hints"] = hints
-        return plan_for_class(PASSTHROUGH, res=res, evidence=ev,
-                              reason=f"short extra ({duration:.0f}s)")
+        return plan_for_class(
+            PASSTHROUGH, res=res, evidence=ev, reason=f"short extra ({duration:.0f}s)"
+        )
 
     # 2. telecined / interlaced (or undecided) wins over everything below,
     #    including an animation hint: it is IVTC'd or deinterlaced, then encoded.
@@ -804,8 +892,14 @@ def _classify(probe: dict, context: dict) -> CodecPlan:
     grainy = grain is not None and grain >= grain_thr
     if is_hdr:
         meta = probe.get("hdr_meta") if isinstance(probe.get("hdr_meta"), dict) else None
-        plan = plan_for_class(HDR, res=res, hdr_meta=meta, grainy_hdr=grainy,
-                              evidence=ev, reason=f"transfer={transfer}")
+        plan = plan_for_class(
+            HDR,
+            res=res,
+            hdr_meta=meta,
+            grainy_hdr=grainy,
+            evidence=ev,
+            reason=f"transfer={transfer}",
+        )
         return _with_deint_filter(plan, vf)
 
     # 4. animation, 5. grainy live action, 6. default.
@@ -821,8 +915,9 @@ def _classify(probe: dict, context: dict) -> CodecPlan:
 
 def _undecided_plan(error: str, reason: str) -> CodecPlan:
     """What a failure falls back to: nothing is known, so it deinterlaces."""
-    return deinterlaced_plan("hd", {"error": error, "interlaced": "unknown",
-                                    "interlaced_basis": "error"}, reason=reason)
+    return deinterlaced_plan(
+        "hd", {"error": error, "interlaced": "unknown", "interlaced_basis": "error"}, reason=reason
+    )
 
 
 def classify(probe: dict | None, context: dict | None = None) -> CodecPlan:
@@ -864,11 +959,19 @@ def _parse_rate(text: str | None) -> float | None:
 
 
 def _probe_stream(path: str) -> dict:
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-print_format", "json",
-           "-show_entries",
-           "stream=codec_name,width,height,field_order,r_frame_rate,avg_frame_rate,"
-           "color_transfer,color_primaries,color_space,pix_fmt:format=duration",
-           path]
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-print_format",
+        "json",
+        "-show_entries",
+        "stream=codec_name,width,height,field_order,r_frame_rate,avg_frame_rate,"
+        "color_transfer,color_primaries,color_space,pix_fmt:format=duration",
+        path,
+    ]
     run = _run(cmd)
     if not run or run.returncode != 0:
         return {}
@@ -879,9 +982,13 @@ def _probe_stream(path: str) -> dict:
     streams = data.get("streams") or [{}]
     s = streams[0] if streams else {}
     out = {
-        "codec_name": s.get("codec_name"), "width": s.get("width"), "height": s.get("height"),
-        "field_order": s.get("field_order"), "pix_fmt": s.get("pix_fmt"),
-        "color_transfer": s.get("color_transfer"), "color_primaries": s.get("color_primaries"),
+        "codec_name": s.get("codec_name"),
+        "width": s.get("width"),
+        "height": s.get("height"),
+        "field_order": s.get("field_order"),
+        "pix_fmt": s.get("pix_fmt"),
+        "color_transfer": s.get("color_transfer"),
+        "color_primaries": s.get("color_primaries"),
         "color_space": s.get("color_space"),
         "fps": _parse_rate(s.get("avg_frame_rate")) or _parse_rate(s.get("r_frame_rate")),
         "duration": _num((data.get("format") or {}).get("duration")),
@@ -898,8 +1005,21 @@ def _frac(text) -> float | None:
 
 def _probe_hdr_meta(path: str) -> dict | None:
     """Mastering display + content light from the first frame, as plain numbers."""
-    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
-           "-show_frames", "-show_entries", "frame=side_data_list", "-print_format", "json", path]
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        "%+#1",
+        "-show_frames",
+        "-show_entries",
+        "frame=side_data_list",
+        "-print_format",
+        "json",
+        path,
+    ]
     run = _run(cmd)
     if not run or run.returncode != 0:
         return None
@@ -931,8 +1051,10 @@ def _probe_hdr_meta(path: str) -> dict | None:
                     meta.pop("mastering_display", None)
             elif kind == "Content light level metadata":
                 if sd.get("max_content") is not None and sd.get("max_average") is not None:
-                    meta["content_light"] = {"max_content": sd["max_content"],
-                                             "max_average": sd["max_average"]}
+                    meta["content_light"] = {
+                        "max_content": sd["max_content"],
+                        "max_average": sd["max_average"],
+                    }
     return meta or None
 
 
@@ -942,9 +1064,7 @@ _IDET_RE = re.compile(
 )
 # The telecine signal (see telecine_verdict): fields idet found duplicated
 # from the previous frame.
-_REPEAT_RE = re.compile(
-    rb"Repeated Fields:\s*Neither:\s*(\d+)\s*Top:\s*(\d+)\s*Bottom:\s*(\d+)"
-)
+_REPEAT_RE = re.compile(rb"Repeated Fields:\s*Neither:\s*(\d+)\s*Top:\s*(\d+)\s*Bottom:\s*(\d+)")
 _REPEAT_KEYS = ("repeated_neither", "repeated_top", "repeated_bottom")
 
 
@@ -955,8 +1075,17 @@ def _parse_idet(stderr: bytes) -> tuple[dict | None, dict | None]:
     filter instance (all zeros), so the real one is the LAST of each line.
     """
     found = _IDET_RE.findall(stderr or b"")
-    det = (dict(zip(("tff", "bff", "progressive", "undetermined"),
-                    (int(v) for v in found[-1]), strict=True)) if found else None)
+    det = (
+        dict(
+            zip(
+                ("tff", "bff", "progressive", "undetermined"),
+                (int(v) for v in found[-1]),
+                strict=True,
+            )
+        )
+        if found
+        else None
+    )
     reps = _REPEAT_RE.findall(stderr or b"")
     rep = dict(zip(_REPEAT_KEYS, (int(v) for v in reps[-1]), strict=True)) if reps else None
     return det, rep
@@ -965,13 +1094,37 @@ def _parse_idet(stderr: bytes) -> tuple[dict | None, dict | None]:
 def _probe_idet(path: str, times: list[float]) -> dict | None:
     """idet over each sample, summed: TFF/BFF/progressive/undetermined plus the
     repeated-field counters (``repeated_neither/top/bottom``)."""
-    total = {"tff": 0, "bff": 0, "progressive": 0, "undetermined": 0,
-             **dict.fromkeys(_REPEAT_KEYS, 0)}
+    total = {
+        "tff": 0,
+        "bff": 0,
+        "progressive": 0,
+        "undetermined": 0,
+        **dict.fromkeys(_REPEAT_KEYS, 0),
+    }
     seen = False
     for t in times:
-        cmd = ["ffmpeg", "-nostdin", "-nostats", "-hide_banner", "-v", "info", "-ss", f"{t:.2f}",
-               "-i", path, "-an", "-sn", "-dn", "-t", str(IDET_SECONDS), "-vf", "idet",
-               "-f", "null", "-"]
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-nostats",
+            "-hide_banner",
+            "-v",
+            "info",
+            "-ss",
+            f"{t:.2f}",
+            "-i",
+            path,
+            "-an",
+            "-sn",
+            "-dn",
+            "-t",
+            str(IDET_SECONDS),
+            "-vf",
+            "idet",
+            "-f",
+            "null",
+            "-",
+        ]
         run = _run(cmd)
         if not run:
             continue
@@ -988,7 +1141,7 @@ def _probe_idet(path: str, times: list[float]) -> dict | None:
 
 
 def _frames(raw: bytes, size: int) -> list[bytes]:
-    return [raw[i:i + size] for i in range(0, len(raw) - size + 1, size)]
+    return [raw[i : i + size] for i in range(0, len(raw) - size + 1, size)]
 
 
 def grain_of_gray(frame: bytes, w: int, h: int) -> float | None:
@@ -1001,7 +1154,7 @@ def grain_of_gray(frame: bytes, w: int, h: int) -> float | None:
         return None
     if sum(frame[::17]) / max(1, len(frame[::17])) < 12:
         return None  # black / fade: says nothing about grain
-    rows = [frame[y * w:(y + 1) * w] for y in range(h)]
+    rows = [frame[y * w : (y + 1) * w] for y in range(h)]
     block_sums: dict[tuple[int, int], int] = {}
     block_n: dict[tuple[int, int], int] = {}
     for y in range(1, h - 1):
@@ -1069,12 +1222,40 @@ def _probe_pixels(path: str, width: int, height: int, times: list[float]) -> tup
     for t in times:
         with tempfile.TemporaryDirectory(prefix="codecprobe-") as tmp:
             gpath, spath = os.path.join(tmp, "g.raw"), os.path.join(tmp, "s.raw")
-            fc = (f"[0:v:0]split=2[a][b];[a]crop={cw}:{ch},format=gray[g];"
-                  f"[b]scale={SMALL_W}:{SMALL_H}:flags=area,format=rgb24[s]")
-            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-ss", f"{t:.2f}",
-                   "-i", path, "-an", "-sn", "-dn", "-filter_complex", fc,
-                   "-map", "[g]", "-frames:v", str(FRAMES_PER_SAMPLE), "-f", "rawvideo", gpath,
-                   "-map", "[s]", "-frames:v", str(FRAMES_PER_SAMPLE), "-f", "rawvideo", spath]
+            fc = (
+                f"[0:v:0]split=2[a][b];[a]crop={cw}:{ch},format=gray[g];"
+                f"[b]scale={SMALL_W}:{SMALL_H}:flags=area,format=rgb24[s]"
+            )
+            cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-v",
+                "error",
+                "-ss",
+                f"{t:.2f}",
+                "-i",
+                path,
+                "-an",
+                "-sn",
+                "-dn",
+                "-filter_complex",
+                fc,
+                "-map",
+                "[g]",
+                "-frames:v",
+                str(FRAMES_PER_SAMPLE),
+                "-f",
+                "rawvideo",
+                gpath,
+                "-map",
+                "[s]",
+                "-frames:v",
+                str(FRAMES_PER_SAMPLE),
+                "-f",
+                "rawvideo",
+                spath,
+            ]
             run = _run(cmd)
             if not run or run.returncode != 0:
                 continue

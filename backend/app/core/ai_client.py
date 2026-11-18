@@ -88,9 +88,7 @@ def resolve_custom_base_url(configured: str) -> str:
     return (configured or "").strip().rstrip("/")
 
 
-def resolve_ai_base_url(
-    provider: str, local_base_url: str = "", custom_base_url: str = ""
-) -> str:
+def resolve_ai_base_url(provider: str, local_base_url: str = "", custom_base_url: str = "") -> str:
     """The base URL ``complete_json`` needs for this provider, or "".
 
     Call sites hold one config row with two separate address fields, because a
@@ -340,7 +338,9 @@ def classify_provider_error(
         # Naming the endpoint is what makes these actionable: the user chose the
         # address, so "could not reach https://x/v1" beats "check the connection".
         template = _CUSTOM_CAUSE_MESSAGES.get(code, _CUSTOM_CAUSE_MESSAGES["unknown"])
-        return code, template.format(provider=label, url=base_url or "(not set)", model=model or "(none set)")
+        return code, template.format(
+            provider=label, url=base_url or "(not set)", model=model or "(none set)"
+        )
     if provider in LOCAL_PROVIDERS:
         template = _LOCAL_CAUSE_MESSAGES.get(code, _LOCAL_CAUSE_MESSAGES["unknown"])
         pull = _LOCAL_PULL_HINTS.get(provider, "").format(model=model or "the model")

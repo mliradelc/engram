@@ -352,9 +352,7 @@ def compute_progress(
     return round(percent, 1), eta
 
 
-def iter_progress(
-    lines: Iterable[str], duration_seconds: float | None
-) -> Iterator[dict[str, Any]]:
+def iter_progress(lines: Iterable[str], duration_seconds: float | None) -> Iterator[dict[str, Any]]:
     """Parse an ffmpeg ``-progress`` stream, yielding one sample per ``progress=`` line.
 
     Each sample is ``{percent, eta, speed, done}``.  ``speed`` is ffmpeg's raw
@@ -456,8 +454,10 @@ def _run_encode(
     """
     read_fd, write_fd = os.pipe()
     reader = threading.Thread(
-        target=_consume_progress, args=(read_fd, key, duration, loop),
-        name="encode-progress", daemon=True,
+        target=_consume_progress,
+        args=(read_fd, key, duration, loop),
+        name="encode-progress",
+        daemon=True,
     )
     try:
         reader.start()
@@ -466,8 +466,12 @@ def _run_encode(
         logger.debug("Encoding hook: could not start progress reader", exc_info=True)
     try:
         return subprocess.run(
-            cmd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.PIPE,
-            text=True, timeout=ENCODE_TIMEOUT_SECONDS,
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=ENCODE_TIMEOUT_SECONDS,
         )
     finally:
         os.close(write_fd)  # the reader hits EOF once ffmpeg has exited as well
@@ -518,7 +522,11 @@ def is_enabled() -> bool:
 def _probe(path: Path) -> dict:
     """Return codec/dimension/track counts for a media file, or {} on failure."""
     cmd = [
-        "ffprobe", "-v", "error", "-print_format", "json",
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
         "-show_entries",
         "stream=index,codec_type,codec_name,width,height,pix_fmt,color_transfer"
         ":stream_disposition=default:format=duration",
@@ -689,7 +697,10 @@ def _store_override(src: Path, codec_class: str) -> dict[str, Any]:
 # neither is ever accepted from an operator.  ``codec_classifier.CLASSES``
 # keeps all six internally.
 OFFERED_CLASSES: tuple[str, ...] = (
-    "passthrough", "animation", "live_action_grainy", "live_action_clean",
+    "passthrough",
+    "animation",
+    "live_action_grainy",
+    "live_action_clean",
 )
 _HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})  # PQ, HLG
 
@@ -697,8 +708,10 @@ _HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})  # PQ, HLG
 def forced_class_problem(codec_class: str | None, probe: dict) -> str | None:
     """Why ``codec_class`` may not be forced on a source with ``probe``; None if it may."""
     if codec_class not in OFFERED_CLASSES:
-        return (f"Codec class {codec_class!r} cannot be forced; "
-                f"choose one of: {', '.join(OFFERED_CLASSES)}")
+        return (
+            f"Codec class {codec_class!r} cannot be forced; "
+            f"choose one of: {', '.join(OFFERED_CLASSES)}"
+        )
     if codec_class == "passthrough":
         return None
     video = _video_stream(probe)
@@ -736,7 +749,9 @@ def forced_plan(
     # The full probe's stream fields win over the interlace probe's copies.
     facts.update({k: video[k] for k in ("width", "height", "pix_fmt") if video.get(k)})
     return mod.forced_class_plan(
-        codec_class, facts, reason=f"forced by operator ({codec_class})",
+        codec_class,
+        facts,
+        reason=f"forced by operator ({codec_class})",
     )
 
 
@@ -766,10 +781,14 @@ def _legacy_video_args(threads: str) -> list[str]:
     crf = _cfg("ENGRAM_ENCODE_CRF", "22")
     preset = _cfg("ENGRAM_ENCODE_PRESET", "6")
     return [
-        "-c:v", "libsvtav1",
-        "-crf", crf,
-        "-preset", preset,
-        "-svtav1-params", f"tune=0:lp={threads}",
+        "-c:v",
+        "libsvtav1",
+        "-crf",
+        crf,
+        "-preset",
+        preset,
+        "-svtav1-params",
+        f"tune=0:lp={threads}",
     ]
 
 
@@ -782,9 +801,20 @@ def _encoder_accepts(video_args: tuple[str, ...]) -> bool:
     Cached per process, so it costs well under a second once per distinct command.
     """
     cmd = [
-        "ffmpeg", "-v", "error", "-y",
-        "-f", "lavfi", "-i", "testsrc=size=128x128:rate=24:duration=0.5",
-        *video_args, "-frames:v", "6", "-f", "null", "-",
+        "ffmpeg",
+        "-v",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=128x128:rate=24:duration=0.5",
+        *video_args,
+        "-frames:v",
+        "6",
+        "-f",
+        "null",
+        "-",
     ]
     try:
         run = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -811,10 +841,14 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
                 if not optional:
                     logger.warning(
                         "Encoding hook: encoder rejected tuning extras for class=%s; "
-                        "using essential parameters only", plan.class_name)
+                        "using essential parameters only",
+                        plan.class_name,
+                    )
                 return args, plan.output_codec_name or "av1", plan
-        logger.warning("Encoding hook: encoder rejected class=%s settings; using fixed settings",
-                       plan.class_name)
+        logger.warning(
+            "Encoding hook: encoder rejected class=%s settings; using fixed settings",
+            plan.class_name,
+        )
         filters = list(getattr(plan, "video_filters", None) or [])
         if filters:
             return ["-vf", ",".join(filters), *_legacy_video_args(threads)], "av1", None
@@ -868,8 +902,15 @@ def _failure_reason(returncode: int | None, stderr: str | None) -> str:
 
 
 def _encode_and_verify(
-    cmd: list[str], src: Path, tmp: Path, *, key: str, duration: float | None, loop,
-    expect_codec: str, active,
+    cmd: list[str],
+    src: Path,
+    tmp: Path,
+    *,
+    key: str,
+    duration: float | None,
+    loop,
+    expect_codec: str,
+    active,
 ) -> str | None:
     """Run the encode and verify ``tmp``.
 
@@ -901,20 +942,30 @@ def _encode_and_verify(
     if active is not None:
         out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
         if out_v.get("pix_fmt") != active.pix_fmt:
-            logger.error("Encoding hook: output pix_fmt %s is not %s for %s",
-                         out_v.get("pix_fmt"), active.pix_fmt, src.name)
+            logger.error(
+                "Encoding hook: output pix_fmt %s is not %s for %s",
+                out_v.get("pix_fmt"),
+                active.pix_fmt,
+                src.name,
+            )
             tmp.unlink(missing_ok=True)
             return f"Output pixel format is not {active.pix_fmt}"
         # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
         if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
-            logger.error("Encoding hook: HDR transfer not preserved for %s (src=%s out=%s)",
-                         src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
+            logger.error(
+                "Encoding hook: HDR transfer not preserved for %s (src=%s out=%s)",
+                src.name,
+                src_v.get("color_transfer"),
+                out_v.get("color_transfer"),
+            )
             tmp.unlink(missing_ok=True)
             return "HDR transfer not preserved"
     if _track_counts(out_probe) != _track_counts(src_probe):
         logger.error(
             "Encoding hook: track mismatch for %s (src=%s out=%s) — keeping original",
-            src.name, _track_counts(src_probe), _track_counts(out_probe),
+            src.name,
+            _track_counts(src_probe),
+            _track_counts(out_probe),
         )
         tmp.unlink(missing_ok=True)
         return "Audio/subtitle track count mismatch"
@@ -937,7 +988,8 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
     # Never in-place, on every path (classifier, forced, and the kill switch).
     if _would_encode_in_place(src, staging_dir):
         logger.error(
-            "Encoding hook: refusing to encode %s in place (destination is the source)", src)
+            "Encoding hook: refusing to encode %s in place (destination is the source)", src
+        )
         return None
 
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -953,25 +1005,47 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
         video_args, expect_codec, active = _select_video_args(plan, threads)
 
     cmd = [
-        "ffmpeg", "-v", "error", "-nostdin", "-nostats", "-progress", "pipe:1", "-y",
-        "-i", str(src),
-        "-map", "0:v:0",
-        "-map", "0:a?",
-        "-map", "0:s?",
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostdin",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-y",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-map",
+        "0:s?",
         *video_args,
-        "-c:a", "copy",
-        "-c:s", "copy",
+        "-c:a",
+        "copy",
+        "-c:s",
+        "copy",
         str(tmp),
     ]
     codec_class = active.class_name if active is not None else None
     forced = _plan_forced(active)
     if active is not None:
-        logger.info("Encoding hook: encoding %s -> %s (class=%s%s)", src.name, dest.name,
-                    active.class_name, ", forced" if forced else "")
+        logger.info(
+            "Encoding hook: encoding %s -> %s (class=%s%s)",
+            src.name,
+            dest.name,
+            active.class_name,
+            ", forced" if forced else "",
+        )
     else:
-        logger.info("Encoding hook: encoding %s -> %s (class=fixed crf=%s preset=%s)",
-                    src.name, dest.name,
-                    _cfg("ENGRAM_ENCODE_CRF", "22"), _cfg("ENGRAM_ENCODE_PRESET", "6"))
+        logger.info(
+            "Encoding hook: encoding %s -> %s (class=fixed crf=%s preset=%s)",
+            src.name,
+            dest.name,
+            _cfg("ENGRAM_ENCODE_CRF", "22"),
+            _cfg("ENGRAM_ENCODE_PRESET", "6"),
+        )
     # Duration for progress: probed before the encode and outside the permit
     # (probing never holds one).  The post-encode verification probes are separate.
     duration = _duration_seconds(_probe(src))
@@ -998,8 +1072,14 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
         failure: str | None = "Encode did not complete"
         try:
             failure = _encode_and_verify(
-                cmd, src, tmp, key=key, duration=duration, loop=loop,
-                expect_codec=expect_codec, active=active,
+                cmd,
+                src,
+                tmp,
+                key=key,
+                duration=duration,
+                loop=loop,
+                expect_codec=expect_codec,
+                active=active,
             )
         finally:
             # Recorded before the terminal publish, so a client that re-fetches
@@ -1017,7 +1097,10 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
         _forget_failure_locked(str(src))
     logger.info(
         "Encoding hook: %s -> %s (%.1f MB -> %.1f MB)",
-        src.name, dest.name, src.stat().st_size / 1e6, dest.stat().st_size / 1e6,
+        src.name,
+        dest.name,
+        src.stat().st_size / 1e6,
+        dest.stat().st_size / 1e6,
     )
     return dest
 
@@ -1050,7 +1133,9 @@ def _pinned_class(src: Path) -> str | None:
     except OSError:
         return None
     if not _override_fresh(override, st):
-        logger.info("Encoding hook: ignoring stale codec-class pin for %s (source changed)", src.name)
+        logger.info(
+            "Encoding hook: ignoring stale codec-class pin for %s (source changed)", src.name
+        )
         return None
     cls = override.get("codec_class")
     return cls if isinstance(cls, str) else None
@@ -1094,7 +1179,8 @@ def after_organize(
         if not in_domain(src):
             logger.warning(
                 "Encoding hook: refusing to encode %s — outside Engram's domain "
-                "(only rips in staging and their encoded output are Engram's)", src,
+                "(only rips in staging and their encoded output are Engram's)",
+                src,
             )
             return
         if _already_done(src):
@@ -1104,14 +1190,19 @@ def after_organize(
         staging = _staging_dir()
         if _would_encode_in_place(src, staging):
             logger.error(
-                "Encoding hook: refusing to encode %s in place (it is in ENGRAM_ENCODE_STAGING)", src)
+                "Encoding hook: refusing to encode %s in place (it is in ENGRAM_ENCODE_STAGING)",
+                src,
+            )
             return
 
         cls = forced_class or _pinned_class(src)
         if cls is not None and not classifier_enabled():
             logger.warning(
                 "Encoding hook: ignoring forced class=%s for %s: ENGRAM_CODEC_CLASSIFIER=0 "
-                "keeps the fixed settings", cls, src.name)
+                "keeps the fixed settings",
+                cls,
+                src.name,
+            )
             cls = None
 
         forced = cls is not None
@@ -1119,13 +1210,17 @@ def after_organize(
             probe = _probe(src)
             problem = forced_class_problem(cls, probe)
             if problem is not None:
-                logger.error("Encoding hook: refusing forced class=%s for %s: %s",
-                             cls, src.name, problem)
+                logger.error(
+                    "Encoding hook: refusing forced class=%s for %s: %s", cls, src.name, problem
+                )
                 return
             plan = forced_plan(src, cls, probe)
             if plan is None:
-                logger.error("Encoding hook: classifier unavailable; cannot force class=%s for %s",
-                             cls, src.name)
+                logger.error(
+                    "Encoding hook: classifier unavailable; cannot force class=%s for %s",
+                    cls,
+                    src.name,
+                )
                 return
             logger.info("Encoding hook: codec class forced: %s (%s)", plan.describe(), src.name)
         else:
@@ -1138,8 +1233,7 @@ def after_organize(
 
         dest = transcode_file(src, staging, plan, loop=loop)
         if dest is not None:
-            _write_marker(src, dest, plan.class_name if plan is not None else None,
-                          forced=forced)
+            _write_marker(src, dest, plan.class_name if plan is not None else None, forced=forced)
     except Exception:  # noqa: BLE001 - fail-open by design
         logger.exception("Encoding hook: unexpected error for %s", final_path)
 
@@ -1282,7 +1376,8 @@ def _resolve_source(
 def _refuse_in_place(src: Path) -> None:
     if _would_encode_in_place(src, _staging_dir()):
         raise RetryInvalid(
-            f"{src.name} is in ENGRAM_ENCODE_STAGING; encoding it would overwrite the source")
+            f"{src.name} is in ENGRAM_ENCODE_STAGING; encoding it would overwrite the source"
+        )
 
 
 def _validate_forced(src: Path, codec_class: str) -> None:
@@ -1332,7 +1427,8 @@ def retry_encode(
         if not classifier_enabled():
             raise RetryConflict(
                 "The codec classifier is disabled (ENGRAM_CODEC_CLASSIFIER=0); "
-                "a codec class cannot be forced")
+                "a codec class cannot be forced"
+            )
         _validate_forced(src, codec_class)
 
     key = str(_staging_dir() / src.name)
@@ -1355,8 +1451,11 @@ def retry_encode(
         with _encoding_lock:
             _RETRY_PENDING.discard(key)
         raise
-    logger.info("Encoding hook: retry queued for %s%s", src.name,
-                f" (class={codec_class}, forced)" if codec_class else "")
+    logger.info(
+        "Encoding hook: retry queued for %s%s",
+        src.name,
+        f" (class={codec_class}, forced)" if codec_class else "",
+    )
 
 
 # ---------------------------------------------------------------------------

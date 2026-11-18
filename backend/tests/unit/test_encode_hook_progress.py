@@ -138,8 +138,18 @@ def test_compute_progress_clamps(out_time, speed, duration, expected):
     assert encode_hook.compute_progress(out_time, speed, duration) == expected
 
 
-@pytest.mark.parametrize("raw, value", [("0.216x", 0.216), ("1x", 1.0), ("N/A", None),
-                                        ("", None), (None, None), ("0x", None), ("fast", None)])
+@pytest.mark.parametrize(
+    "raw, value",
+    [
+        ("0.216x", 0.216),
+        ("1x", 1.0),
+        ("N/A", None),
+        ("", None),
+        (None, None),
+        ("0x", None),
+        ("fast", None),
+    ],
+)
 def test_parse_speed(raw, value):
     assert encode_hook._parse_speed(raw) == value
 
@@ -357,8 +367,15 @@ def test_progress_published_on_loop_throttled_and_terminated(tmp_path, monkeypat
         assert msg["file"] == src.name
         assert msg["destination_folder"] == str(tmp_path / "out")
         assert msg["codec"] == "av1"
-        assert set(msg) == {"file", "destination_folder", "percent", "eta", "speed",
-                            "codec", "done"}
+        assert set(msg) == {
+            "file",
+            "destination_folder",
+            "percent",
+            "eta",
+            "speed",
+            "codec",
+            "done",
+        }
 
 
 def test_publisher_failure_never_breaks_the_encode(tmp_path, monkeypatch):
@@ -382,8 +399,23 @@ def test_real_ffmpeg_progress_stream_is_parsed(tmp_path, monkeypatch):
     """A real encode emits -progress on the pipe and the reader turns it into samples."""
     src = tmp_path / "real.mkv"
     subprocess.run(
-        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=24",
-         "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x120:rate=24",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(src),
+        ],
         check=True,
     )
     monkeypatch.setenv("ENGRAM_ENCODE_PRESET", "12")
@@ -816,10 +848,16 @@ def test_marker_suffix_is_frozen(tmp_path):
     src.write_bytes(b"src")
     assert encode_hook._marker_path(src) == tmp_path / "Show - S01E01.mkv.engram-av1.json"
     st = src.stat()
-    (tmp_path / "Show - S01E01.mkv.engram-av1.json").write_text(json.dumps({
-        "size": st.st_size, "mtime": int(st.st_mtime),
-        "av1": "/staging/encode-out/Show - S01E01.mkv", "codec_class": "live_action_clean",
-    }))
+    (tmp_path / "Show - S01E01.mkv.engram-av1.json").write_text(
+        json.dumps(
+            {
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "av1": "/staging/encode-out/Show - S01E01.mkv",
+                "codec_class": "live_action_clean",
+            }
+        )
+    )
     assert encode_hook._already_done(src)
     assert "av1" in encode_hook._DONE_FIELDS
 
@@ -828,15 +866,17 @@ def test_marker_suffix_is_frozen(tmp_path):
 # Failure reason: the most informative stderr line, not the last
 # ---------------------------------------------------------------------------
 
-SVT_BANNER = "\n".join([
-    "Svt[info]: -------------------------------------------",
-    "Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v2.3.0",
-    "Svt[info]: SVT [build]  :\tGCC 13.2.0\t 64 bit",
-    "Svt[info]: LIB Build date: Jan  1 2026 00:00:00",
-    "Svt[info]: -------------------------------------------",
-    "Svt[info]: Level of Parallelism: 5",
-    "Svt[info]: -------------------------------------------",
-])
+SVT_BANNER = "\n".join(
+    [
+        "Svt[info]: -------------------------------------------",
+        "Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v2.3.0",
+        "Svt[info]: SVT [build]  :\tGCC 13.2.0\t 64 bit",
+        "Svt[info]: LIB Build date: Jan  1 2026 00:00:00",
+        "Svt[info]: -------------------------------------------",
+        "Svt[info]: Level of Parallelism: 5",
+        "Svt[info]: -------------------------------------------",
+    ]
+)
 
 
 def test_failure_reason_banner_only_does_not_surface_the_banner():
@@ -853,12 +893,16 @@ def test_failure_reason_prefers_the_error_line_over_the_banner():
 
 
 def test_failure_reason_prefers_first_error_line_not_last_line():
-    stderr = "\n".join([
-        "/in/ep.mkv: Permission denied",
-        "Svt[info]: -------------------------------------------",
-        "Conversion failed!",
-    ])
-    assert encode_hook._failure_reason(1, stderr) == "ffmpeg exited 1: /in/ep.mkv: Permission denied"
+    stderr = "\n".join(
+        [
+            "/in/ep.mkv: Permission denied",
+            "Svt[info]: -------------------------------------------",
+            "Conversion failed!",
+        ]
+    )
+    assert (
+        encode_hook._failure_reason(1, stderr) == "ffmpeg exited 1: /in/ep.mkv: Permission denied"
+    )
 
 
 def test_failure_reason_keeps_genuine_encoder_errors():
@@ -879,13 +923,15 @@ def test_failure_reason_signal_death_is_named():
 
 
 def test_failure_reason_falls_back_to_first_surviving_line():
-    stderr = "\n".join([
-        "Svt[info]: -------------------------------------------",
-        "first plain line",
-        "x265 [info]: frame I: 12, Avg QP:20.1",
-        "frame=  120 fps= 30 q=-0.0 size=    1024kB time=00:00:05.00",
-        "second plain line",
-    ])
+    stderr = "\n".join(
+        [
+            "Svt[info]: -------------------------------------------",
+            "first plain line",
+            "x265 [info]: frame I: 12, Avg QP:20.1",
+            "frame=  120 fps= 30 q=-0.0 size=    1024kB time=00:00:05.00",
+            "second plain line",
+        ]
+    )
     assert encode_hook._failure_reason(1, stderr) == "ffmpeg exited 1: first plain line"
 
 
