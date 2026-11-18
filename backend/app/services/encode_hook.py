@@ -111,6 +111,49 @@ def _cfg(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+STALE_ENV_PREFIX = "ENGRAM_AV1_"
+CURRENT_ENV_PREFIX = "ENGRAM_ENCODE_"
+
+
+class StaleEncodeEnvError(RuntimeError):
+    """Pre-rename ``ENGRAM_AV1_*`` variables are set; the hook refuses to run on them."""
+
+
+def stale_env_keys(environ: dict[str, str] | None = None) -> list[str]:
+    """Sorted ``ENGRAM_AV1_*`` keys present in ``environ`` (``os.environ`` by default)."""
+    env = os.environ if environ is None else environ
+    return sorted(k for k in env if k.startswith(STALE_ENV_PREFIX))
+
+
+def check_stale_env(environ: dict[str, str] | None = None) -> None:
+    """Raise ``StaleEncodeEnvError`` if any pre-rename ``ENGRAM_AV1_*`` key is set.
+
+    Every ``ENGRAM_AV1_*`` setting became ``ENGRAM_ENCODE_*``.  The hook defaults
+    to off, so a deployment still on the old names (``ENGRAM_AV1_HOOK=1`` with no
+    ``ENGRAM_ENCODE_HOOK``) would otherwise run with encoding silently disabled.
+    Called from the app's startup, not at import, so importing the module (and
+    the fast tests) never depends on the environment.
+    """
+    stale = stale_env_keys(environ)
+    if not stale:
+        return
+    renames = ", ".join(f"{k} -> {CURRENT_ENV_PREFIX}{k[len(STALE_ENV_PREFIX) :]}" for k in stale)
+    message = (
+        "Encoding hook: refusing to start: renamed environment variable(s) still set: "
+        f"{renames}. Rename them in the deployment's .env (see CODEC-CLASSIFIER.md, "
+        '"Renaming ENGRAM_AV1_* to ENGRAM_ENCODE_*"); the old names are ignored, '
+        "so leaving them would run with encoding disabled."
+    )
+    for key in stale:
+        logger.error(
+            "Encoding hook: stale variable %s was renamed to %s%s",
+            key,
+            CURRENT_ENV_PREFIX,
+            key[len(STALE_ENV_PREFIX) :],
+        )
+    raise StaleEncodeEnvError(message)
+
+
 def _max_concurrent() -> int:
     """Parse ``ENGRAM_ENCODE_MAX_CONCURRENT``.  0 means unlimited; never raises.
 

@@ -45,6 +45,12 @@ async def lifespan(app: FastAPI):
             "Using the bundled CA certificates instead."
         )
 
+    # Refuse to start on pre-rename ENGRAM_AV1_* settings: the hook defaults to
+    # off, so running on them would silently disable encoding.
+    from app.services.encode_hook import check_stale_env
+
+    check_stale_env()
+
     await init_db()
     logger.info("Database initialized")
 

@@ -200,6 +200,22 @@ Unset `ENGRAM_CODEC_CLASSIFIER` means the classifier is on. To revert without a 
 `finalization_coordinator.py` passes content_type, detected_title, tmdb_id/year, video_resolution,
 duration_seconds, is_extra and the language lists at both call sites.
 
+### Renaming ENGRAM_AV1_* to ENGRAM_ENCODE_*
+
+Every `ENGRAM_AV1_*` variable was renamed to `ENGRAM_ENCODE_*` (same suffix:
+`ENGRAM_AV1_HOOK` → `ENGRAM_ENCODE_HOOK`, `_STAGING`, `_CRF`, `_PRESET`, `_THREADS`,
+`_MAX_CONCURRENT`). The old names are **not read**. A deployment whose `.env` still uses them
+runs with **encoding disabled**, because the hook is off unless `ENGRAM_ENCODE_HOOK=1`. Rename
+them in the deployment's `.env` (back it up first), then recreate the container:
+
+```bash
+sed -i.bak 's/^\(\(export \)\?\)ENGRAM_AV1_/\1ENGRAM_ENCODE_/' /opt/engram/.env
+```
+
+So this cannot happen silently, the backend **refuses to start** while any `ENGRAM_AV1_*` key
+is in its environment; the error names each stale key and its replacement. Do not skip the
+rename: removing the old keys alone also leaves encoding off.
+
 ### Marker name stays `.engram-av1.json`
 
 The per-file marker keeps its `.engram-av1.json` suffix and its `"av1"` key (the output path) even
