@@ -26,7 +26,7 @@ Class set (six, evaluated in this order; first match wins)
 
 Why this set: each class differs in a decision that changes the *command*, not
 just a number.  Interlacing decides the deinterlace filter; HDR decides
-metadata handling and forbids luma-bias; animation decides grain synthesis and
+metadata handling; animation decides grain synthesis and
 variance-boost strength; grain decides the codec.  Finer genre splits (sitcom
 vs. drama, CGI vs. anime) are not separable by cheap probes and would be
 unvalidated settings dressed up as precision, so they are not attempted.
@@ -65,6 +65,10 @@ Sources read while designing this (and where they disagree, what was chosen):
   informed nothing here beyond the spec's own summary.)
 
 Where this module deliberately departs from a source:
+
+* JET's ``tf-strength=1``, ``sharpness=1`` and SDR ``luminance-qp-bias`` are
+  not emitted: the installed SVT-AV1 (2.3.0) refuses all three, so they never
+  took effect (see :func:`_av1_base`).
 
 * ``tune=0`` (Encode Wiki, and the hook's existing behaviour) rather than
   JET's ``tune=1``.  Viewing-quality tune, kept consistent with what the hook
@@ -135,7 +139,8 @@ import signal
 import statistics
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 
 logger = logging.getLogger(__name__)
@@ -243,6 +248,9 @@ class CodecPlan:
     video_filters: list[str] = field(default_factory=list)
     hdr: bool = False
     evidence: dict = field(default_factory=dict)
+    # Encoder parameter keys the host's encoder refused (see without_params).
+    # Never emitted, whichever list they came from (including ``lp``/``pools``).
+    rejected_params: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def is_passthrough(self) -> bool:
@@ -259,7 +267,14 @@ class CodecPlan:
         return {"av1": "av1", "hevc": "hevc"}.get(self.codec)
 
     def video_args(self, threads: str | int = 4, *, optional: bool = True) -> list[str]:
-        """ffmpeg arguments for the video stream (everything after the maps)."""
+        """ffmpeg arguments for the video stream (everything after the maps).
+
+        AV1 carries ``-err_detect:v explode``: libsvtav1 otherwise only *warns*
+        about a ``-svtav1-params`` key it cannot parse and encodes without it
+        (exit 0), so tuning could be silently missing.  With it the encode
+        fails instead (measured, ffmpeg 7.1.5 / SVT-AV1 2.3.0: exit 234).
+        libx265 has no such switch; the hook's pre-check covers both.
+        """
         if self.is_passthrough:
             return []
         args: list[str] = []
@@ -268,16 +283,39 @@ class CodecPlan:
         if self.codec == "av1":
             params = list(self.svt_required) + (list(self.svt_optional) if optional else [])
             params.append(("lp", str(threads)))
-            args += ["-c:v", "libsvtav1", "-crf", str(self.crf), "-preset", str(self.preset)]
+            args += ["-c:v", "libsvtav1", "-err_detect:v", "explode"]
+            args += ["-crf", str(self.crf), "-preset", str(self.preset)]
             args += ["-pix_fmt", self.pix_fmt]
-            args += ["-svtav1-params", ":".join(f"{k}={v}" for k, v in params)]
+            args += ["-svtav1-params", self._param_string(params)]
         else:
             params = list(self.x265_required) + (list(self.x265_optional) if optional else [])
             params.append(("pools", str(threads)))
             args += ["-c:v", "libx265", "-crf", str(self.crf), "-preset", str(self.preset)]
             args += ["-pix_fmt", self.pix_fmt]
-            args += ["-x265-params", ":".join(f"{k}={v}" for k, v in params)]
+            args += ["-x265-params", self._param_string(params)]
         return args
+
+    def _param_string(self, params: list[tuple[str, str]]) -> str:
+        return ":".join(f"{k}={v}" for k, v in params if k not in self.rejected_params)
+
+    def encoder_params(self) -> list[tuple[str, str]]:
+        """Every encoder parameter this plan may emit, required then optional."""
+        if self.codec == "av1":
+            return list(self.svt_required) + list(self.svt_optional)
+        if self.codec == "hevc":
+            return list(self.x265_required) + list(self.x265_optional)
+        return []
+
+    def without_params(self, keys: Iterable[str]) -> CodecPlan:
+        """A copy that never emits ``keys`` (parameters the host's encoder rejects).
+
+        The keys stay in the plan's lists (they are the intent, and a newer
+        encoder may accept them) but are filtered out of :meth:`video_args`,
+        and recorded in ``evidence["rejected_params"]``.
+        """
+        rejected = self.rejected_params | frozenset(keys)
+        evidence = {**self.evidence, "rejected_params": sorted(rejected)}
+        return replace(self, rejected_params=rejected, evidence=evidence)
 
     def describe(self) -> str:
         """One log line: class, the evidence that drove it, and the outcome."""
@@ -289,6 +327,8 @@ class CodecPlan:
                 bits.append(f"{key}={val:.2f}" if isinstance(val, float) else f"{key}={val}")
         if ev.get("hints"):
             bits.append("hints=" + ",".join(ev["hints"]))
+        if self.rejected_params:
+            bits.append("encoder_rejected=" + ",".join(sorted(self.rejected_params)))
         if self.is_passthrough:
             return " ".join(bits) + f" -> passthrough ({self.reason})"
         tail = f"{'x265' if self.codec == 'hevc' else 'av1'} crf={self.crf} preset={self.preset}"
@@ -346,7 +386,9 @@ def validate_plan(plan: CodecPlan) -> list[str]:
     if plan.crf is None or not 0 <= plan.crf <= 51:
         problems.append("crf missing or out of range")
     if plan.codec == "av1":
-        keys = dict(plan.svt_required + plan.svt_optional)
+        keys = {
+            k: v for k, v in plan.svt_required + plan.svt_optional if k not in plan.rejected_params
+        }
         if keys.get("film-grain-denoise") != "0":
             problems.append("film-grain-denoise=0 missing")
         if plan.preset is None or not plan.preset.isdigit() or int(plan.preset) < 5:
@@ -389,7 +431,18 @@ def resolution_class(width: int | None, height: int | None, hint: str | None = N
     return "sd" if hint else "hd"
 
 
-def _av1_base(res: str, *, grain: int, vb_strength: int, luma_bias: bool) -> tuple[list, list]:
+# Not emitted, though the sources above recommend them: ``tf-strength=1``
+# (keyframe blocking), ``sharpness=1`` and ``luminance-qp-bias=25`` (SDR only).
+# SVT-AV1 2.3.0 (ffmpeg 7.1.5, Debian 13) refuses all three ("Error parsing
+# option tf-strength: 1.") and, without ``-err_detect explode``, encoded on
+# without them, so they never had an effect.  2.3.0 has no same-intent
+# replacement: temporal filtering is only on/off (``enable-tf=0`` would drop it
+# outright), and there is no luminance-bias or sharpness control.  They are not
+# kept "for a newer SVT" either: re-adding one is a tuning change to validate,
+# not something an encoder upgrade should switch on unseen.  If one is re-added,
+# a host that refuses it is caught by the encode hook's parameter check (the key
+# is dropped with a WARNING) and by ``-err_detect:v explode`` (the encode fails).
+def _av1_base(res: str, *, grain: int, vb_strength: int) -> tuple[list, list]:
     required = [
         ("tune", "0"),
         ("film-grain", str(grain)),
@@ -398,11 +451,7 @@ def _av1_base(res: str, *, grain: int, vb_strength: int, luma_bias: bool) -> tup
     optional = [
         ("enable-variance-boost", "1"),
         ("variance-boost-strength", str(vb_strength)),
-        ("tf-strength", "1"),
-        ("sharpness", "1"),
     ]
-    if luma_bias:
-        optional.append(("luminance-qp-bias", "25"))
     if res == "hd":
         optional.append(("tile-columns", "1"))
     elif res == "uhd":
@@ -542,7 +591,7 @@ def _plan_for_class(
         # bwdif, then a conservative AV1 encode.  Film grain synthesis is off:
         # grain on interlaced sources is unmeasured (field combing inflates the
         # grain estimate).
-        req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
+        req, opt = _av1_base(res, grain=0, vb_strength=2)
         return CodecPlan(
             INTERLACED,
             "av1",
@@ -556,7 +605,7 @@ def _plan_for_class(
         )
 
     if class_name == ANIMATION:
-        req, opt = _av1_base(res, grain=0, vb_strength=1, luma_bias=True)
+        req, opt = _av1_base(res, grain=0, vb_strength=1)
         return CodecPlan(
             class_name,
             "av1",
@@ -591,7 +640,7 @@ def _plan_for_class(
                 class_name=class_name,
                 reason=reason or "grainy HDR",
             )
-        req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2, luma_bias=False)
+        req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2)
         svt_meta = _hdr_metadata_params(hdr_meta)[0]
         return CodecPlan(
             class_name,
@@ -607,7 +656,7 @@ def _plan_for_class(
 
     # live_action_clean (also the safe default for any unknown name)
     crf = 23 if res == "sd" else 24  # JET: SD sources want a lower CRF
-    req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2, luma_bias=True)
+    req, opt = _av1_base(res, grain=4 if grain_ok else 0, vb_strength=2)
     return CodecPlan(
         LIVE_ACTION_CLEAN,
         "av1",

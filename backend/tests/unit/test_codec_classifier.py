@@ -32,6 +32,12 @@ def _load(name: str):
 cc = _load("codec_classifier")
 encode_hook = _load("encode_hook")
 
+
+def _clear_encoder_caches() -> None:
+    encode_hook._encoder_accepts.cache_clear()
+    encode_hook._rejected_params.cache_clear()
+
+
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = pytest.mark.skipif(not HAVE_FFMPEG, reason="ffmpeg/ffprobe not installed")
 
@@ -267,9 +273,19 @@ def test_hdr_forces_10_bit_and_suppresses_luma_bias(transfer, grain, res):
     assert cc.validate_plan(plan) == []
 
 
-def test_sdr_live_action_does_get_luma_bias():
-    args = cc.classify(probe()).video_args(4)
-    assert "luminance-qp-bias=25" in args[args.index("-svtav1-params") + 1]
+# Refused by SVT-AV1 2.3.0 ("Error parsing option tf-strength: 1.") and so never
+# applied; see _av1_base.  test_no_class_emits_a_parameter_this_host_rejects
+# proves the rest against the installed encoder.
+_REFUSED_BY_SVT_2_3 = ("tf-strength", "sharpness", "luminance-qp-bias")
+
+
+@pytest.mark.parametrize("class_name", [c for c in cc.CLASSES if c != cc.PASSTHROUGH])
+@pytest.mark.parametrize("res", ["sd", "hd", "uhd"])
+def test_no_plan_emits_a_parameter_svt_2_3_refuses(class_name, res):
+    plan = cc.plan_for_class(class_name, res=res, hdr_meta=HDR_META)
+    params = dict(plan.encoder_params())
+    assert not set(_REFUSED_BY_SVT_2_3) & set(params)
+    assert not any(k in " ".join(plan.video_args(4)) for k in _REFUSED_BY_SVT_2_3)
 
 
 def test_hdr_metadata_is_passed_explicitly_to_each_encoder():
@@ -558,7 +574,7 @@ def _streams(codec="av1", pix="yuv420p10le", audio=2, subs=1, transfer=None):
 
 @pytest.fixture
 def hook(monkeypatch, tmp_path):
-    encode_hook._encoder_accepts.cache_clear()
+    _clear_encoder_caches()
     monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
     monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "stage"))
     monkeypatch.delenv("ENGRAM_CODEC_CLASSIFIER", raising=False)
@@ -568,7 +584,7 @@ def hook(monkeypatch, tmp_path):
     src = tmp_path / "Movie (2000).mkv"
     src.write_bytes(b"source")
     yield src, tmp_path
-    encode_hook._encoder_accepts.cache_clear()
+    _clear_encoder_caches()
 
 
 def _encode_cmds(calls):
@@ -826,7 +842,7 @@ def test_encoder_rejecting_extras_degrades_to_essential_params_then_to_fixed(hoo
     # Encoder rejects everything the plan emits: fixed legacy command.
     (tmp / "stage" / src.name).unlink()
     (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).unlink()
-    encode_hook._encoder_accepts.cache_clear()
+    _clear_encoder_caches()
     calls, run = run_factory(lambda c: "film-grain" not in " ".join(c))
     monkeypatch.setattr(encode_hook.subprocess, "run", run)
     encode_hook.after_organize(str(src))
@@ -1149,7 +1165,7 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
         return plan
 
     monkeypatch.setattr(real, "plan_for_file", fast)
-    encode_hook._encoder_accepts.cache_clear()
+    _clear_encoder_caches()
     encode_hook.after_organize(str(src), context={"content_type": "tv", "is_extra": False})
     out = tmp_path / "stage" / src.name
     assert out.exists()
@@ -1950,3 +1966,211 @@ def test_hook_records_an_interrupted_probe_and_encodes_nothing(hook, monkeypatch
     assert "probe interrupted" in row["reason"] and "exited 255" in row["reason"]
     assert row["forced"] is (forced is not None)
     encode_hook.dismiss_failure()
+
+
+# ---------------------------------------------------------------------------
+# Encoder parameters the host refuses are never emitted (Defect B)
+#
+# libsvtav1 and libx265 only *warn* about a parameter they cannot parse and
+# encode on without it (exit 0), so a refused setting used to look applied.
+# ---------------------------------------------------------------------------
+
+_ALL_ENCODED_PLANS = [
+    (name, res, grainy_hdr)
+    for name in (cc.INTERLACED, cc.HDR, cc.ANIMATION, cc.LIVE_ACTION_GRAINY, cc.LIVE_ACTION_CLEAN)
+    for res in ("sd", "hd", "uhd")
+    for grainy_hdr in ((False, True) if name == cc.HDR else (False,))
+]
+
+
+def _params_of(args: list[str]) -> str:
+    flag = "-svtav1-params" if "-svtav1-params" in args else "-x265-params"
+    return args[args.index(flag) + 1]
+
+
+def _parse_params(text: str) -> dict[str, str]:
+    """Parse a ``k=v:k=v`` string strictly: every item has a key, no key twice."""
+    out: dict[str, str] = {}
+    for item in text.split(":"):
+        key, sep, value = item.partition("=")
+        assert sep and key and value, f"unparseable item {item!r} in {text!r}"
+        assert key not in out, f"duplicate key {key!r} in {text!r}"
+        out[key] = value
+    return out
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(("class_name", "res", "grainy_hdr"), _ALL_ENCODED_PLANS)
+def test_no_class_emits_a_parameter_this_host_rejects(class_name, res, grainy_hdr):
+    """Every plan, through the hook's real selection, against the installed encoder."""
+    _clear_encoder_caches()
+    plan = cc.plan_for_class(class_name, res=res, hdr_meta=HDR_META, grainy_hdr=grainy_hdr)
+    args, codec, active = encode_hook._select_video_args(plan, "2")
+    # The full plan was accepted: no fall to essentials or to the fixed command.
+    assert active is not None and args == active.video_args("2")
+    assert codec == plan.output_codec_name
+    # Nothing in the emitted command is refused by this host's encoder ...
+    check = encode_hook._rejected_params(tuple(args))
+    assert check.rejected == frozenset(), f"{check.encoder} rejects {sorted(check.rejected)}"
+    # ... so nothing had to be dropped, and the AV1 command fails loudly if it ever is.
+    assert active.rejected_params == frozenset()
+    if codec == "av1":
+        assert args[args.index("-c:v") + 1 : args.index("-c:v") + 4] == [
+            "libsvtav1",
+            "-err_detect:v",
+            "explode",
+        ]
+    # Stable and parseable: same string twice, strict k=v items, lp/pools last.
+    text = _params_of(args)
+    assert text == _params_of(active.video_args("2"))
+    parsed = _parse_params(text)
+    assert list(parsed)[-1] == ("lp" if codec == "av1" else "pools")
+    assert parsed == dict(active.encoder_params()) | {list(parsed)[-1]: "2"}
+
+
+@needs_ffmpeg
+def test_a_refused_parameter_is_dropped_on_the_real_encoder_and_the_rest_kept(caplog):
+    _clear_encoder_caches()
+    plan = cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="hd")
+    plan.svt_optional.append(("not-an-svt-option", "1"))
+    # Without the check, -err_detect:v explode makes the real encode fail.
+    assert not encode_hook._encoder_accepts(tuple(plan.video_args("2")))
+    with caplog.at_level("WARNING"):
+        args, _codec, active = encode_hook._select_video_args(plan, "2")
+    assert "rejects not-an-svt-option" in caplog.text and "SVT-AV1 v" in caplog.text
+    parsed = _parse_params(_params_of(args))
+    assert "not-an-svt-option" not in parsed
+    # Only the refused key went: the supported tuning is all still there.
+    assert parsed["enable-variance-boost"] == "1" and parsed["tile-columns"] == "1"
+    assert active.evidence["rejected_params"] == ["not-an-svt-option"]
+    assert "encoder_rejected=not-an-svt-option" in active.describe()
+    assert encode_hook._encoder_accepts(tuple(args))
+    _clear_encoder_caches()
+
+
+def _fake_encoder(stderr_for, calls=None, rc_for=None):
+    """subprocess.run stand-in: encoder probes answer with ``stderr_for(cmd)``."""
+    base = _Run(calls if calls is not None else [], lambda c: _streams())
+
+    def run(cmd, **kw):
+        if cmd[0] == "ffmpeg" and "testsrc=size=128x128:rate=24:duration=0.5" in cmd:
+            if calls is not None:
+                calls.append(list(cmd))
+            rc = rc_for(cmd) if rc_for else 0
+            return subprocess.CompletedProcess(cmd, rc, "", stderr_for(cmd))
+        return base(cmd, **kw)
+
+    return run
+
+
+def test_only_the_refused_svt_keys_are_dropped_including_lp(monkeypatch, caplog):
+    _clear_encoder_caches()
+    stderr = (
+        "Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v9.9.9\n"
+        "[libsvtav1 @ 0x1] Error parsing option variance-boost-strength: 2.\n"
+        "[libsvtav1 @ 0x1] Error parsing option lp: 2.\n"
+    )
+    probes: list = []
+
+    def stderr_for(cmd):
+        # Only the rejection probe runs at -v warning; the accept probe sees none.
+        return stderr if cmd[cmd.index("-v") + 1] == "warning" else ""
+
+    monkeypatch.setattr(encode_hook.subprocess, "run", _fake_encoder(stderr_for, probes))
+    plan = cc.plan_for_class(cc.ANIMATION, res="uhd")
+    with caplog.at_level("WARNING"):
+        args, _codec, active = encode_hook._select_video_args(plan, "2")
+    parsed = _parse_params(_params_of(args))
+    assert "variance-boost-strength" not in parsed and "lp" not in parsed
+    assert parsed["enable-variance-boost"] == "1" and parsed["tile-columns"] == "2"
+    assert "SVT-AV1 v9.9.9 rejects lp, variance-boost-strength" in caplog.text
+    # The rejection probe runs without explode, so it reports every key at once.
+    (warning_probe,) = [c for c in probes if c[c.index("-v") + 1] == "warning"]
+    assert "explode" not in warning_probe
+    # Cached: a second encode of the same command does not re-probe.
+    encode_hook._select_video_args(plan, "2")
+    assert len([c for c in probes if c[c.index("-v") + 1] == "warning"]) == 1
+    _clear_encoder_caches()
+
+
+def test_a_refused_required_key_is_dropped_and_logged_as_an_error(monkeypatch, caplog):
+    _clear_encoder_caches()
+    stderr = "[libsvtav1 @ 0x1] Error parsing option film-grain-denoise: 0.\n"
+    monkeypatch.setattr(encode_hook.subprocess, "run", _fake_encoder(lambda c: stderr))
+    with caplog.at_level("WARNING"):
+        args, _codec, active = encode_hook._select_video_args(cc.plan_for_class(cc.HDR), "2")
+    assert "film-grain-denoise" not in _params_of(args)
+    assert "cannot apply required setting(s) film-grain-denoise" in caplog.text
+    # The plan says so honestly instead of claiming the setting.
+    assert "film-grain-denoise=0 missing" in cc.validate_plan(active)
+    _clear_encoder_caches()
+
+
+def test_x265_refusals_are_dropped_too(monkeypatch, caplog):
+    _clear_encoder_caches()
+    stderr = (
+        "[libx265 @ 0x1] Unknown option: strong-intra-smoothing.\n"
+        "[libx265 @ 0x1] Invalid value for aq-mode: 3.\n"
+    )
+    monkeypatch.setattr(encode_hook.subprocess, "run", _fake_encoder(lambda c: stderr))
+    with caplog.at_level("WARNING"):
+        args, codec, _active = encode_hook._select_video_args(
+            cc.plan_for_class(cc.LIVE_ACTION_GRAINY), "2"
+        )
+    parsed = _parse_params(_params_of(args))
+    assert codec == "hevc"
+    assert "aq-mode" not in parsed and "strong-intra-smoothing" not in parsed
+    assert parsed["no-sao"] == "1" and parsed["pools"] == "2"
+    assert "x265 rejects aq-mode, strong-intra-smoothing" in caplog.text
+    _clear_encoder_caches()
+
+
+def test_an_encoder_that_refuses_nothing_gets_every_parameter(monkeypatch):
+    # The mechanism adds nothing and removes nothing on an encoder that takes it all.
+    _clear_encoder_caches()
+    monkeypatch.setattr(encode_hook.subprocess, "run", _fake_encoder(lambda c: ""))
+    plan = cc.plan_for_class(cc.LIVE_ACTION_CLEAN, res="hd")
+    args, _codec, active = encode_hook._select_video_args(plan, "2")
+    assert args == plan.video_args("2") and active.rejected_params == frozenset()
+    _clear_encoder_caches()
+
+
+@pytest.mark.parametrize(
+    ("how", "reason"),
+    [
+        ("rc-15", "ffmpeg exited -15"),
+        ("rc255", "ffmpeg exited 255"),
+        ("timeout", "timed out"),
+        ("oserror", "could not run"),
+    ],
+)
+def test_an_interrupted_encoder_check_fails_visibly_not_to_fixed_settings(
+    hook, monkeypatch, how, reason
+):
+    src, tmp = hook
+    encode_hook.dismiss_failure()
+    plan = cc.plan_for_class(cc.INTERLACED, res="sd")
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    calls: list = []
+    base = _Run(calls, lambda c: _streams())
+
+    def run(cmd, **kw):
+        if cmd[0] == "ffmpeg" and "testsrc=size=128x128:rate=24:duration=0.5" in cmd:
+            if how == "timeout":
+                raise subprocess.TimeoutExpired(cmd, 60)
+            if how == "oserror":
+                raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+            return subprocess.CompletedProcess(cmd, -15 if how == "rc-15" else 255, "", "")
+        return base(cmd, **kw)
+
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
+    # Before: an interrupted check read as "encoder rejects everything" and the
+    # file was encoded with the fixed legacy command.  Now nothing is encoded.
+    assert _encode_cmds(calls) == []
+    assert not (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).exists()
+    (row,) = encode_hook.failures_snapshot()
+    assert row["reason"].startswith("Encoder check interrupted, nothing encoded")
+    assert reason in row["reason"] and row["codec_class"] == cc.INTERLACED
+    encode_hook.dismiss_failure()
+    _clear_encoder_caches()

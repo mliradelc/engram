@@ -95,6 +95,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -821,23 +822,34 @@ def _legacy_video_args(threads: str) -> list[str]:
     ]
 
 
-@lru_cache(maxsize=32)
-def _encoder_accepts(video_args: tuple[str, ...]) -> bool:
-    """True if this ffmpeg/encoder build accepts ``video_args`` on a tiny synthetic clip.
+_ENCODER_PROBE_INPUT = ("-f", "lavfi", "-i", "testsrc=size=128x128:rate=24:duration=0.5")
+_ENCODER_PROBE_TIMEOUT = 60
+# How each encoder wrapper reports an encoder parameter it would not take.  All
+# three are *warnings* and ffmpeg still exits 0 and encodes without the
+# parameter, which is why a return code can never detect them.  Measured on
+# ffmpeg 7.1.5: libsvtav1 (SVT-AV1 2.3.0) "Error parsing option tf-strength: 1.";
+# libx265 "Unknown option: bogus." and "Invalid value for aq-mode: banana.".
+_REJECTED_PARAM_RE = re.compile(
+    r"Error parsing option ([^\s:]+):|Unknown option: ([^\s.]+)\.|Invalid value for ([^\s:]+):"
+)
+_SVT_VERSION_RE = re.compile(r"SVT-AV1 Encoder Lib (v[\w.+-]+)")
+_EXPLODE = ("-err_detect:v", "explode")
 
-    Encoders differ by build (an older SVT-AV1 may reject newer parameters), and
-    a rejected parameter would otherwise surface only after minutes of encoding.
-    Cached per process, so it costs well under a second once per distinct command.
+
+def _encoder_probe(video_args: tuple[str, ...], *, loglevel: str) -> subprocess.CompletedProcess:
+    """Encode six synthetic frames with ``video_args``.
+
+    Raises :class:`ProbeInterrupted` when the probe could not run, timed out or
+    was killed: that says nothing about the encoder, and treating it as a
+    rejection would silently degrade the encode to the fixed settings.
     """
     cmd = [
         "ffmpeg",
+        "-hide_banner",
         "-v",
-        "error",
+        loglevel,
         "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc=size=128x128:rate=24:duration=0.5",
+        *_ENCODER_PROBE_INPUT,
         *video_args,
         "-frames:v",
         "6",
@@ -846,24 +858,115 @@ def _encoder_accepts(video_args: tuple[str, ...]) -> bool:
         "-",
     ]
     try:
-        run = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return run.returncode == 0
+        run = subprocess.run(cmd, capture_output=True, text=True, timeout=_ENCODER_PROBE_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeInterrupted(f"encoder check timed out after {_ENCODER_PROBE_TIMEOUT}s") from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise ProbeInterrupted(f"encoder check could not run: {exc}") from exc
+    if run.returncode < 0 or run.returncode == _FFMPEG_INTERRUPTED_RC:
+        raise ProbeInterrupted(f"encoder check interrupted (ffmpeg exited {run.returncode})")
+    return run
+
+
+@lru_cache(maxsize=32)
+def _encoder_accepts(video_args: tuple[str, ...]) -> bool:
+    """True if this ffmpeg/encoder build accepts ``video_args`` on a tiny synthetic clip.
+
+    Encoders differ by build (an older SVT-AV1 may reject newer parameters), and
+    a rejected parameter would otherwise surface only after minutes of encoding.
+    Cached per process, so it costs well under a second once per distinct command.
+    Only a *fatal* rejection shows here; parameters an encoder merely ignores
+    are :func:`_rejected_params`'s.  Raises :class:`ProbeInterrupted` (never
+    cached) when the check itself was interrupted.
+    """
+    return _encoder_probe(video_args, loglevel="error").returncode == 0
+
+
+@dataclass(frozen=True)
+class _EncoderParamCheck:
+    rejected: frozenset[str]
+    encoder: str  # e.g. "SVT-AV1 v2.3.0", for the log line
+
+
+@lru_cache(maxsize=32)
+def _rejected_params(video_args: tuple[str, ...]) -> _EncoderParamCheck:
+    """The encoder-parameter keys in ``video_args`` this host's encoder refuses.
+
+    Read from the encoder's own warnings, so it follows whatever SVT-AV1 /
+    x265 is installed: nothing here lists which parameters a version knows, so
+    an upgrade that adds one starts emitting it and a downgrade that loses one
+    stops, with a WARNING either way.  ``-err_detect:v explode`` is left out of
+    this probe so every rejected key is reported in one run rather than the
+    first one only.  Cached per command; raises :class:`ProbeInterrupted`
+    (never cached) when the check was interrupted.
+    """
+    args = list(video_args)
+    for i in range(len(args) - 1):
+        if (args[i], args[i + 1]) == _EXPLODE:
+            del args[i : i + 2]
+            break
+    run = _encoder_probe(tuple(args), loglevel="warning")
+    stderr = run.stderr or ""
+    rejected = frozenset(
+        next(g for g in m.groups() if g) for m in _REJECTED_PARAM_RE.finditer(stderr)
+    )
+    version = _SVT_VERSION_RE.search(stderr)
+    if version:
+        encoder = f"SVT-AV1 {version.group(1)}"
+    elif "libx265" in video_args:
+        encoder = "x265"
+    else:
+        encoder = "the encoder"
+    return _EncoderParamCheck(rejected, encoder)
+
+
+def _drop_rejected_params(plan, threads: str):
+    """``plan`` without the parameters this host's encoder would ignore.
+
+    Only the rejected keys go: the rest of the tuning (and the plan's filters)
+    is kept, so one unknown parameter does not cost all the others.
+    """
+    if plan is None or getattr(plan, "is_passthrough", True):
+        return plan
+    check = _rejected_params(tuple(plan.video_args(threads)))
+    if not check.rejected:
+        return plan
+    required = plan.svt_required if plan.codec == "av1" else plan.x265_required
+    lost = sorted(check.rejected & {k for k, _ in required})
+    logger.warning(
+        "Encoding hook: %s rejects %s; not emitting %s for class=%s",
+        check.encoder,
+        ", ".join(sorted(check.rejected)),
+        "them" if len(check.rejected) > 1 else "it",
+        plan.class_name,
+    )
+    if lost:
+        logger.error(
+            "Encoding hook: %s cannot apply required setting(s) %s for class=%s; "
+            "the encode runs without them",
+            check.encoder,
+            ", ".join(lost),
+            plan.class_name,
+        )
+    return plan.without_params(check.rejected)
 
 
 def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | None]:
     """Choose the video arguments, degrading gracefully.
 
-    Order: the plan's full parameter set, then only its essential parameters
-    (drops tuning extras an older encoder may not know), then the fixed legacy
-    command.  Returns (args, expected output codec_name, plan-or-None).
+    First the parameters this host's encoder would silently ignore are dropped
+    (:func:`_rejected_params`).  Then, in order: the plan's full parameter set,
+    only its essential parameters (drops tuning extras an older encoder fails
+    on), then the fixed legacy command.  Returns (args, expected output
+    codec_name, plan-or-None).  Raises :class:`ProbeInterrupted` when an
+    encoder check was interrupted: that is not a verdict on the encoder.
 
     The plan's video filters (``bwdif`` on an interlaced source) belong to the
     source, not to the settings, so they survive the fall to the fixed command:
     an encoder rejecting a tuning parameter must not leave combing in.
     """
     if plan is not None:
+        plan = _drop_rejected_params(plan, threads)
         for optional in (True, False):
             args = plan.video_args(threads, optional=optional)
             if _encoder_accepts(tuple(args)):
@@ -1031,7 +1134,19 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
     if plan is None:
         video_args, expect_codec, active = _legacy_video_args(threads), "av1", None
     else:
-        video_args, expect_codec, active = _select_video_args(plan, threads)
+        try:
+            video_args, expect_codec, active = _select_video_args(plan, threads)
+        except ProbeInterrupted as exc:
+            # Not a verdict on the encoder, so not a reason for the fixed command.
+            logger.error("Encoding hook: not encoding %s: %s", src.name, exc)
+            _record_failure(
+                src,
+                dest,
+                f"Encoder check interrupted, nothing encoded: {exc}",
+                codec_class=plan.class_name,
+                forced=_plan_forced(plan),
+            )
+            return None
 
     cmd = [
         "ffmpeg",

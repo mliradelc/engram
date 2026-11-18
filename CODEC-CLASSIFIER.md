@@ -17,16 +17,16 @@ Evaluated top to bottom; first match wins. `sd` = width < 1200, `hd` = 1200-2999
 |---|---|---|---|
 | `passthrough` | source codec already AV1; or `is_extra` and shorter than 180 s | none (file left as filed, marker written) | n/a |
 | `interlaced` | idet says interlaced with a dominant field order; or `field_order` says so when idet is inconclusive; **or interlacing cannot be decided at all** | **deinterlace, then encode** (no flag needed) | `bwdif=mode=send_frame:parity=auto:deint=all` (telecined: `fieldmatch,decimate`), then AV1 CRF 24, preset 6, film-grain 0 |
-| `hdr` | `color_transfer` = `smpte2084` (PQ) or `arib-std-b67` (HLG) | AV1, or x265 if the title is also grainy | AV1 CRF 24, preset 6 (8 at uhd), film-grain 4 (0 at uhd), **no luminance-qp-bias**; x265 CRF 20 |
+| `hdr` | `color_transfer` = `smpte2084` (PQ) or `arib-std-b67` (HLG) | AV1, or x265 if the title is also grainy | AV1 CRF 24, preset 6 (8 at uhd), film-grain 4 (0 at uhd); x265 CRF 20 |
 | `animation` | animation score >= 0.60 and grain below threshold | AV1 | CRF 27, preset 6 (8 uhd), film-grain 0, variance-boost strength 1 |
 | `live_action_grainy` | normalised grain >= 0.40 | **x265** | CRF 20 (sd) / 21, preset medium (fast at uhd), `aq-mode=3` |
-| `live_action_clean` | everything else (a progressive source with no grain/animation measurement lands here; a probe too empty to decide interlacing goes to `interlaced`) | AV1 | CRF 23 (sd) / 25, preset 6 (8 uhd), film-grain 4 (0 at uhd), variance-boost strength 2, luminance-qp-bias 25 |
+| `live_action_clean` | everything else (a progressive source with no grain/animation measurement lands here; a probe too empty to decide interlacing goes to `interlaced`) | AV1 | CRF 23 (sd) / 25, preset 6 (8 uhd), film-grain 4 (0 at uhd), variance-boost strength 2 |
 
 Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-denoise=0`
 (this SVT build defaults denoising **on**, which would stack on top of real grain) and
 `lp=<ENGRAM_ENCODE_THREADS>`. "Optional" AV1 parameters: `enable-variance-boost=1`,
-`variance-boost-strength`, `tf-strength=1`, `sharpness=1`, `luminance-qp-bias` (SDR only),
-`tile-columns` (1 at hd, 2 at uhd). AV1 preset 2-4 is never emitted (i3-7100T, software only).
+`variance-boost-strength`, `tile-columns` (1 at hd, 2 at uhd). `tf-strength`, `sharpness` and
+`luminance-qp-bias` are **not** emitted (see "Encoder parameters the host refuses"). AV1 preset 2-4 is never emitted (i3-7100T, software only).
 
 ## Deinterlacing: the rule
 
@@ -151,7 +151,9 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
   is clamped to 10 (SVT-AV1 has no 12-bit profile). The kill-switch command still has no
   `-pix_fmt`.
 * `tune=0` (Encode Wiki, and what the hook already shipped). **JET keeps `tune=1`**; we do not.
-* Variance boost on, `tf-strength=1`, `sharpness=1`, tiles per JET. Strength 1 for animation (Encode Wiki).
+* Variance boost on and tiles per JET. Strength 1 for animation (Encode Wiki). JET's
+  `tf-strength=1`, `sharpness=1` and SDR `luminance-qp-bias` are not emitted: the installed
+  SVT-AV1 refuses them (below).
 * Film grain: 4 on clean live action (JET: dithering for gradients; Encode Wiki: ~8 is for *normally
   grainy* film, which here goes to x265 instead). **Animation uses 0**, where Encode Wiki suggests
   ~4 for hand-drawn: 10-bit already covers banding, and Doom9 reports synthesis does little on
@@ -194,14 +196,46 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
   directory; confirm the curator/media server accepts HEVC there before enabling grainy-class
   output.
 * **Not verified against production.** Tests ran on ffmpeg 7.1.5 / SVT-AV1 2.3.0. Production is
-  ffmpeg 5.1.9 on Debian 12, whose SVT-AV1 is much older and may lack variance-boost, `tf-strength`,
-  `luminance-qp-bias`, or HDR params. Two safeguards, neither exercised on the real build:
-  before each encode the hook runs a 6-frame synthetic test encode (cached per command) and
-  degrades to *essential parameters only* (tune, film-grain, film-grain-denoise, lp), then to the
-  fixed legacy command if that is rejected. An encoder that **silently ignores** an unknown
-  parameter is not detectable this way, so on the old build "optional" settings may simply not apply.
-  Run one synthetic encode on the real image before relying on this.
+  ffmpeg 5.1.9 on Debian 12, whose SVT-AV1 is much older and may refuse more (variance-boost, HDR
+  params). That is now handled per host rather than assumed (next section), but no encode has
+  been run on the production image: check its log for `rejects` WARNINGs on the first encode.
+
 * Probing costs a few seconds per file (about 5 idet runs plus 5 pixel runs); negligible against an encode.
+
+## Encoder parameters the host refuses
+
+libsvtav1 and libx265 do **not fail** on a parameter they cannot take: ffmpeg logs a warning and
+encodes without it, exit 0. Measured on this host (ffmpeg 7.1.5, SVT-AV1 2.3.0, Debian 13), a
+6-frame encode with each parameter alone:
+
+| Parameter | Result |
+|---|---|
+| `tf-strength=1` | `[libsvtav1 @ 0x...] Error parsing option tf-strength: 1.` exit 0 |
+| `sharpness=1` | `[libsvtav1 @ 0x...] Error parsing option sharpness: 1.` exit 0 |
+| `luminance-qp-bias=25` | `[libsvtav1 @ 0x...] Error parsing option luminance-qp-bias: 25.` exit 0 |
+| everything else emitted (tune, film-grain, film-grain-denoise, variance-boost, tile-columns, lp, mastering-display, content-light; every x265 param) | accepted |
+
+The messages are at warning level, so the encode's `-v error` hid them, and the old pre-check
+(`_encoder_accepts`, exit code only) passed. The three were removed from the plans; 2.3.0 has no
+same-intent replacement (temporal filtering is only on/off via `enable-tf`, and there is no luma
+bias or sharpness control), so nothing replaced them. To keep this from recurring:
+
+* Before each encode the hook runs the plan's command on 6 synthetic frames at `-v warning` and
+  reads the encoder's own refusals (`Error parsing option K:` for SVT, `Unknown option: K.` /
+  `Invalid value for K:` for x265). Only the refused keys are dropped, with a WARNING naming them
+  and the SVT version (an ERROR if a *required* one, e.g. `film-grain-denoise`, is refused); the
+  rest of the tuning is kept. Nothing lists which parameters a version knows, so this follows an
+  encoder upgrade or downgrade by itself. Cached per command. After that the existing ladder
+  still applies to a command the encoder *fails* on outright: the plan's essential parameters
+  only (tune, film-grain, film-grain-denoise, lp), then the fixed legacy command, with the
+  deinterlace filter kept throughout.
+* Every classified AV1 command carries `-err_detect:v explode`, which makes libsvtav1 treat a
+  parameter it cannot parse as fatal (measured: exit 234). A refused parameter can no longer be
+  encoded around silently. libx265 has no equivalent; the pre-check covers it. The kill-switch
+  command is unchanged.
+* An encoder check that is itself interrupted (killed, timed out, ffmpeg missing) is not read as
+  "the encoder refuses everything" (which used to fall to the fixed command): the file gets a
+  failed row ("Encoder check interrupted, nothing encoded") and is not encoded.
 
 ## Configuration and disabling
 
