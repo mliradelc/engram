@@ -123,3 +123,67 @@ async def test_app_startup_refuses_on_stale_key(monkeypatch):
     with pytest.raises(RuntimeError, match="ENGRAM_AV1_HOOK -> ENGRAM_ENCODE_HOOK"):
         async with lifespan(app):
             pass
+
+
+# --- The guard aborts startup by design, so a false positive would crash-loop a
+# --- healthy deployment. These pin that it fires on genuine stale keys only,
+# --- never on absence and never on look-alike names.
+
+
+def test_clean_environment_passes_guard():
+    """A fresh install sets neither ENGRAM_AV1_* nor ENGRAM_ENCODE_*: no error."""
+    # The autouse fixture removed every ENGRAM_AV1_*/ENGRAM_ENCODE_* key.
+    assert not [k for k in os.environ if k.startswith(("ENGRAM_AV1_", "ENGRAM_ENCODE_"))]
+    assert encode_hook.stale_env_keys() == []
+    encode_hook.check_stale_env()  # does not raise
+    encode_hook.check_stale_env({})  # an empty mapping is clean too
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "ENGRAM_AV1",  # no trailing underscore: not the renamed prefix
+        "ENGRAM_AV10_HOOK",
+        "ENGRAM_DEBUG",
+        "ENGRAM_ENCODE_HOOK",
+        "MY_ENGRAM_AV1_HOOK",  # prefix match only, not substring
+        "XENGRAM_AV1_CRF",
+    ],
+)
+def test_look_alike_names_do_not_trip_guard(key):
+    encode_hook.check_stale_env({key: "1"})  # does not raise
+    assert encode_hook.stale_env_keys({key: "1"}) == []
+
+
+def test_empty_stale_value_still_trips_guard():
+    """Presence, not truthiness, is what matters: ``ENGRAM_AV1_HOOK=`` is still stale."""
+    with pytest.raises(encode_hook.StaleEncodeEnvError):
+        encode_hook.check_stale_env({"ENGRAM_AV1_HOOK": ""})
+
+
+class _PastGuard(Exception):
+    """Raised by a stubbed ``init_db`` to prove the lifespan got past the guard."""
+
+
+async def test_app_startup_proceeds_on_clean_environment(monkeypatch):
+    """With no ENGRAM_AV1_* key the lifespan runs the guard and carries on to the DB.
+
+    ``init_db`` is stubbed to raise a sentinel so the test stops right after the
+    guard without starting the drive monitor or touching the real database.
+    Reaching it proves the guard returned instead of aborting startup.
+    """
+    import app.main as main_mod
+    from app.main import app, lifespan
+
+    monkeypatch.setattr(main_mod, "setup_logging", lambda: None)
+    reached = []
+
+    async def fake_init_db():
+        reached.append(True)
+        raise _PastGuard
+
+    monkeypatch.setattr(main_mod, "init_db", fake_init_db)
+    with pytest.raises(_PastGuard):
+        async with lifespan(app):
+            pass
+    assert reached == [True]
