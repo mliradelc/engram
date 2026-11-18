@@ -52,11 +52,32 @@ _REAL_TRANSCODE = av1_hook.transcode_to_av1
 AV1_SRC = {"streams": [{"codec_type": "video", "codec_name": "av1", "width": 1920, "height": 1080}]}
 
 
+PROGRESSIVE_SRC = {"field_order": "progressive",
+                   "idet": {"tff": 2, "bff": 1, "progressive": 200, "undetermined": 9}}
+INTERLACED_SRC = {"field_order": "tt",
+                  "idet": {"tff": 180, "bff": 4, "progressive": 20, "undetermined": 6}}
+
+
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     monkeypatch.setattr(av1_hook, "_ENCODING", {})
     monkeypatch.setattr(av1_hook, "_FAILED", av1_hook.deque(maxlen=av1_hook.FAILURE_BUFFER_SIZE))
     monkeypatch.setattr(av1_hook, "_RETRY_PENDING", set())
+
+
+@pytest.fixture(autouse=True)
+def interlace(monkeypatch):
+    """Stub the classifier's idet probe (no ffmpeg on fake files).  Tests set
+    ``interlace.result`` to choose what the source looks like; ``calls`` lists
+    the paths probed."""
+    state = SimpleNamespace(result={}, calls=[])
+
+    def fake(path):
+        state.calls.append(path)
+        return dict(state.result)
+
+    monkeypatch.setattr(av1_hook._load_classifier(), "probe_interlace", fake)
+    return state
 
 
 @pytest.fixture
@@ -165,6 +186,77 @@ def test_forced_plan_never_yields_hdr_or_interlaced(tmp_path, cls):
 def test_forced_plan_refuses_classes_outside_the_four(tmp_path, cls):
     with pytest.raises(ValueError):
         av1_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
+
+
+# ---------------------------------------------------------------------------
+# Deinterlacing belongs to the source: a forced or pinned class cannot skip it
+# ---------------------------------------------------------------------------
+
+ENCODING_FOUR = [c for c in FOUR if c != "passthrough"]
+BWDIF = "bwdif=mode=send_frame:parity=auto:deint=interlaced"
+
+
+@pytest.mark.parametrize("cls", ENCODING_FOUR)
+def test_forced_class_on_an_interlaced_source_still_gets_bwdif(tmp_path, cls, interlace):
+    interlace.result = INTERLACED_SRC
+    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
+    assert plan.class_name == cls  # the class still picks codec/CRF/preset
+    assert plan.video_filters == [BWDIF]
+    assert plan.evidence["interlaced"] == "yes"
+    args = plan.video_args(4)
+    assert args[args.index("-vf") + 1] == BWDIF
+    assert interlace.calls == [str(tmp_path / "x.mkv")]
+
+
+@pytest.mark.parametrize("cls", ENCODING_FOUR)
+def test_forced_class_on_a_progressive_source_does_not_get_bwdif(tmp_path, cls, interlace):
+    interlace.result = PROGRESSIVE_SRC
+    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
+    assert plan.video_filters == []
+    assert "-vf" not in plan.video_args(4)
+    assert plan.evidence["interlaced"] == "no"
+
+
+def test_forced_plan_uses_idet_over_a_progressive_field_order_flag(tmp_path, interlace):
+    """A DVD flagged progressive but combed in fact: idet decides, not the flag."""
+    interlace.result = {**INTERLACED_SRC, "field_order": "progressive"}
+    plan = av1_hook.forced_plan(tmp_path / "x.mkv", "animation", SD_MPEG2)
+    assert plan.video_filters == [BWDIF]
+
+
+def test_forced_passthrough_skips_the_idet_probe(tmp_path, interlace):
+    interlace.result = INTERLACED_SRC
+    plan = av1_hook.forced_plan(tmp_path / "x.mkv", "passthrough", SD_MPEG2)
+    assert plan.is_passthrough and plan.video_filters == []
+    assert interlace.calls == []
+
+
+def test_a_pin_on_an_interlaced_source_encodes_deinterlaced(env, interlace):
+    src = _rip(env.lib)
+    interlace.result = INTERLACED_SRC
+    av1_hook.set_override(src, "animation", roots=env.roots)
+    av1_hook.after_organize(str(src))
+    [enc] = env.encodes
+    assert enc["plan"].class_name == "animation"
+    assert enc["plan"].video_filters == [BWDIF]
+    assert interlace.calls == [str(src)]
+
+
+def test_a_forced_retry_class_on_an_interlaced_source_encodes_deinterlaced(env, interlace):
+    src = _rip(env.lib)
+    interlace.result = INTERLACED_SRC
+    av1_hook.after_organize(str(src), forced_class="live_action_grainy")
+    [enc] = env.encodes
+    assert enc["plan"].codec == "hevc"
+    assert enc["plan"].video_filters == [BWDIF]
+
+
+def test_forced_plan_carries_the_source_bit_depth(tmp_path):
+    ten = {"streams": [{**SD_MPEG2["streams"][0], "pix_fmt": "yuv420p10le"}]}
+    eight = {"streams": [{**SD_MPEG2["streams"][0], "pix_fmt": "yuv420p"}]}
+    for cls in ENCODING_FOUR:
+        assert av1_hook.forced_plan(tmp_path / "x.mkv", cls, ten).pix_fmt == "yuv420p10le"
+        assert av1_hook.forced_plan(tmp_path / "x.mkv", cls, eight).pix_fmt == "yuv420p"
 
 
 def test_forced_class_problem():

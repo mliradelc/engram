@@ -77,6 +77,12 @@ Where this module deliberately departs from a source:
   SVT keeps real grain and pays for it, and the community puts the AV1 /
   x265 crossover for detail retention around CRF 20.  AV1 with denoise on was
   rejected -- it removes detail and the denoiser is called poor by JET.
+* Output bit depth follows the source (8-bit stays 8-bit, 10-bit stays
+  10-bit), not Encode Wiki's "always feed 10-bit": the principal's rule is to
+  preserve the source's bit depth.  HDR and unknown-depth sources get 10-bit.
+* An operator-forced class decides codec / CRF / preset only.  Resolution, bit
+  depth and deinterlacing are the source's (:func:`forced_class_plan`): an
+  interlaced source gets ``bwdif`` under any forced class.
 * Interlaced material is **not encoded** by default.  Automatic deinterlacing
   is irreversible, and telecined film (where idet reports mixed frames) needs
   IVTC, not a deinterlacer; guessing wrong bakes in combing or ghosting.  The
@@ -119,7 +125,18 @@ LIVE_ACTION_CLEAN = "live_action_clean"
 CLASSES = (PASSTHROUGH, INTERLACED, HDR, ANIMATION, LIVE_ACTION_GRAINY, LIVE_ACTION_CLEAN)
 DEFAULT_CLASS = LIVE_ACTION_CLEAN  # what an empty / unusable probe falls back to
 
-PIX_FMT = "yuv420p10le"  # 10-bit always, even from 8-bit sources
+# Output bit depth follows the source ("preserve bit"): never reduce a 10-bit
+# source to 8-bit, never pad an 8-bit source to 10-bit.  Chroma is always 4:2:0
+# (SVT-AV1 supports nothing else).  ``PIX_FMT`` is what a source of unknown
+# depth gets: 10-bit cannot truncate, so it is the safe answer when we cannot
+# prove the source is 8-bit.  HDR is always 10-bit.
+PIX_FMT_8BIT = "yuv420p"
+PIX_FMT_10BIT = "yuv420p10le"
+PIX_FMT = PIX_FMT_10BIT
+OUTPUT_PIX_FMTS = (PIX_FMT_8BIT, PIX_FMT_10BIT)
+_PIX_DEPTH_RE = re.compile(r"(\d+)(?:le|be)$")
+
+DEINTERLACE_FILTER = "bwdif=mode=send_frame:parity=auto:deint=interlaced"
 
 SHORT_EXTRA_SECONDS = 180  # an *extra* shorter than this is not worth an encode
 INTERLACED_FRACTION = 0.30  # (tff+bff) / (tff+bff+prog) over idet-decided frames
@@ -156,7 +173,7 @@ class CodecPlan:
     reason: str = ""
     crf: int | None = None
     preset: str | None = None
-    pix_fmt: str = PIX_FMT
+    source_pix_fmt: str | None = None  # the probed source's pix_fmt; decides pix_fmt
     svt_required: list[tuple[str, str]] = field(default_factory=list)
     svt_optional: list[tuple[str, str]] = field(default_factory=list)
     x265_required: list[tuple[str, str]] = field(default_factory=list)
@@ -168,6 +185,11 @@ class CodecPlan:
     @property
     def is_passthrough(self) -> bool:
         return self.codec == "none"
+
+    @property
+    def pix_fmt(self) -> str:
+        """Output pixel format, derived from the source, never from the class."""
+        return output_pix_fmt(self.source_pix_fmt, hdr=self.hdr)
 
     @property
     def output_codec_name(self) -> str | None:
@@ -211,6 +233,38 @@ class CodecPlan:
         return " ".join(bits) + " -> " + tail
 
 
+def source_bit_depth(pix_fmt: str | None) -> int | None:
+    """Bits per component of an ffmpeg ``pix_fmt``; None when it cannot be told.
+
+    ``yuv420p10le`` / ``p010le`` / ``gray10le`` -> 10; ``yuv420p`` / ``yuvj420p``
+    / ``nv12`` (no depth suffix) -> 8.
+    """
+    if not pix_fmt:
+        return None
+    name = str(pix_fmt).strip().lower()
+    m = _PIX_DEPTH_RE.search(name)
+    if m:
+        depth = int(m.group(1))
+        return depth if 8 <= depth <= 16 else None
+    if name.startswith(("yuv", "yuvj", "nv", "gray")):
+        return 8
+    return None
+
+
+def output_pix_fmt(source_pix_fmt: str | None, *, hdr: bool = False) -> str:
+    """4:2:0 at the source's depth: 8-bit stays 8-bit, deeper becomes 10-bit.
+
+    Unknown depth and HDR get 10-bit (cannot truncate).  A 12-bit source is
+    clamped to 10-bit: SVT-AV1 has no 12-bit profile.
+    """
+    if hdr:
+        return PIX_FMT_10BIT
+    depth = source_bit_depth(source_pix_fmt)
+    if depth == 8:
+        return PIX_FMT_8BIT
+    return PIX_FMT_10BIT
+
+
 def validate_plan(plan: CodecPlan) -> list[str]:
     """Return a list of problems with a plan (empty means valid)."""
     problems: list[str] = []
@@ -220,8 +274,13 @@ def validate_plan(plan: CodecPlan) -> list[str]:
         problems.append(f"bad codec {plan.codec!r}")
     if plan.is_passthrough:
         return problems
-    if plan.pix_fmt != PIX_FMT:
-        problems.append("output must be 10-bit")
+    if plan.pix_fmt not in OUTPUT_PIX_FMTS:
+        problems.append(f"pix_fmt {plan.pix_fmt!r} is not 4:2:0 8/10-bit")
+    if plan.hdr and plan.pix_fmt != PIX_FMT_10BIT:
+        problems.append("HDR output must be 10-bit")
+    src_depth = source_bit_depth(plan.source_pix_fmt)
+    if src_depth is not None and (source_bit_depth(plan.pix_fmt) or 0) < min(src_depth, 10):
+        problems.append("output is shallower than the source")
     if plan.crf is None or not 0 <= plan.crf <= 51:
         problems.append("crf missing or out of range")
     if plan.codec == "av1":
@@ -356,8 +415,28 @@ def plan_for_class(
     grainy_hdr: bool = False,
     evidence: dict | None = None,
     reason: str = "",
+    source_pix_fmt: str | None = None,
 ) -> CodecPlan:
-    """Build the settings for one class.  Complete and valid for every class."""
+    """Build the settings for one class.  Complete and valid for every class.
+
+    ``source_pix_fmt`` (the probed source's) decides the output bit depth; the
+    class never does.
+    """
+    plan = _plan_for_class(class_name, res=res, hdr_meta=hdr_meta, grainy_hdr=grainy_hdr,
+                           evidence=evidence, reason=reason)
+    plan.source_pix_fmt = source_pix_fmt
+    return plan
+
+
+def _plan_for_class(
+    class_name: str,
+    *,
+    res: str,
+    hdr_meta: dict | None,
+    grainy_hdr: bool,
+    evidence: dict | None,
+    reason: str,
+) -> CodecPlan:
     ev = dict(evidence or {})
     preset = "6"
     # UHD gets no film-grain synthesis: the synthesis/grain-table compute cost at
@@ -394,7 +473,7 @@ def plan_for_class(
                      svt_required=req, svt_optional=opt, evidence=ev)
 
 
-def deinterlaced_plan(res: str, evidence: dict) -> CodecPlan:
+def deinterlaced_plan(res: str, evidence: dict, source_pix_fmt: str | None = None) -> CodecPlan:
     """Opt-in path for interlaced sources: bwdif, then a conservative AV1 encode.
 
     Film grain synthesis is off: grain on interlaced sources is unmeasured
@@ -403,11 +482,40 @@ def deinterlaced_plan(res: str, evidence: dict) -> CodecPlan:
     req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
     return CodecPlan(
         INTERLACED, "av1", "interlaced source, deinterlace opted in",
-        24, "6",
+        24, "6", source_pix_fmt=source_pix_fmt,
         svt_required=req, svt_optional=opt,
-        video_filters=["bwdif=mode=send_frame:parity=auto:deint=interlaced"],
+        video_filters=[DEINTERLACE_FILTER],
         evidence=evidence,
     )
+
+
+def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") -> CodecPlan:
+    """Settings for an operator-forced class, with the source's own properties.
+
+    The class picks codec / CRF / preset.  It does **not** decide what belongs to
+    the source: resolution, bit depth and deinterlacing come from ``probe``
+    (the flat dict :func:`probe_interlace` returns, plus width/height/pix_fmt).
+    An interlaced source gets ``bwdif`` whichever class was forced, so a pin
+    cannot produce combed output.  ``hdr`` / ``interlaced`` are not forceable
+    and are the caller's to refuse; this function does not re-check them.
+    """
+    p = probe if isinstance(probe, dict) else {}
+    width = int(_num(p.get("width"), 0) or 0) or None
+    height = int(_num(p.get("height"), 0) or 0) or None
+    res = resolution_class(width, height)
+    ev: dict = {"res": res, "forced": True}
+    plan = plan_for_class(class_name, res=res, evidence=ev, reason=reason,
+                          source_pix_fmt=p.get("pix_fmt"))
+    if plan.is_passthrough:
+        return plan  # nothing is encoded, so there is nothing to deinterlace
+    inter, frac, basis = interlaced_verdict(p)
+    plan.evidence["interlaced"] = "yes" if inter else ("no" if inter is False else "unknown")
+    if frac is not None:
+        plan.evidence["interlaced_frac"] = round(frac, 3)
+    plan.evidence["interlaced_basis"] = basis
+    if inter and DEINTERLACE_FILTER not in plan.video_filters:
+        plan.video_filters = [DEINTERLACE_FILTER, *plan.video_filters]
+    return plan
 
 
 # --------------------------------------------------------------------------
@@ -560,8 +668,11 @@ def classify(probe: dict | None, context: dict | None = None, *,
     Never raises: any error yields the safe default class with the error recorded.
     """
     try:
-        return _classify(probe if isinstance(probe, dict) else {},
-                         context if isinstance(context, dict) else {}, deinterlace)
+        p = probe if isinstance(probe, dict) else {}
+        plan = _classify(p, context if isinstance(context, dict) else {}, deinterlace)
+        # Bit depth belongs to the source, whichever class was chosen.
+        plan.source_pix_fmt = p.get("pix_fmt")
+        return plan
     except Exception as exc:  # noqa: BLE001 - classifier must never break the hook
         logger.warning("codec_classifier: classify failed (%s); using default class", exc)
         return plan_for_class(DEFAULT_CLASS, evidence={"error": str(exc)}, reason="classify error")
@@ -828,6 +939,25 @@ def probe_media(path: str) -> dict:
             probe["pixel_frames"] = len(grains)
     except Exception:  # noqa: BLE001 - probes are best-effort
         logger.warning("codec_classifier: probing failed for %s", path, exc_info=True)
+    return probe
+
+
+def probe_interlace(path: str) -> dict:
+    """The cheap probes a forced class needs: stream info plus idet.  Never raises.
+
+    One ffprobe (dimensions, ``pix_fmt``, ``field_order``, duration) and the
+    same idet sampling :func:`probe_media` runs (``IDET_SECONDS`` at each of
+    :data:`SAMPLE_FRACTIONS`), but none of the pixel probes, which are the
+    expensive part and only matter to *choosing* a class.
+    """
+    probe: dict = {}
+    try:
+        probe = _probe_stream(path)
+        idet = _probe_idet(path, sample_times(probe.get("duration")))
+        if idet:
+            probe["idet"] = idet
+    except Exception:  # noqa: BLE001 - probes are best-effort
+        logger.warning("codec_classifier: interlace probe failed for %s", path, exc_info=True)
     return probe
 
 

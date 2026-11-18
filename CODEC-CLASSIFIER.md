@@ -69,19 +69,28 @@ Sources: JET Encoding Guide (SVT-AV1), Encode Wiki (SVT-AV1, graining, preserve 
 the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec but returned HTTP
 403 here, so it informed nothing beyond the spec's summary. Full URLs are in the module docstring.
 
-* 10-bit everywhere: banding, even from 8-bit sources (Encode Wiki).
+* Bit depth follows the source: 8-bit stays 8-bit, 10-bit stays 10-bit, always 4:2:0. This
+  departs from Encode Wiki's "always feed 10-bit" on purpose: the rule is to preserve the
+  source. HDR and sources whose depth cannot be read get 10-bit (it cannot truncate); 12-bit
+  is clamped to 10 (SVT-AV1 has no 12-bit profile). The kill-switch command still has no
+  `-pix_fmt`.
 * `tune=0` (Encode Wiki, and what the hook already shipped). **JET keeps `tune=1`**; we do not.
 * Variance boost on, `tf-strength=1`, `sharpness=1`, tiles per JET. Strength 1 for animation (Encode Wiki).
 * Film grain: 4 on clean live action (JET: dithering for gradients; Encode Wiki: ~8 is for *normally
   grainy* film, which here goes to x265 instead). **Animation uses 0**, where Encode Wiki suggests
   ~4 for hand-drawn: 10-bit already covers banding, and Doom9 reports synthesis does little on
-  grain-free content. Revisit if anime shows banding.
+  grain-free content. Revisit if anime shows banding (more likely now that 8-bit sources stay
+  8-bit).
 * Grainy live action goes to x265. With `film-grain-denoise=0` SVT keeps real grain and pays for
   it; JET puts the AV1/x265 crossover near CRF 20. Denoise-then-synthesise was rejected: it
   removes detail and JET calls SVT's denoiser poor.
 * Interlaced is **not** encoded by default. Deinterlacing is irreversible, and telecined film
   needs IVTC rather than a deinterlacer; guessing wrong bakes in combing. The original is already in
   the library, so skipping loses nothing.
+* A **forced or pinned** class decides codec, CRF and preset only. Deinterlacing is the source's:
+  before a forced class is applied, the same idet sampling runs (stream probe + idet, none of the
+  pixel probes), and an interlaced source gets `bwdif` whichever class was chosen. A pin cannot
+  produce combed output. `passthrough` encodes nothing and skips the probe.
 * AV1 preset 6 floor; UHD gets 8 and no grain synthesis (SVT warns synthesis above preset 6 is a
   large compute cost).
 

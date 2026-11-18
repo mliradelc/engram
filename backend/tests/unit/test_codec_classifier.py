@@ -348,6 +348,75 @@ def test_film_grain_denoise_zero_in_every_av1_param_string(name, res, optional):
         assert params["lp"] == "4"
 
 
+# ---------------------------------------------------------------------------
+# Bit depth follows the source ("preserve bit")
+# ---------------------------------------------------------------------------
+
+SOURCE_PIX_FMTS = {  # source pix_fmt -> expected output pix_fmt
+    "yuv420p": "yuv420p",
+    "yuvj420p": "yuv420p",
+    "nv12": "yuv420p",
+    "yuv422p": "yuv420p",
+    "yuv420p10le": "yuv420p10le",
+    "yuv422p10le": "yuv420p10le",
+    "p010le": "yuv420p10le",
+    "yuv420p12le": "yuv420p10le",  # clamped: SVT-AV1 has no 12-bit profile
+    None: "yuv420p10le",  # unknown depth: 10-bit cannot truncate
+}
+
+
+def test_10_bit_source_plans_10_bit_and_8_bit_source_plans_8_bit():
+    for name in (cc.ANIMATION, cc.LIVE_ACTION_GRAINY, cc.LIVE_ACTION_CLEAN):
+        ten = cc.plan_for_class(name, res="hd", source_pix_fmt="yuv420p10le")
+        eight = cc.plan_for_class(name, res="hd", source_pix_fmt="yuv420p")
+        assert ten.pix_fmt == "yuv420p10le"
+        assert eight.pix_fmt == "yuv420p"
+        for plan, want in ((ten, "yuv420p10le"), (eight, "yuv420p")):
+            args = plan.video_args(4)
+            assert args[args.index("-pix_fmt") + 1] == want
+            assert cc.validate_plan(plan) == []
+
+
+@pytest.mark.parametrize("src_fmt, want", list(SOURCE_PIX_FMTS.items()))
+@pytest.mark.parametrize("name", list(CLASS_PROBES))
+def test_classify_derives_pix_fmt_from_the_probe(name, src_fmt, want):
+    p, ctx = CLASS_PROBES[name]
+    plan = cc.classify({**p, "pix_fmt": src_fmt}, ctx)
+    if plan.is_passthrough:
+        return
+    expected = "yuv420p10le" if plan.hdr else want
+    assert plan.pix_fmt == expected
+    assert cc.validate_plan(plan) == []
+
+
+@pytest.mark.parametrize("src_fmt", [f for f in SOURCE_PIX_FMTS if f])
+@pytest.mark.parametrize("name", ENCODING_CLASSES)
+def test_no_class_ever_emits_a_pix_fmt_shallower_than_its_source(name, src_fmt):
+    plans = [cc.plan_for_class(name, res="hd", hdr_meta=HDR_META, source_pix_fmt=src_fmt),
+             cc.classify(probe(idet=INTERLACED_IDET, pix_fmt=src_fmt), deinterlace=True)]
+    for plan in plans:
+        out = cc.source_bit_depth(plan.pix_fmt)
+        assert out >= min(cc.source_bit_depth(src_fmt), 10)
+        assert plan.pix_fmt.startswith("yuv420p")  # 4:2:0 kept
+        assert cc.validate_plan(plan) == []
+
+
+def test_validate_plan_rejects_a_shallower_output(monkeypatch):
+    plan = cc.plan_for_class(cc.LIVE_ACTION_CLEAN, source_pix_fmt="yuv420p10le")
+    assert cc.validate_plan(plan) == []
+    # Simulate the regression this guards: a fixed 8-bit output whatever the source.
+    monkeypatch.setattr(cc, "output_pix_fmt", lambda src, hdr=False: "yuv420p")
+    assert "output is shallower than the source" in cc.validate_plan(plan)
+
+
+def test_hdr_is_10_bit_even_from_a_mislabelled_8_bit_source():
+    assert cc.output_pix_fmt("yuv420p", hdr=True) == "yuv420p10le"
+
+
+def test_legacy_video_args_still_have_no_pix_fmt():
+    assert "-pix_fmt" not in av1_hook._legacy_video_args("4")
+
+
 def test_essential_params_are_a_subset_so_degrading_never_drops_denoise_or_grain():
     for name in ENCODING_CLASSES:
         plan = cc.plan_for_class(name, res="hd")
@@ -751,6 +820,44 @@ def test_deinterlace_command_parses_and_encodes_av1_10_bit(synth, tmp_path):
     assert run.returncode == 0, run.stderr
     v = _ffprobe_video(out)
     assert (v["codec_name"], v["pix_fmt"]) == ("av1", "yuv420p10le")
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("src_fmt", ["yuv420p", "yuv420p10le"])
+@pytest.mark.parametrize("name", [cc.ANIMATION, cc.LIVE_ACTION_GRAINY])
+def test_real_encode_preserves_the_source_bit_depth(name, src_fmt, tmp_path):
+    src = _make_source(tmp_path / f"src-{src_fmt}.mkv", "testsrc=size=320x240:rate=24",
+                       ["-c:v", "ffv1", "-pix_fmt", src_fmt])
+    meta = cc._probe_stream(str(src))
+    assert meta["pix_fmt"] == src_fmt
+    plan = cc.plan_for_class(name, res="sd", source_pix_fmt=meta["pix_fmt"])
+    args = plan.video_args(2)
+    args[args.index("-preset") + 1] = "12" if plan.codec == "av1" else "ultrafast"
+    out = tmp_path / "out.mkv"
+    run = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0",
+                          *args, str(out)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert _ffprobe_video(out)["pix_fmt"] == src_fmt
+
+
+@needs_ffmpeg
+def test_forced_class_on_a_real_combed_source_gets_bwdif(tmp_path):
+    """End to end on a real interlaced MPEG-2 file: the cheap probe catches it."""
+    combed = _make_source(
+        tmp_path / "combed.mkv", "testsrc2=size=320x240:rate=60",
+        ["-vf", "interlace=scan=tff,format=yuv420p", "-c:v", "mpeg2video",
+         "-flags", "+ildct+ilme", "-top", "1", "-b:v", "4M"], seconds=3)
+    facts = cc.probe_interlace(str(combed))
+    assert "grain" not in facts and "animation" not in facts  # no pixel probes
+    plan = cc.forced_class_plan(cc.ANIMATION, facts)
+    assert plan.class_name == cc.ANIMATION
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    assert plan.pix_fmt == "yuv420p"
+
+    progressive = _make_source(tmp_path / "prog.mkv", "testsrc2=size=320x240:rate=24",
+                               seconds=3)
+    plan = cc.forced_class_plan(cc.ANIMATION, cc.probe_interlace(str(progressive)))
+    assert plan.video_filters == []
 
 
 @needs_ffmpeg

@@ -653,13 +653,18 @@ def forced_class_problem(codec_class: str | None, probe: dict) -> str | None:
     return None
 
 
-def forced_plan(src: Path, codec_class: str, probe: dict | None = None):
-    """A ``CodecPlan`` for ``codec_class`` at the source's own resolution.
+def forced_plan(
+    src: Path, codec_class: str, probe: dict | None = None, interlace: dict | None = None
+):
+    """A ``CodecPlan`` for ``codec_class`` with the source's own properties.
 
-    Probes ``src`` (unless ``probe`` is given) for its dimensions; the classes
-    that may be forced depend on resolution only.  Returns None when the
-    classifier module cannot be loaded.  Raises ``ValueError`` for a class
-    outside :data:`OFFERED_CLASSES`.
+    The class picks codec / CRF / preset.  Resolution and bit depth come from
+    ``probe`` (probed from ``src`` when not given).  Deinterlacing comes from
+    ``interlace`` -- the classifier's cheap idet probe, run on ``src`` here
+    unless given -- so an interlaced source gets ``bwdif`` whichever class was
+    forced or pinned.  ``passthrough`` encodes nothing and skips the idet probe.
+    Returns None when the classifier module cannot be loaded.  Raises
+    ``ValueError`` for a class outside :data:`OFFERED_CLASSES`.
     """
     if codec_class not in OFFERED_CLASSES:
         raise ValueError(f"codec class {codec_class!r} cannot be forced")
@@ -667,10 +672,13 @@ def forced_plan(src: Path, codec_class: str, probe: dict | None = None):
     if mod is None:
         return None
     video = _video_stream(probe if probe is not None else _probe(src))
-    res = mod.resolution_class(video.get("width"), video.get("height"))
-    return mod.plan_for_class(
-        codec_class, res=res, evidence={"res": res, "forced": True},
-        reason=f"forced by operator ({codec_class})",
+    facts: dict[str, Any] = {}
+    if codec_class != "passthrough":
+        facts.update(interlace if interlace is not None else mod.probe_interlace(str(src)))
+    # The full probe's stream fields win over the interlace probe's copies.
+    facts.update({k: video[k] for k in ("width", "height", "pix_fmt") if video.get(k)})
+    return mod.forced_class_plan(
+        codec_class, facts, reason=f"forced by operator ({codec_class})",
     )
 
 
