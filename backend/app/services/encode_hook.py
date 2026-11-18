@@ -29,9 +29,7 @@ transcode, let alone the rip.
 
 Configuration (environment):
     ENGRAM_ENCODE_HOOK       "1" to enable; anything else disables.
-    ENGRAM_ENCODE_STAGING    destination dir (default /staging/av1-out; the
-                             directory name is historical, kept so existing
-                             encoded output is not orphaned)
+    ENGRAM_ENCODE_STAGING    destination dir (default /staging/encode-out)
     ENGRAM_ENCODE_THREADS    encoder thread count, SVT ``lp`` / x265 ``pools``
                              (default 4; applies on every path)
     ENGRAM_CODEC_CLASSIFIER  "0" disables the classifier (fixed CRF/preset).
@@ -98,7 +96,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# On-disk name; historical, kept so existing markers still mark files as done.
+# Deliberately still "av1" although the hook also writes x265, and so is the
+# marker's "av1" JSON key (the output path).  Every file already encoded carries
+# a marker with this suffix; renaming it (or the key) would make every one of
+# them look unconverted and re-trigger a re-encode of the whole library.
+# Guarded by test_marker_suffix_is_frozen.
 MARKER_SUFFIX = ".engram-av1.json"
 ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
 PROGRESS_PUBLISH_INTERVAL = 2.0  # seconds between encode_progress messages per file
@@ -1136,10 +1138,13 @@ class RetryInvalid(RetryError):
 _RETRY_PENDING: set[str] = set()
 
 
+DEFAULT_ENCODE_STAGING = "/staging/encode-out"
+
+
 def _staging_dir() -> Path:
-    # The default directory name "av1-out" is historical (from when this was the
-    # "AV1 hook"); it is kept so encoded output already on disk is not orphaned.
-    return Path(_cfg("ENGRAM_ENCODE_STAGING", "/staging/av1-out"))
+    # Retiring output left under an older default is a manual runbook step
+    # (CODEC-CLASSIFIER.md), never something the app does on its own.
+    return Path(_cfg("ENGRAM_ENCODE_STAGING", DEFAULT_ENCODE_STAGING))
 
 
 # Engram's domain: the only places a file may be encoded from.  A rip lands in

@@ -39,14 +39,14 @@ async def test_encoding_endpoint_empty(client):
 async def test_encoding_endpoint_returns_snapshot(client, monkeypatch):
     row = {
         "file": "Show - S01E01.mkv",
-        "destination_folder": "/staging/av1-out",
+        "destination_folder": "/staging/encode-out",
         "percent": 42.5,
         "eta": 1800,
         "speed": "0.25x",
         "codec": "av1",
         "started_at": 1.0,
     }
-    monkeypatch.setattr(encode_hook, "_ENCODING", {"/staging/av1-out/Show - S01E01.mkv": row})
+    monkeypatch.setattr(encode_hook, "_ENCODING", {"/staging/encode-out/Show - S01E01.mkv": row})
     resp = await client.get("/api/encoding")
     assert resp.status_code == 200
     assert resp.json() == {"active": [row], "failed": []}
@@ -87,7 +87,7 @@ def retry_env(tmp_path, monkeypatch):
     lib.mkdir(parents=True)
     monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
     monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
-    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "av1-out"))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "encode-out"))
 
     async def fake_get_config():
         return SimpleNamespace(library_tv_path=str(lib), library_movies_path="")

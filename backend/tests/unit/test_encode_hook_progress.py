@@ -689,7 +689,7 @@ def test_retry_without_roots_fails_closed(hook_env, tmp_path, monkeypatch):
     elsewhere = tmp_path / "media" / "_staging"
     elsewhere.mkdir(parents=True)
     monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(elsewhere),))
-    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "av1-out"))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "encode-out"))
     src = _staged_src(hook_env)
     with pytest.raises(encode_hook.RetryNotFound):
         encode_hook.retry_encode(src)
@@ -760,7 +760,7 @@ def test_default_retry_roots_skip_empty_and_honour_only_in_domain_paths(monkeypa
     domain = tmp_path / "media" / "_staging"
     inside = domain / "tv"
     outside = tmp_path / "media" / "tv"
-    staging = tmp_path / "staging" / "av1-out"
+    staging = tmp_path / "staging" / "encode-out"
     for d in (inside, outside, staging):
         d.mkdir(parents=True)
     monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
@@ -781,7 +781,7 @@ def test_domain_roots_are_staging_only_never_the_library(monkeypatch, tmp_path):
 
     media = tmp_path / "media"
     domain, tv, movies = media / "_staging", media / "tv", media / "movies"
-    staging = tmp_path / "staging" / "av1-out"
+    staging = tmp_path / "staging" / "encode-out"
     for d in (domain, tv, movies, staging):
         d.mkdir(parents=True)
     monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
@@ -794,6 +794,34 @@ def test_domain_roots_are_staging_only_never_the_library(monkeypatch, tmp_path):
     assert encode_hook.in_domain(staging / "Show - S01E01.mkv")
     assert not encode_hook.in_domain(tv / "Show - S01E01.mkv", [str(tv), str(movies)])
     assert not encode_hook.in_domain(movies / "Film (2010).mkv", [str(tv), str(movies)])
+
+
+def test_default_staging_dir_is_encode_out(monkeypatch):
+    """Unset ENGRAM_ENCODE_STAGING falls back to /staging/encode-out, never the old av1 name."""
+    monkeypatch.delenv("ENGRAM_ENCODE_STAGING", raising=False)
+    assert encode_hook._staging_dir() == Path("/staging/encode-out")
+    assert "av1" not in str(encode_hook._staging_dir())
+
+
+def test_marker_suffix_is_frozen(tmp_path):
+    """The marker name and its "av1" key must NOT follow the encode rename.
+
+    Every file the hook has already encoded carries ``<name>.engram-av1.json``
+    with the output under ``"av1"``.  Renaming either makes those files look
+    unconverted and re-encodes the whole library.  A marker written in the old
+    on-disk form must still count as done.
+    """
+    assert encode_hook.MARKER_SUFFIX == ".engram-av1.json"
+    src = tmp_path / "Show - S01E01.mkv"
+    src.write_bytes(b"src")
+    assert encode_hook._marker_path(src) == tmp_path / "Show - S01E01.mkv.engram-av1.json"
+    st = src.stat()
+    (tmp_path / "Show - S01E01.mkv.engram-av1.json").write_text(json.dumps({
+        "size": st.st_size, "mtime": int(st.st_mtime),
+        "av1": "/staging/encode-out/Show - S01E01.mkv", "codec_class": "live_action_clean",
+    }))
+    assert encode_hook._already_done(src)
+    assert "av1" in encode_hook._DONE_FIELDS
 
 
 # ---------------------------------------------------------------------------

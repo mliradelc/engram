@@ -806,7 +806,7 @@ describe("encode retry / dismiss / override", () => {
   const failure = {
     file: "Show - S01E02.mkv",
     source: "/media/_staging/tv/Show - S01E02.mkv",
-    destination_folder: "/staging/av1-out",
+    destination_folder: "/staging/encode-out",
     reason: "ffmpeg exited 1",
     codec_class: "live_action_clean",
     forced: false,

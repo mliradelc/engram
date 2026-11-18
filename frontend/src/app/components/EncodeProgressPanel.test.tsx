@@ -16,7 +16,7 @@ import type { EncodeFailure, EncodeOverrideStatus, EncodeProgress } from '../../
 const failure = (over: Partial<EncodeFailure> = {}): EncodeFailure => ({
     file: 'Show - S01E02.mkv',
     source: '/library/tv/Show/Season 01/Show - S01E02.mkv',
-    destination_folder: '/staging/av1-out',
+    destination_folder: '/staging/encode-out',
     reason: 'ffmpeg exited 1: boom',
     failed_at: 1_700_000_000,
     ...over,
@@ -24,7 +24,7 @@ const failure = (over: Partial<EncodeFailure> = {}): EncodeFailure => ({
 
 const row = (over: Partial<EncodeProgress> = {}): EncodeProgress => ({
     file: 'Show - S01E01.mkv',
-    destination_folder: '/staging/av1-out',
+    destination_folder: '/staging/encode-out',
     percent: 42.5,
     eta: 1830,
     speed: '0.25x',
@@ -47,7 +47,7 @@ describe('EncodeProgressPanel', () => {
         expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '43');
         expect(screen.getByTestId('encode-progress-percent')).toHaveTextContent('42.5%');
         expect(screen.getByTestId('encode-progress-eta')).toHaveTextContent('ETA 30m 30s');
-        expect(screen.getByTestId('encode-progress-destination')).toHaveTextContent('/staging/av1-out');
+        expect(screen.getByTestId('encode-progress-destination')).toHaveTextContent('/staging/encode-out');
     });
 
     it('shows a dash when the ETA is unknown', () => {

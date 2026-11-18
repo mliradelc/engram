@@ -190,7 +190,7 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
 | ~~`ENGRAM_CODEC_INTERLACED`~~ | **removed, ignored.** Deinterlacing follows the source, not a setting |
 | `ENGRAM_ENCODE_THREADS` | SVT `lp` / x265 `pools`; applies on every path |
 | `ENGRAM_ENCODE_CRF`, `ENGRAM_ENCODE_PRESET` | **fallback path only** (kill switch, classifier failure, or encoder rejecting the class settings). They no longer influence classified encodes |
-| `ENGRAM_ENCODE_STAGING` | output directory (unchanged) |
+| `ENGRAM_ENCODE_STAGING` | output directory (default `/staging/encode-out`; see the runbook below if you have output under the old default) |
 | `ENGRAM_ENCODE_MAX_CONCURRENT` | max simultaneous ffmpeg encodes process-wide, any codec (default `1` = serial; `0`, negative or non-integer = unlimited). Extra encodes block (INFO log) until a slot frees; the wait does not count against the encode timeout |
 
 Unset `ENGRAM_CODEC_CLASSIFIER` means the classifier is on. To revert without a rebuild, set
@@ -199,3 +199,35 @@ Unset `ENGRAM_CODEC_CLASSIFIER` means the classifier is on. To revert without a 
 `encode_hook.after_organize(final_path, *, context=None)`: `context` is optional and keyword-only;
 `finalization_coordinator.py` passes content_type, detected_title, tmdb_id/year, video_resolution,
 duration_seconds, is_extra and the language lists at both call sites.
+
+### Marker name stays `.engram-av1.json`
+
+The per-file marker keeps its `.engram-av1.json` suffix and its `"av1"` key (the output path) even
+though the hook also writes x265. Every file already encoded carries that marker; renaming the
+suffix or the key would make each of them look unconverted and re-encode the whole library.
+`test_marker_suffix_is_frozen` guards it.
+
+## Runbook: retiring the old `/staging/av1-out` directory
+
+The `ENGRAM_ENCODE_STAGING` default was `/staging/av1-out` until the hook was renamed; it is now
+`/staging/encode-out`. A deployment that set `ENGRAM_ENCODE_STAGING` explicitly (for example to a
+NAS mount) is unaffected by the new default, but may still have stale output under the old directory.
+
+On the reference deployment that directory sits **inside the container's 24 GB rootfs**, not on the
+NAS mount, and holds about **831 MB** of output written before `ENGRAM_ENCODE_STAGING` was pointed at
+the NAS (files dated 2026-11-13/14). Nothing writes there any more.
+
+This is a **manual, operator-run step**. Do not automate it into the app: a startup routine that
+deletes a directory because its default name changed is a data-loss bug.
+
+1. **Confirm the hook is idle.** `curl -s localhost:8000/api/encoding` must return `"active": []`.
+   Do not continue while an encode is running or a retry is queued.
+2. **Confirm what is live.** `docker exec engram printenv ENGRAM_ENCODE_STAGING` should name the
+   NAS path, not `/staging/av1-out`. If it is unset or still points at `/staging/av1-out`, stop
+   here: that directory is the live target, not a leftover.
+3. **Measure.** `docker exec engram du -sh /staging/av1-out` and `ls -la` it; expect about 831 MB.
+4. **Keep anything worth keeping.** Move it with `docker exec engram mv <file> <live target>/`.
+   (`docker exec` needs the container running, so do this before stopping it.)
+5. **Stop the container**, remove the old directory (`rm -r /staging/av1-out` on the volume that
+   backs it, or `rmdir` if step 4 emptied it), and **start it again**.
+6. **Confirm the reclaim.** Free space on the rootfs should rise by about the size from step 3.
