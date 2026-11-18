@@ -11,7 +11,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api.websocket import ConnectionManager
 from app.main import app
-from app.services import av1_hook, finalization_coordinator  # noqa: F401
+from app.services import encode_hook, finalization_coordinator  # noqa: F401
 
 
 @pytest.fixture
@@ -23,11 +23,11 @@ async def client():
 
 @pytest.fixture(autouse=True)
 def _reset_registries(monkeypatch):
-    monkeypatch.setattr(av1_hook, "_ENCODING", {})
+    monkeypatch.setattr(encode_hook, "_ENCODING", {})
     monkeypatch.setattr(
-        av1_hook, "_FAILED", av1_hook.deque(maxlen=av1_hook.FAILURE_BUFFER_SIZE)
+        encode_hook, "_FAILED", encode_hook.deque(maxlen=encode_hook.FAILURE_BUFFER_SIZE)
     )
-    monkeypatch.setattr(av1_hook, "_RETRY_PENDING", set())
+    monkeypatch.setattr(encode_hook, "_RETRY_PENDING", set())
 
 
 async def test_encoding_endpoint_empty(client):
@@ -46,7 +46,7 @@ async def test_encoding_endpoint_returns_snapshot(client, monkeypatch):
         "codec": "av1",
         "started_at": 1.0,
     }
-    monkeypatch.setattr(av1_hook, "_ENCODING", {"/staging/av1-out/Show - S01E01.mkv": row})
+    monkeypatch.setattr(encode_hook, "_ENCODING", {"/staging/av1-out/Show - S01E01.mkv": row})
     resp = await client.get("/api/encoding")
     assert resp.status_code == 200
     assert resp.json() == {"active": [row], "failed": []}
@@ -54,7 +54,7 @@ async def test_encoding_endpoint_returns_snapshot(client, monkeypatch):
 
 async def test_encoding_endpoint_lists_failures(client, tmp_path):
     src = tmp_path / "Show - S01E02.mkv"
-    av1_hook._record_failure(src, tmp_path / "out" / src.name, "ffmpeg exited 1")
+    encode_hook._record_failure(src, tmp_path / "out" / src.name, "ffmpeg exited 1")
     resp = await client.get("/api/encoding")
     assert resp.status_code == 200
     body = resp.json()
@@ -85,23 +85,23 @@ def retry_env(tmp_path, monkeypatch):
     domain = tmp_path / "_staging"
     lib = domain / "tv"
     lib.mkdir(parents=True)
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "av1-out"))
 
     async def fake_get_config():
         return SimpleNamespace(library_tv_path=str(lib), library_movies_path="")
 
     monkeypatch.setattr(config_service, "get_config", fake_get_config)
     runs: list[tuple] = []
-    monkeypatch.setattr(av1_hook, "_run_retry", lambda src, key, loop: runs.append((src, loop)))
+    monkeypatch.setattr(encode_hook, "_run_retry", lambda src, key, loop: runs.append((src, loop)))
     return SimpleNamespace(lib=lib, runs=runs)
 
 
 async def test_retry_returns_202_and_queues(client, retry_env):
     src = retry_env.lib / "Show - S01E01.mkv"
     src.write_bytes(b"x")
-    marker = av1_hook._marker_path(src)
+    marker = encode_hook._marker_path(src)
     marker.write_text("{}")
     resp = await client.post("/api/encoding/retry", json={"file": str(src)})
     assert resp.status_code == 202
@@ -136,8 +136,8 @@ async def test_retry_returns_404_outside_library_roots(client, retry_env, tmp_pa
 async def test_retry_returns_409_while_encoding(client, retry_env):
     src = retry_env.lib / "Show - S01E01.mkv"
     src.write_bytes(b"x")
-    key = str(av1_hook._staging_dir() / src.name)
-    av1_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
+    key = str(encode_hook._staging_dir() / src.name)
+    encode_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
     resp = await client.post("/api/encoding/retry", json={"file": str(src)})
     assert resp.status_code == 409
     assert "Already encoding" in resp.json()["detail"]
@@ -172,4 +172,4 @@ async def test_broadcast_encode_progress_is_flat_with_every_field():
 def test_coordinator_registers_the_ws_publisher():
     from app.api.websocket import manager
 
-    assert av1_hook._progress_publisher == manager.broadcast_encode_progress
+    assert encode_hook._progress_publisher == manager.broadcast_encode_progress

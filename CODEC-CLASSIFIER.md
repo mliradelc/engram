@@ -1,6 +1,6 @@
 # Codec classifier
 
-The post-organize AV1 hook (`backend/app/services/av1_hook.py`) used to apply one fixed
+The post-organize encoding hook (`backend/app/services/encode_hook.py`) used to apply one fixed
 CRF/preset to every file. It now asks `backend/app/services/codec_classifier.py` to pick a codec
 pipeline from the **media itself**. The Engram identification context is a hint only; where the
 probes and the context disagree, the probes win.
@@ -24,7 +24,7 @@ Evaluated top to bottom; first match wins. `sd` = width < 1200, `hd` = 1200-2999
 
 Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-denoise=0`
 (this SVT build defaults denoising **on**, which would stack on top of real grain) and
-`lp=<ENGRAM_AV1_THREADS>`. "Optional" AV1 parameters: `enable-variance-boost=1`,
+`lp=<ENGRAM_ENCODE_THREADS>`. "Optional" AV1 parameters: `enable-variance-boost=1`,
 `variance-boost-strength`, `tf-strength=1`, `sharpness=1`, `luminance-qp-bias` (SDR only),
 `tile-columns` (1 at hd, 2 at uhd). AV1 preset 2-4 is never emitted (i3-7100T, software only).
 
@@ -185,17 +185,17 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
 
 | Variable | Effect |
 |---|---|
-| `ENGRAM_AV1_HOOK=1` | enables the hook (unchanged) |
+| `ENGRAM_ENCODE_HOOK=1` | enables the hook (unchanged) |
 | `ENGRAM_CODEC_CLASSIFIER=0` | **kill switch**: restores the original fixed command exactly (`-c:v libsvtav1 -crf 22 -preset 6 -svtav1-params tune=0:lp=4`, no `-pix_fmt`); the classifier is not even loaded |
 | ~~`ENGRAM_CODEC_INTERLACED`~~ | **removed, ignored.** Deinterlacing follows the source, not a setting |
-| `ENGRAM_AV1_THREADS` | SVT `lp` / x265 `pools`; applies on every path |
-| `ENGRAM_AV1_CRF`, `ENGRAM_AV1_PRESET` | **fallback path only** (kill switch, classifier failure, or encoder rejecting the class settings). They no longer influence classified encodes |
-| `ENGRAM_AV1_STAGING` | output directory (unchanged) |
-| `ENGRAM_AV1_MAX_CONCURRENT` | max simultaneous ffmpeg encodes process-wide, any codec (default `1` = serial; `0`, negative or non-integer = unlimited). Extra encodes block (INFO log) until a slot frees; the wait does not count against the encode timeout |
+| `ENGRAM_ENCODE_THREADS` | SVT `lp` / x265 `pools`; applies on every path |
+| `ENGRAM_ENCODE_CRF`, `ENGRAM_ENCODE_PRESET` | **fallback path only** (kill switch, classifier failure, or encoder rejecting the class settings). They no longer influence classified encodes |
+| `ENGRAM_ENCODE_STAGING` | output directory (unchanged) |
+| `ENGRAM_ENCODE_MAX_CONCURRENT` | max simultaneous ffmpeg encodes process-wide, any codec (default `1` = serial; `0`, negative or non-integer = unlimited). Extra encodes block (INFO log) until a slot frees; the wait does not count against the encode timeout |
 
 Unset `ENGRAM_CODEC_CLASSIFIER` means the classifier is on. To revert without a rebuild, set
 `ENGRAM_CODEC_CLASSIFIER=0` in the container environment and restart the service.
 
-`av1_hook.after_organize(final_path, *, context=None)`: `context` is optional and keyword-only;
+`encode_hook.after_organize(final_path, *, context=None)`: `context` is optional and keyword-only;
 `finalization_coordinator.py` passes content_type, detected_title, tmdb_id/year, video_resolution,
 duration_seconds, is_extra and the language lists at both call sites.

@@ -1,4 +1,4 @@
-"""Tests for the content-aware codec classifier and its wiring into the AV1 hook.
+"""Tests for the content-aware codec classifier and its wiring into the encoding hook.
 
 Both modules are loaded by file path, never through ``app.services``: that
 package's ``__init__`` imports the whole ASR stack, and the point of the
@@ -28,7 +28,7 @@ def _load(name: str):
 
 
 cc = _load("codec_classifier")
-av1_hook = _load("av1_hook")
+encode_hook = _load("encode_hook")
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 needs_ffmpeg = pytest.mark.skipif(not HAVE_FFMPEG, reason="ffmpeg/ffprobe not installed")
@@ -425,7 +425,7 @@ def test_hdr_is_10_bit_even_from_a_mislabelled_8_bit_source():
 
 
 def test_legacy_video_args_still_have_no_pix_fmt():
-    assert "-pix_fmt" not in av1_hook._legacy_video_args("4")
+    assert "-pix_fmt" not in encode_hook._legacy_video_args("4")
 
 
 def test_essential_params_are_a_subset_so_degrading_never_drops_denoise_or_grain():
@@ -487,7 +487,7 @@ def test_module_imports_with_stdlib_only():
 
 
 # ---------------------------------------------------------------------------
-# av1_hook wiring (subprocess mocked)
+# encode_hook wiring (subprocess mocked)
 # ---------------------------------------------------------------------------
 
 
@@ -514,17 +514,17 @@ def _streams(codec="av1", pix="yuv420p10le", audio=2, subs=1, transfer=None):
 
 @pytest.fixture
 def hook(monkeypatch, tmp_path):
-    av1_hook._encoder_accepts.cache_clear()
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "stage"))
+    encode_hook._encoder_accepts.cache_clear()
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "stage"))
     monkeypatch.delenv("ENGRAM_CODEC_CLASSIFIER", raising=False)
     # The fixture source stands in for a rip in Engram's staging root; the hook
     # refuses anything outside ``_DOMAIN_ROOTS``.
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
     src = tmp_path / "Movie (2000).mkv"
     src.write_bytes(b"source")
     yield src, tmp_path
-    av1_hook._encoder_accepts.cache_clear()
+    encode_hook._encoder_accepts.cache_clear()
 
 
 def _encode_cmds(calls):
@@ -534,15 +534,15 @@ def _encode_cmds(calls):
 def test_kill_switch_reproduces_the_original_command_exactly(hook, monkeypatch):
     src, tmp = hook
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
-    monkeypatch.setenv("ENGRAM_AV1_CRF", "30")
-    monkeypatch.setenv("ENGRAM_AV1_PRESET", "8")
-    monkeypatch.setenv("ENGRAM_AV1_THREADS", "2")
+    monkeypatch.setenv("ENGRAM_ENCODE_CRF", "30")
+    monkeypatch.setenv("ENGRAM_ENCODE_PRESET", "8")
+    monkeypatch.setenv("ENGRAM_ENCODE_THREADS", "2")
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
     # The classifier must not even be consulted.
-    monkeypatch.setattr(av1_hook, "_load_classifier",
+    monkeypatch.setattr(encode_hook, "_load_classifier",
                         lambda: pytest.fail("classifier loaded despite kill switch"))
-    av1_hook.after_organize(str(src), context={"content_type": "tv"})
+    encode_hook.after_organize(str(src), context={"content_type": "tv"})
     (cmd,) = _encode_cmds(calls)
     staging = tmp / "stage"
     # Encoding arguments are the original ones; only the progress-reporting flags
@@ -563,8 +563,8 @@ def test_default_fixed_settings_are_unchanged(hook, monkeypatch):
     src, tmp = hook
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-crf") + 1] == "22" and cmd[cmd.index("-preset") + 1] == "6"
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"
@@ -586,11 +586,11 @@ def test_classifier_plan_drives_the_command_and_context_is_forwarded(hook, monke
     src, tmp = hook
     plan = cc.plan_for_class(cc.ANIMATION, res="sd")
     fake = _FakeClassifier(plan)
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: fake)
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: fake)
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
     ctx = {"content_type": "tv", "is_extra": False}
-    av1_hook.after_organize(str(src), context=ctx)
+    encode_hook.after_organize(str(src), context=ctx)
     assert fake.seen[1] == ctx
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-crf") + 1] == "27"
@@ -601,18 +601,18 @@ def test_classifier_plan_drives_the_command_and_context_is_forwarded(hook, monke
         "-map", "0:v:0", "-map", "0:a?", "-map", "0:s?"]
     assert cmd[-5:-1] == ["-c:a", "copy", "-c:s", "copy"]
     assert (tmp / "stage" / src.name).exists()
-    marker = json.loads((src.parent / (src.name + av1_hook.MARKER_SUFFIX)).read_text())
+    marker = json.loads((src.parent / (src.name + encode_hook.MARKER_SUFFIX)).read_text())
     assert marker["codec_class"] == cc.ANIMATION
 
 
 def test_hevc_plan_is_verified_as_hevc(hook, monkeypatch):
     src, tmp = hook
-    monkeypatch.setattr(av1_hook, "_load_classifier",
+    monkeypatch.setattr(encode_hook, "_load_classifier",
                         lambda: _FakeClassifier(cc.plan_for_class(cc.LIVE_ACTION_GRAINY)))
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run",
+    monkeypatch.setattr(encode_hook.subprocess, "run",
                         _Run(calls, lambda c: _streams(codec="hevc")))
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-c:v") + 1] == "libx265"
     assert (tmp / "stage" / src.name).exists()
@@ -620,12 +620,12 @@ def test_hevc_plan_is_verified_as_hevc(hook, monkeypatch):
 
 def test_wrong_codec_or_pixfmt_aborts_the_swap(hook, monkeypatch):
     src, tmp = hook
-    monkeypatch.setattr(av1_hook, "_load_classifier",
+    monkeypatch.setattr(encode_hook, "_load_classifier",
                         lambda: _FakeClassifier(cc.plan_for_class(cc.LIVE_ACTION_CLEAN)))
     for streams in (_streams(codec="hevc"), _streams(pix="yuv420p")):
         calls: list = []
-        monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c, s=streams: s))
-        av1_hook.after_organize(str(src))
+        monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c, s=streams: s))
+        encode_hook.after_organize(str(src))
         assert not (tmp / "stage" / src.name).exists()
         assert not list((tmp / "stage").glob("*.partial.mkv"))
         assert src.read_bytes() == b"source"
@@ -633,7 +633,7 @@ def test_wrong_codec_or_pixfmt_aborts_the_swap(hook, monkeypatch):
 
 def test_track_count_mismatch_still_aborts_the_swap(hook, monkeypatch):
     src, tmp = hook
-    monkeypatch.setattr(av1_hook, "_load_classifier",
+    monkeypatch.setattr(encode_hook, "_load_classifier",
                         lambda: _FakeClassifier(cc.plan_for_class(cc.LIVE_ACTION_CLEAN)))
     probes = iter([_streams(audio=2), _streams(audio=1)])  # source, then output
     calls: list = []
@@ -644,8 +644,8 @@ def test_track_count_mismatch_still_aborts_the_swap(hook, monkeypatch):
             return subprocess.CompletedProcess(cmd, 0, json.dumps(next(probes)), "")
         return _Run([], None)(cmd, **kw)
 
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     assert not (tmp / "stage" / src.name).exists()
     assert src.read_bytes() == b"source"
 
@@ -653,7 +653,7 @@ def test_track_count_mismatch_still_aborts_the_swap(hook, monkeypatch):
 def test_hdr_transfer_loss_aborts_the_swap(hook, monkeypatch):
     src, tmp = hook
     plan = cc.plan_for_class(cc.HDR)
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     probes = iter([_streams(transfer="smpte2084"), _streams()])
     calls: list = []
 
@@ -662,26 +662,26 @@ def test_hdr_transfer_loss_aborts_the_swap(hook, monkeypatch):
             return subprocess.CompletedProcess(cmd, 0, json.dumps(next(probes)), "")
         return _Run(calls, None)(cmd, **kw)
 
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     assert not (tmp / "stage" / src.name).exists()
 
 
 def test_passthrough_plan_encodes_nothing_and_writes_an_idempotent_marker(hook, monkeypatch):
     src, tmp = hook
     plan = cc.plan_for_class(cc.PASSTHROUGH, reason="source already AV1")
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    encode_hook.after_organize(str(src))
     assert _encode_cmds(calls) == []
     assert not (tmp / "stage").exists() or not any((tmp / "stage").iterdir())
-    marker = json.loads((src.parent / (src.name + av1_hook.MARKER_SUFFIX)).read_text())
+    marker = json.loads((src.parent / (src.name + encode_hook.MARKER_SUFFIX)).read_text())
     assert marker["av1"] is None and marker["codec_class"] == cc.PASSTHROUGH
     # Second call is a no-op (marker matches size+mtime).
-    monkeypatch.setattr(av1_hook, "_load_classifier",
+    monkeypatch.setattr(encode_hook, "_load_classifier",
                         lambda: pytest.fail("re-classified an already-handled file"))
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
 
 
 def test_classifier_exception_falls_back_to_fixed_settings(hook, monkeypatch):
@@ -691,10 +691,10 @@ def test_classifier_exception_falls_back_to_fixed_settings(hook, monkeypatch):
         def plan_for_file(self, *a, **k):
             raise RuntimeError("probe exploded")
 
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: Boom())
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: Boom())
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"
     assert (tmp / "stage" / src.name).exists()
@@ -702,10 +702,10 @@ def test_classifier_exception_falls_back_to_fixed_settings(hook, monkeypatch):
 
 def test_unloadable_classifier_falls_back_to_fixed_settings(hook, monkeypatch):
     src, tmp = hook
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: None)
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: None)
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"
 
@@ -713,7 +713,7 @@ def test_unloadable_classifier_falls_back_to_fixed_settings(hook, monkeypatch):
 def test_encoder_rejecting_extras_degrades_to_essential_params_then_to_fixed(hook, monkeypatch):
     src, tmp = hook
     plan = cc.plan_for_class(cc.LIVE_ACTION_CLEAN)
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
 
     def run_factory(accept):
         calls: list = []
@@ -729,19 +729,19 @@ def test_encoder_rejecting_extras_degrades_to_essential_params_then_to_fixed(hoo
 
     # Old encoder: knows only the essential parameters.
     calls, run = run_factory(lambda c: "variance-boost" not in " ".join(c))
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     p = cmd[cmd.index("-svtav1-params") + 1]
     assert "film-grain-denoise=0" in p and "variance-boost" not in p
 
     # Encoder rejects everything the plan emits: fixed legacy command.
     (tmp / "stage" / src.name).unlink()
-    (src.parent / (src.name + av1_hook.MARKER_SUFFIX)).unlink()
-    av1_hook._encoder_accepts.cache_clear()
+    (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).unlink()
+    encode_hook._encoder_accepts.cache_clear()
     calls, run = run_factory(lambda c: "film-grain" not in " ".join(c))
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"
 
@@ -749,25 +749,25 @@ def test_encoder_rejecting_extras_degrades_to_essential_params_then_to_fixed(hoo
 def test_after_organize_context_is_optional_and_keyword_only():
     import inspect
 
-    sig = inspect.signature(av1_hook.after_organize)
+    sig = inspect.signature(encode_hook.after_organize)
     p = sig.parameters["context"]
     assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None
     with pytest.raises(TypeError):
-        av1_hook.after_organize("/x.mkv", {"content_type": "tv"})  # positional is rejected
+        encode_hook.after_organize("/x.mkv", {"content_type": "tv"})  # positional is rejected
 
 
 def test_hook_disabled_does_nothing(monkeypatch, tmp_path):
-    monkeypatch.delenv("ENGRAM_AV1_HOOK", raising=False)
+    monkeypatch.delenv("ENGRAM_ENCODE_HOOK", raising=False)
     src = tmp_path / "a.mkv"
     src.write_bytes(b"x")
-    monkeypatch.setattr(av1_hook.subprocess, "run",
+    monkeypatch.setattr(encode_hook.subprocess, "run",
                         lambda *a, **k: pytest.fail("ran a subprocess while disabled"))
-    av1_hook.after_organize(str(src), context={"content_type": "tv"})
+    encode_hook.after_organize(str(src), context={"content_type": "tv"})
 
 
 def test_load_classifier_works_when_imported_directly():
-    # av1_hook was imported by path above, with no app.services in sight.
-    assert av1_hook._load_classifier() is not None
+    # encode_hook was imported by path above, with no app.services in sight.
+    assert encode_hook._load_classifier() is not None
 
 
 # ---------------------------------------------------------------------------
@@ -937,12 +937,12 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
                     "sine=d=2", "-i", str(sub), "-map", "0:v", "-map", "1:a", "-map", "2:s",
                     "-c:v", "copy", "-c:a", "aac", "-c:s", "srt", str(withtracks)], check=True)
     withtracks.replace(src)
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "stage"))
-    monkeypatch.setenv("ENGRAM_AV1_THREADS", "2")
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))  # src is a staged rip
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "stage"))
+    monkeypatch.setenv("ENGRAM_ENCODE_THREADS", "2")
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(tmp_path),))  # src is a staged rip
     # Force a fast preset on whatever class the media lands in; settings otherwise intact.
-    real = av1_hook._load_classifier()
+    real = encode_hook._load_classifier()
     orig = real.plan_for_file
 
     def fast(path, context=None, **kw):
@@ -954,14 +954,14 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
         return plan
 
     monkeypatch.setattr(real, "plan_for_file", fast)
-    av1_hook._encoder_accepts.cache_clear()
-    av1_hook.after_organize(str(src), context={"content_type": "tv", "is_extra": False})
+    encode_hook._encoder_accepts.cache_clear()
+    encode_hook.after_organize(str(src), context={"content_type": "tv", "is_extra": False})
     out = tmp_path / "stage" / src.name
     assert out.exists()
-    probe_out = av1_hook._probe(out)
-    src_counts = av1_hook._track_counts(av1_hook._probe(src))
-    assert av1_hook._track_counts(probe_out) == src_counts == (1, 1)
-    assert (src.parent / (src.name + av1_hook.MARKER_SUFFIX)).exists()
+    probe_out = encode_hook._probe(out)
+    src_counts = encode_hook._track_counts(encode_hook._probe(src))
+    assert encode_hook._track_counts(probe_out) == src_counts == (1, 1)
+    assert (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1073,10 +1073,10 @@ def test_no_plan_ever_changes_the_frame_rate():
 def test_hook_command_for_an_interlaced_source_has_bwdif_and_no_rate_flags(hook, monkeypatch):
     src, tmp = hook
     plan = cc.classify(probe(idet=INTERLACED_IDET, pix_fmt="yuv420p"))
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams(pix="yuv420p")))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams(pix="yuv420p")))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER
     assert not set(cmd) & set(_FRAME_RATE_FLAGS)
@@ -1086,7 +1086,7 @@ def test_fixed_command_fallback_keeps_bwdif(hook, monkeypatch):
     """An encoder rejecting the class settings must not drop the deinterlacer."""
     src, tmp = hook
     plan = cc.classify(probe(idet=INTERLACED_IDET))
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
     base = _Run(calls, lambda c: _streams())
 
@@ -1095,39 +1095,39 @@ def test_fixed_command_fallback_keeps_bwdif(hook, monkeypatch):
             return subprocess.CompletedProcess(cmd, 1, "", "bad param")
         return base(cmd, **kw)
 
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"  # the fixed command...
     assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER  # ...still deinterlaced
 
 
 def test_kill_switch_command_is_still_byte_identical(hook, monkeypatch):
-    assert "-vf" not in av1_hook._legacy_video_args("4")
+    assert "-vf" not in encode_hook._legacy_video_args("4")
 
 
 def test_an_old_interlaced_skip_marker_does_not_count_as_done(hook, monkeypatch):
     """Files skipped under the old 'interlaced, left untouched' rule get encoded now."""
     src, tmp = hook
     st = src.stat()
-    marker = src.parent / (src.name + av1_hook.MARKER_SUFFIX)
+    marker = src.parent / (src.name + encode_hook.MARKER_SUFFIX)
     marker.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime),
                                   "av1": None, "codec_class": "interlaced"}))
-    assert av1_hook._already_done(src) is False
+    assert encode_hook._already_done(src) is False
     plan = cc.classify(probe(idet=INTERLACED_IDET))
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER
     done = json.loads(marker.read_text())
     assert done["codec_class"] == cc.INTERLACED and done["av1"] is not None
-    assert av1_hook._already_done(src) is True
+    assert encode_hook._already_done(src) is True
     # An ordinary passthrough record is still done.
     marker.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime),
                                   "av1": None, "codec_class": "passthrough"}))
-    assert av1_hook._already_done(src) is True
+    assert encode_hook._already_done(src) is True
 
 
 def _field_paired_1080i(path: Path, *, flagged: bool) -> Path:
@@ -1347,7 +1347,7 @@ def test_no_telecine_plan_changes_the_frame_rate_by_flag():
 def test_hook_command_for_a_telecined_source_ivtcs_and_keeps_it_on_fallback(hook, monkeypatch):
     src, tmp = hook
     plan = cc.classify(probe(idet=TELECINED_IDET, fps=29.97, pix_fmt="yuv420p"))
-    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
     base = _Run(calls, lambda c: _streams(pix="yuv420p"))
 
@@ -1356,8 +1356,8 @@ def test_hook_command_for_a_telecined_source_ivtcs_and_keeps_it_on_fallback(hook
             return subprocess.CompletedProcess(cmd, 1, "", "bad param")
         return base(cmd, **kw)
 
-    monkeypatch.setattr(av1_hook.subprocess, "run", run)
-    av1_hook.after_organize(str(src))
+    monkeypatch.setattr(encode_hook.subprocess, "run", run)
+    encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-vf") + 1] == cc.IVTC_FILTER
     assert not set(cmd) & set(_FRAME_RATE_FLAGS)

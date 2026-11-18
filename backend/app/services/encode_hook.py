@@ -1,8 +1,9 @@
-"""Post-organize AV1 transcode hook.
+"""Post-organize encoding hook (formerly the "AV1 hook").
 
 Engram files rips as untouched MakeMKV output (MPEG-2 for DVD, MPEG-2/VC-1 for
-BD). This module re-encodes a just-organized file to AV1 and moves the result to
-the curator's staging directory, so the existing CT104 curator imports it and
+BD). This module re-encodes a just-organized file (AV1, or x265 where the codec
+classifier routes it) and moves the result to the curator's staging
+directory, so the existing CT104 curator imports it and
 remains the single filing authority.
 
 Design constraints, each deliberate:
@@ -16,7 +17,7 @@ Design constraints, each deliberate:
   job does not re-encode an already-converted file.
 * **Fail-open.** Any error logs and returns; the rip stays in the library as
   Engram filed it. Losing a transcode is recoverable, losing a rip is not.
-* **Off by default.** Enabled only when ``ENGRAM_AV1_HOOK=1`` in the container
+* **Off by default.** Enabled only when ``ENGRAM_ENCODE_HOOK=1`` in the container
   environment, so a rebuild without the setting behaves exactly as upstream.
 
 Codec choice is made per file by ``codec_classifier`` (see CODEC-CLASSIFIER.md):
@@ -27,23 +28,25 @@ classifier or its encoder pre-check fails, so a classifier fault never costs the
 transcode, let alone the rip.
 
 Configuration (environment):
-    ENGRAM_AV1_HOOK          "1" to enable; anything else disables.
-    ENGRAM_AV1_STAGING       destination dir (default /staging/av1-out)
-    ENGRAM_AV1_THREADS       encoder thread count, SVT ``lp`` / x265 ``pools``
+    ENGRAM_ENCODE_HOOK       "1" to enable; anything else disables.
+    ENGRAM_ENCODE_STAGING    destination dir (default /staging/av1-out; the
+                             directory name is historical, kept so existing
+                             encoded output is not orphaned)
+    ENGRAM_ENCODE_THREADS    encoder thread count, SVT ``lp`` / x265 ``pools``
                              (default 4; applies on every path)
     ENGRAM_CODEC_CLASSIFIER  "0" disables the classifier (fixed CRF/preset).
                              (Deinterlacing is not configurable: an interlaced or
                              undecided source always gets bwdif, a progressive one
                              never does.  The old ENGRAM_CODEC_INTERLACED is ignored.)
-    ENGRAM_AV1_CRF           fixed-path SVT-AV1 CRF (default 22)      } fallback
-    ENGRAM_AV1_PRESET        fixed-path SVT-AV1 preset (default 6)    } path only
-    ENGRAM_AV1_MAX_CONCURRENT
+    ENGRAM_ENCODE_CRF        fixed-path SVT-AV1 CRF (default 22)      } fallback
+    ENGRAM_ENCODE_PRESET     fixed-path SVT-AV1 preset (default 6)    } path only
+    ENGRAM_ENCODE_MAX_CONCURRENT
                              max simultaneous ffmpeg encodes across the whole
                              process, any codec (default 1 = strictly serial;
                              0, negative or non-integer = unlimited).
 
 Encode concurrency: every job's organize sweep is its own asyncio task, so
-several sweeps can reach ``transcode_to_av1`` at once.  On a small host that
+several sweeps can reach ``transcode_file`` at once.  On a small host that
 starved the CPU and memory (four parallel encodes took the API down), so the
 ffmpeg encode (plus verification probe of its output) is gated by a
 process-wide ``threading.Semaphore``.  ``after_organize`` already runs in a
@@ -58,7 +61,7 @@ messages through a publisher the coordinator registers with
 ``set_progress_publisher``.  The registry is deliberately process-local: a
 restart kills the encode, so a persisted row would only ever be a lie.
 
-Failures and retry: an encode that fails (``transcode_to_av1`` returns None)
+Failures and retry: an encode that fails (``transcode_file`` returns None)
 is recorded in a bounded in-memory ring buffer (``FAILURE_BUFFER_SIZE``,
 ``failures_snapshot()``), served next to the active rows by
 ``encoding_status()``.  ``retry_encode`` re-runs ``after_organize`` for such a
@@ -93,6 +96,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# On-disk name; historical, kept so existing markers still mark files as done.
 MARKER_SUFFIX = ".engram-av1.json"
 ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
 PROGRESS_PUBLISH_INTERVAL = 2.0  # seconds between encode_progress messages per file
@@ -104,12 +108,12 @@ def _cfg(name: str, default: str) -> str:
 
 
 def _max_concurrent() -> int:
-    """Parse ``ENGRAM_AV1_MAX_CONCURRENT``.  0 means unlimited; never raises.
+    """Parse ``ENGRAM_ENCODE_MAX_CONCURRENT``.  0 means unlimited; never raises.
 
     Invalid or negative values mean unlimited (the pre-gate behaviour) rather than
     an error: a typo in an env var must not stop transcoding or the job.
     """
-    raw = _cfg("ENGRAM_AV1_MAX_CONCURRENT", "1").strip()
+    raw = _cfg("ENGRAM_ENCODE_MAX_CONCURRENT", "1").strip()
     try:
         value = int(raw)
     except ValueError:
@@ -149,7 +153,7 @@ def _encode_slot(name: str) -> Iterator[None]:
     if not sem.acquire(blocking=False):
         with _gate_lock:
             busy = _gate_busy
-        logger.info("AV1 hook: waiting for encode slot (%d/%d busy) for %s", busy, limit, name)
+        logger.info("Encoding hook: waiting for encode slot (%d/%d busy) for %s", busy, limit, name)
         sem.acquire()
     with _gate_lock:
         _gate_busy += 1
@@ -225,7 +229,7 @@ def _record_failure(
             _forget_failure_locked(str(src))
             _FAILED.append(entry)
     except Exception:  # noqa: BLE001 - fail-open: the buffer is cosmetic
-        logger.debug("AV1 hook: could not record failure for %s", src, exc_info=True)
+        logger.debug("Encoding hook: could not record failure for %s", src, exc_info=True)
 
 
 def failures_snapshot() -> list[dict[str, Any]]:
@@ -358,7 +362,7 @@ def _publish(loop, entry: dict[str, Any], *, done: bool = False) -> None:
             loop,
         )
     except Exception:  # noqa: BLE001 - fail-open: progress is cosmetic
-        logger.debug("AV1 hook: could not publish encode progress", exc_info=True)
+        logger.debug("Encoding hook: could not publish encode progress", exc_info=True)
 
 
 def _consume_progress(fd: int, key: str, duration: float | None, loop) -> None:
@@ -386,11 +390,11 @@ def _consume_progress(fd: int, key: str, duration: float | None, loop) -> None:
                         last_publish = now
                         _publish(loop, snapshot)
             except Exception:  # noqa: BLE001 - fail-open: keep draining the pipe
-                logger.debug("AV1 hook: progress parse failed for %s", key, exc_info=True)
+                logger.debug("Encoding hook: progress parse failed for %s", key, exc_info=True)
                 for _ in stream:
                     pass
     except Exception:  # noqa: BLE001 - fail-open: progress is cosmetic
-        logger.debug("AV1 hook: progress reader failed for %s", key, exc_info=True)
+        logger.debug("Encoding hook: progress reader failed for %s", key, exc_info=True)
 
 
 def _run_encode(
@@ -406,13 +410,13 @@ def _run_encode(
     read_fd, write_fd = os.pipe()
     reader = threading.Thread(
         target=_consume_progress, args=(read_fd, key, duration, loop),
-        name="av1-progress", daemon=True,
+        name="encode-progress", daemon=True,
     )
     try:
         reader.start()
     except Exception:  # noqa: BLE001 - no progress, but the encode still runs
         os.close(read_fd)
-        logger.debug("AV1 hook: could not start progress reader", exc_info=True)
+        logger.debug("Encoding hook: could not start progress reader", exc_info=True)
     try:
         return subprocess.run(
             cmd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=subprocess.PIPE,
@@ -456,12 +460,12 @@ def _load_classifier():
         return mod
     except Exception:  # noqa: BLE001 - fail-open: fall back to the fixed path
         sys.modules.pop("codec_classifier", None)
-        logger.exception("AV1 hook: could not load codec_classifier; using fixed settings")
+        logger.exception("Encoding hook: could not load codec_classifier; using fixed settings")
         return None
 
 
 def is_enabled() -> bool:
-    return _cfg("ENGRAM_AV1_HOOK", "0") == "1"
+    return _cfg("ENGRAM_ENCODE_HOOK", "0") == "1"
 
 
 def _probe(path: Path) -> dict:
@@ -598,7 +602,7 @@ def _write_marker(
                 data["override"] = override
             _store_marker(src, data)
     except OSError:
-        logger.warning("AV1 hook: could not write marker for %s", src)
+        logger.warning("Encoding hook: could not write marker for %s", src)
 
 
 def _strip_done(src: Path) -> None:
@@ -697,7 +701,7 @@ def _would_encode_in_place(src: Path, staging_dir: Path) -> bool:
     """True when the encode's destination is the source itself.
 
     ``dest = staging_dir / src.name`` and ``tmp.replace(dest)``: for a source
-    sitting directly in ``ENGRAM_AV1_STAGING`` that overwrites the original.
+    sitting directly in ``ENGRAM_ENCODE_STAGING`` that overwrites the original.
     """
     try:
         return (staging_dir / src.name).resolve(strict=False) == src.resolve(strict=False)
@@ -712,8 +716,8 @@ def _legacy_video_args(threads: str) -> list[str]:
     ``-pix_fmt`` and ``film-grain-denoise``): ``ENGRAM_CODEC_CLASSIFIER=0`` must
     reproduce the old command exactly.
     """
-    crf = _cfg("ENGRAM_AV1_CRF", "22")
-    preset = _cfg("ENGRAM_AV1_PRESET", "6")
+    crf = _cfg("ENGRAM_ENCODE_CRF", "22")
+    preset = _cfg("ENGRAM_ENCODE_PRESET", "6")
     return [
         "-c:v", "libsvtav1",
         "-crf", crf,
@@ -759,10 +763,10 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
             if _encoder_accepts(tuple(args)):
                 if not optional:
                     logger.warning(
-                        "AV1 hook: encoder rejected tuning extras for class=%s; "
+                        "Encoding hook: encoder rejected tuning extras for class=%s; "
                         "using essential parameters only", plan.class_name)
                 return args, plan.output_codec_name or "av1", plan
-        logger.warning("AV1 hook: encoder rejected class=%s settings; using fixed settings",
+        logger.warning("Encoding hook: encoder rejected class=%s settings; using fixed settings",
                        plan.class_name)
         filters = list(getattr(plan, "video_filters", None) or [])
         if filters:
@@ -783,13 +787,13 @@ def _encode_and_verify(
     try:
         run = _run_encode(cmd, key=key, duration=duration, loop=loop)
     except subprocess.TimeoutExpired:
-        logger.error("AV1 hook: encode timed out for %s", src.name)
+        logger.error("Encoding hook: encode timed out for %s", src.name)
         tmp.unlink(missing_ok=True)
         return "Encode timed out"
 
     if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
         stderr = (run.stderr or "").strip()
-        logger.error("AV1 hook: encode failed for %s: %s", src.name, stderr[-500:])
+        logger.error("Encoding hook: encode failed for %s: %s", src.name, stderr[-500:])
         tmp.unlink(missing_ok=True)
         last = stderr.splitlines()[-1][-200:] if stderr else ""
         return f"ffmpeg exited {run.returncode}" + (f": {last}" if last else "")
@@ -798,25 +802,25 @@ def _encode_and_verify(
     src_probe = _probe(src)
     out_probe = _probe(tmp)
     if _video_codec(out_probe) != expect_codec:
-        logger.error("AV1 hook: output is not %s for %s", expect_codec, src.name)
+        logger.error("Encoding hook: output is not %s for %s", expect_codec, src.name)
         tmp.unlink(missing_ok=True)
         return f"Output is not {expect_codec}"
     if active is not None:
         out_v, src_v = _video_stream(out_probe), _video_stream(src_probe)
         if out_v.get("pix_fmt") != active.pix_fmt:
-            logger.error("AV1 hook: output pix_fmt %s is not %s for %s",
+            logger.error("Encoding hook: output pix_fmt %s is not %s for %s",
                          out_v.get("pix_fmt"), active.pix_fmt, src.name)
             tmp.unlink(missing_ok=True)
             return f"Output pixel format is not {active.pix_fmt}"
         # An HDR title that loses its transfer tag plays back washed out: refuse the swap.
         if active.hdr and src_v.get("color_transfer") != out_v.get("color_transfer"):
-            logger.error("AV1 hook: HDR transfer not preserved for %s (src=%s out=%s)",
+            logger.error("Encoding hook: HDR transfer not preserved for %s (src=%s out=%s)",
                          src.name, src_v.get("color_transfer"), out_v.get("color_transfer"))
             tmp.unlink(missing_ok=True)
             return "HDR transfer not preserved"
     if _track_counts(out_probe) != _track_counts(src_probe):
         logger.error(
-            "AV1 hook: track mismatch for %s (src=%s out=%s) — keeping original",
+            "Encoding hook: track mismatch for %s (src=%s out=%s) — keeping original",
             src.name, _track_counts(src_probe), _track_counts(out_probe),
         )
         tmp.unlink(missing_ok=True)
@@ -824,7 +828,7 @@ def _encode_and_verify(
     return None
 
 
-def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Path | None:
+def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Path | None:
     """Encode ``src`` in ``staging_dir``.  Returns the output path or None.
 
     With ``plan`` (a ``codec_classifier.CodecPlan``) the codec and settings come
@@ -835,12 +839,12 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
     ``loop`` is the caller's running event loop; with it, progress is published
     over the WebSocket.  None (e.g. a direct call) skips publishing silently.
     """
-    threads = _cfg("ENGRAM_AV1_THREADS", "4")
+    threads = _cfg("ENGRAM_ENCODE_THREADS", "4")
 
     # Never in-place, on every path (classifier, forced, and the kill switch).
     if _would_encode_in_place(src, staging_dir):
         logger.error(
-            "AV1 hook: refusing to encode %s in place (destination is the source)", src)
+            "Encoding hook: refusing to encode %s in place (destination is the source)", src)
         return None
 
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -869,12 +873,12 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
     codec_class = active.class_name if active is not None else None
     forced = _plan_forced(active)
     if active is not None:
-        logger.info("AV1 hook: encoding %s -> %s (class=%s%s)", src.name, dest.name,
+        logger.info("Encoding hook: encoding %s -> %s (class=%s%s)", src.name, dest.name,
                     active.class_name, ", forced" if forced else "")
     else:
-        logger.info("AV1 hook: encoding %s -> %s (class=fixed crf=%s preset=%s)",
+        logger.info("Encoding hook: encoding %s -> %s (class=fixed crf=%s preset=%s)",
                     src.name, dest.name,
-                    _cfg("ENGRAM_AV1_CRF", "22"), _cfg("ENGRAM_AV1_PRESET", "6"))
+                    _cfg("ENGRAM_ENCODE_CRF", "22"), _cfg("ENGRAM_ENCODE_PRESET", "6"))
     # Duration for progress: probed before the encode and outside the permit
     # (probing never holds one).  The post-encode verification probes are separate.
     duration = _duration_seconds(_probe(src))
@@ -919,7 +923,7 @@ def transcode_to_av1(src: Path, staging_dir: Path, plan=None, *, loop=None) -> P
     with _encoding_lock:
         _forget_failure_locked(str(src))
     logger.info(
-        "AV1 hook: %s -> %s (%.1f MB -> %.1f MB)",
+        "Encoding hook: %s -> %s (%.1f MB -> %.1f MB)",
         src.name, dest.name, src.stat().st_size / 1e6, dest.stat().st_size / 1e6,
     )
     return dest
@@ -936,10 +940,10 @@ def _classify(src: Path, context: dict | None):
         # Deinterlacing is the source's (codec_classifier.needs_deinterlace);
         # no setting turns it on or off.
         plan = mod.plan_for_file(str(src), context)
-        logger.info("AV1 hook: codec_classifier: %s (%s)", plan.describe(), src.name)
+        logger.info("Encoding hook: codec_classifier: %s (%s)", plan.describe(), src.name)
         return plan
     except Exception:  # noqa: BLE001 - fail-open: fixed settings
-        logger.exception("AV1 hook: classifier failed for %s; using fixed settings", src.name)
+        logger.exception("Encoding hook: classifier failed for %s; using fixed settings", src.name)
         return None
 
 
@@ -953,7 +957,7 @@ def _pinned_class(src: Path) -> str | None:
     except OSError:
         return None
     if not _override_fresh(override, st):
-        logger.info("AV1 hook: ignoring stale codec-class pin for %s (source changed)", src.name)
+        logger.info("Encoding hook: ignoring stale codec-class pin for %s (source changed)", src.name)
         return None
     cls = override.get("codec_class")
     return cls if isinstance(cls, str) else None
@@ -990,30 +994,30 @@ def after_organize(
     try:
         src = Path(final_path)
         if not src.is_file():
-            logger.warning("AV1 hook: filed path is not a file: %s", final_path)
+            logger.warning("Encoding hook: filed path is not a file: %s", final_path)
             return
         if src.suffix.lower() != ".mkv":
             return
         if not in_domain(src):
             logger.warning(
-                "AV1 hook: refusing to encode %s — outside Engram's domain "
-                "(only rips in staging and their AV1 output are Engram's)", src,
+                "Encoding hook: refusing to encode %s — outside Engram's domain "
+                "(only rips in staging and their encoded output are Engram's)", src,
             )
             return
         if _already_done(src):
-            logger.info("AV1 hook: already converted, skipping %s", src.name)
+            logger.info("Encoding hook: already converted, skipping %s", src.name)
             return
 
         staging = _staging_dir()
         if _would_encode_in_place(src, staging):
             logger.error(
-                "AV1 hook: refusing to encode %s in place (it is in ENGRAM_AV1_STAGING)", src)
+                "Encoding hook: refusing to encode %s in place (it is in ENGRAM_ENCODE_STAGING)", src)
             return
 
         cls = forced_class or _pinned_class(src)
         if cls is not None and not classifier_enabled():
             logger.warning(
-                "AV1 hook: ignoring forced class=%s for %s: ENGRAM_CODEC_CLASSIFIER=0 "
+                "Encoding hook: ignoring forced class=%s for %s: ENGRAM_CODEC_CLASSIFIER=0 "
                 "keeps the fixed settings", cls, src.name)
             cls = None
 
@@ -1022,29 +1026,29 @@ def after_organize(
             probe = _probe(src)
             problem = forced_class_problem(cls, probe)
             if problem is not None:
-                logger.error("AV1 hook: refusing forced class=%s for %s: %s",
+                logger.error("Encoding hook: refusing forced class=%s for %s: %s",
                              cls, src.name, problem)
                 return
             plan = forced_plan(src, cls, probe)
             if plan is None:
-                logger.error("AV1 hook: classifier unavailable; cannot force class=%s for %s",
+                logger.error("Encoding hook: classifier unavailable; cannot force class=%s for %s",
                              cls, src.name)
                 return
-            logger.info("AV1 hook: codec class forced: %s (%s)", plan.describe(), src.name)
+            logger.info("Encoding hook: codec class forced: %s (%s)", plan.describe(), src.name)
         else:
             plan = _classify(src, context)
 
         if plan is not None and plan.is_passthrough:
-            logger.info("AV1 hook: leaving %s untouched (%s)", src.name, plan.reason)
+            logger.info("Encoding hook: leaving %s untouched (%s)", src.name, plan.reason)
             _write_marker(src, None, plan.class_name, forced=forced)
             return
 
-        dest = transcode_to_av1(src, staging, plan, loop=loop)
+        dest = transcode_file(src, staging, plan, loop=loop)
         if dest is not None:
             _write_marker(src, dest, plan.class_name if plan is not None else None,
                           forced=forced)
     except Exception:  # noqa: BLE001 - fail-open by design
-        logger.exception("AV1 hook: unexpected error for %s", final_path)
+        logger.exception("Encoding hook: unexpected error for %s", final_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1077,7 @@ class RetryConflict(RetryError):
 class RetryInvalid(RetryError):
     """The request is well-formed but unsafe: a class that may not be forced on
     this source, a class outside :data:`OFFERED_CLASSES`, or a source inside
-    ``ENGRAM_AV1_STAGING`` (where the encode would overwrite it)."""
+    ``ENGRAM_ENCODE_STAGING`` (where the encode would overwrite it)."""
 
     status = 422
 
@@ -1085,12 +1089,14 @@ _RETRY_PENDING: set[str] = set()
 
 
 def _staging_dir() -> Path:
-    return Path(_cfg("ENGRAM_AV1_STAGING", "/staging/av1-out"))
+    # The default directory name "av1-out" is historical (from when this was the
+    # "AV1 hook"); it is kept so encoded output already on disk is not orphaned.
+    return Path(_cfg("ENGRAM_ENCODE_STAGING", "/staging/av1-out"))
 
 
 # Engram's domain: the only places a file may be encoded from.  A rip lands in
 # the curator's staging root (``library_tv_path``/``library_movies_path``); an
-# encode's output lands under ``ENGRAM_AV1_STAGING``.  Nothing else on the NAS is
+# encode's output lands under ``ENGRAM_ENCODE_STAGING``.  Nothing else on the NAS is
 # Engram's to touch — the library holds files Engram never produced (legacy rips,
 # downloads, anime releases), and re-encoding those silently rewrites the
 # principal's collection with a different codec and a lossy generation.
@@ -1151,7 +1157,7 @@ def _run_retry(src: Path, key: str, loop) -> None:
     try:
         after_organize(str(src), loop=loop)
     except Exception:  # noqa: BLE001 - after_organize is fail-open; belt and braces
-        logger.exception("AV1 hook: retry failed for %s", src)
+        logger.exception("Encoding hook: retry failed for %s", src)
     finally:
         with _encoding_lock:
             _RETRY_PENDING.discard(key)
@@ -1170,7 +1176,7 @@ def _resolve_source(
         raise RetryNotFound(f"Not a file: {path}") from exc
     allowed = [Path(r) for r in roots] if roots is not None else default_retry_roots(())
     if not _within(src, allowed):
-        logger.warning("AV1 hook: refusing request outside Engram's domain: %s", src)
+        logger.warning("Encoding hook: refusing request outside Engram's domain: %s", src)
         raise RetryNotFound(f"Not a file in Engram's domain: {path}")
     if not src.is_file() or src.suffix.lower() != ".mkv":
         raise RetryNotFound(f"Not an existing .mkv file: {path}")
@@ -1180,7 +1186,7 @@ def _resolve_source(
 def _refuse_in_place(src: Path) -> None:
     if _would_encode_in_place(src, _staging_dir()):
         raise RetryInvalid(
-            f"{src.name} is in ENGRAM_AV1_STAGING; encoding it would overwrite the source")
+            f"{src.name} is in ENGRAM_ENCODE_STAGING; encoding it would overwrite the source")
 
 
 def _validate_forced(src: Path, codec_class: str) -> None:
@@ -1208,7 +1214,7 @@ def retry_encode(
     ``after_organize`` on its own daemon thread, returning immediately: an
     encode takes over an hour, and a dedicated thread keeps it off the default
     executor.  The encode is the ordinary ``after_organize`` ->
-    ``transcode_to_av1`` path, so it takes the same ``_encode_slot`` permit and
+    ``transcode_file`` path, so it takes the same ``_encode_slot`` permit and
     shows in ``_ENCODING`` like any other; there is no second code path.
 
     ``codec_class`` (one of :data:`OFFERED_CLASSES`) is persisted as the pin
@@ -1217,14 +1223,14 @@ def retry_encode(
     ``ENGRAM_CODEC_CLASSIFIER=0``.
 
     ``roots``: the source must resolve inside one of these.  The route passes
-    ``default_retry_roots(library paths)``.  None means the AV1 staging parent
+    ``default_retry_roots(library paths)``.  None means the encode staging parent
     only, so a caller that forgets the roots fails closed.
 
     May run ffprobe (with ``codec_class``); call it off the event loop.
     """
     src = _resolve_source(path, roots)
     if not is_enabled():
-        raise RetryConflict("The AV1 hook is disabled (ENGRAM_AV1_HOOK is not 1)")
+        raise RetryConflict("The encoding hook is disabled (ENGRAM_ENCODE_HOOK is not 1)")
     _refuse_in_place(src)
     if codec_class is not None:
         if not classifier_enabled():
@@ -1247,13 +1253,13 @@ def retry_encode(
                 _store_override(src, codec_class)
             _strip_done(src)
         threading.Thread(
-            target=_run_retry, args=(src, key, loop), name="av1-retry", daemon=True
+            target=_run_retry, args=(src, key, loop), name="encode-retry", daemon=True
         ).start()
     except Exception:
         with _encoding_lock:
             _RETRY_PENDING.discard(key)
         raise
-    logger.info("AV1 hook: retry queued for %s%s", src.name,
+    logger.info("Encoding hook: retry queued for %s%s", src.name,
                 f" (class={codec_class}, forced)" if codec_class else "")
 
 
@@ -1337,7 +1343,7 @@ def set_override(
     _refuse_in_place(src)
     _validate_forced(src, codec_class)
     _store_override(src, codec_class)
-    logger.info("AV1 hook: codec class pinned: class=%s for %s", codec_class, src.name)
+    logger.info("Encoding hook: codec class pinned: class=%s for %s", codec_class, src.name)
     return override_status(src, roots=roots)
 
 
@@ -1358,5 +1364,5 @@ def clear_override(
             return False
         data.pop("override")
         _store_marker(src, data)
-    logger.info("AV1 hook: codec class pin cleared for %s", src.name)
+    logger.info("Encoding hook: codec class pin cleared for %s", src.name)
     return True

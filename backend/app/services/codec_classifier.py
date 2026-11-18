@@ -1,6 +1,6 @@
 """Content-aware codec pipeline classifier for the Engram post-organize hook.
 
-The AV1 hook used to apply one fixed CRF/preset to every file.  This module
+The encoding hook used to apply one fixed CRF/preset to every file.  This module
 looks at the *media itself* (ffprobe/ffmpeg probes) and picks a codec pipeline
 for it.  The Engram identification context (tv/movie, is_extra, duration,
 resolution) is a **hint only**: where it disagrees with the probes the probes

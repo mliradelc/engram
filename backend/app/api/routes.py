@@ -509,9 +509,9 @@ async def list_encoding() -> dict[str, list[dict]]:
     In-memory and process-local by design: a queued file is not listed, and
     nothing survives a restart (neither does the encode).
     """
-    from app.services import av1_hook
+    from app.services import encode_hook
 
-    return av1_hook.encoding_status()
+    return encode_hook.encoding_status()
 
 
 class EncodeRetryRequest(BaseModel):
@@ -542,12 +542,12 @@ class EncodeDismissRequest(BaseModel):
 
 
 async def _encode_roots() -> list:
-    """Engram's encode domain for this config (see ``av1_hook.domain_roots``)."""
-    from app.services import av1_hook
+    """Engram's encode domain for this config (see ``encode_hook.domain_roots``)."""
+    from app.services import encode_hook
     from app.services.config_service import get_config
 
     config = await get_config()
-    return av1_hook.default_retry_roots([config.library_tv_path, config.library_movies_path])
+    return encode_hook.default_retry_roots([config.library_tv_path, config.library_movies_path])
 
 
 @router.post(
@@ -562,10 +562,10 @@ async def dismiss_encoding(body: EncodeDismissRequest | None = None) -> dict:
     retry) otherwise lingers until the process restarts.  Returns the number of
     rows removed.
     """
-    from app.services import av1_hook
+    from app.services import encode_hook
 
     source = body.file if body is not None else None
-    return {"dismissed": av1_hook.dismiss_failure(source)}
+    return {"dismissed": encode_hook.dismiss_failure(source)}
 
 
 @router.post(
@@ -578,27 +578,27 @@ async def retry_encoding(body: EncodeRetryRequest) -> dict:
 
     202 once queued (the encode runs in the background and shows on the panel
     when it holds a slot); 404 when the path is not an existing ``.mkv`` under
-    the library roots or the AV1 staging parent (this route is LAN-reachable,
+    the library roots or the encode staging parent (this route is LAN-reachable,
     so it must not encode arbitrary files); 409 when the file is already
     encoding, the hook is disabled, or ``codec_class`` is given while the
     classifier is disabled; 422 when ``codec_class`` is not one of the four
     offered classes or cannot be forced on this source (AV1 or HDR), or the
-    source is inside ``ENGRAM_AV1_STAGING``.
+    source is inside ``ENGRAM_ENCODE_STAGING``.
     """
-    from app.services import av1_hook
+    from app.services import encode_hook
 
     roots = await _encode_roots()
     loop = asyncio.get_running_loop()
     try:
         # Off the loop: a forced class probes the source with ffprobe.
         await asyncio.to_thread(
-            av1_hook.retry_encode,
+            encode_hook.retry_encode,
             body.file,
             loop=loop,
             roots=roots,
             codec_class=body.codec_class,
         )
-    except av1_hook.RetryError as exc:
+    except encode_hook.RetryError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     except OSError as exc:
         logger.error("Encode retry failed for %s: %s", sanitize_log_value(body.file), exc)
@@ -621,12 +621,12 @@ async def get_encoding_override(file: str = Query(..., min_length=1)) -> dict:
     Outside Engram's domain: ``in_domain: false`` and no marker is read.
     404 for a path in the domain that is not an existing ``.mkv``.
     """
-    from app.services import av1_hook
+    from app.services import encode_hook
 
     roots = await _encode_roots()
     try:
-        return await asyncio.to_thread(av1_hook.override_status, file, roots=roots)
-    except av1_hook.RetryError as exc:
+        return await asyncio.to_thread(encode_hook.override_status, file, roots=roots)
+    except encode_hook.RetryError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
 
@@ -639,16 +639,16 @@ async def put_encoding_override(body: EncodeOverrideRequest) -> dict:
 
     404 outside Engram's domain or for a missing file; 422 for a class that is
     not one of the four offered (``hdr`` and ``interlaced`` included) or cannot
-    be forced on this source, or a source inside ``ENGRAM_AV1_STAGING``.
+    be forced on this source, or a source inside ``ENGRAM_ENCODE_STAGING``.
     """
-    from app.services import av1_hook
+    from app.services import encode_hook
 
     roots = await _encode_roots()
     try:
         return await asyncio.to_thread(
-            av1_hook.set_override, body.file, body.codec_class, roots=roots
+            encode_hook.set_override, body.file, body.codec_class, roots=roots
         )
-    except av1_hook.RetryError as exc:
+    except encode_hook.RetryError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     except OSError as exc:
         logger.error("Encode pin failed for %s: %s", sanitize_log_value(body.file), exc)
@@ -661,12 +661,12 @@ async def put_encoding_override(body: EncodeOverrideRequest) -> dict:
 )
 async def delete_encoding_override(file: str = Query(..., min_length=1)) -> dict:
     """Clear a source's codec-class pin; the classifier decides again. 404 outside the domain."""
-    from app.services import av1_hook
+    from app.services import encode_hook
 
     roots = await _encode_roots()
     try:
-        cleared = await asyncio.to_thread(av1_hook.clear_override, file, roots=roots)
-    except av1_hook.RetryError as exc:
+        cleared = await asyncio.to_thread(encode_hook.clear_override, file, roots=roots)
+    except encode_hook.RetryError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
     except OSError as exc:
         logger.error("Encode pin clear failed for %s: %s", sanitize_log_value(file), exc)

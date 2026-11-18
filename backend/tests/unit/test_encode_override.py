@@ -1,4 +1,4 @@
-"""Per-title codec-class override (pin) and forced retry for the AV1 hook.
+"""Per-title codec-class override (pin) and forced retry for the encoding hook.
 
 Covers SPEC-reclassify-v2 D0-D5: only four classes may be forced, the pin lives
 in the marker and survives an encode and a retry, a stale pin is ignored and
@@ -17,7 +17,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.services import av1_hook
+from app.services import encode_hook
 
 FOUR = ["passthrough", "animation", "live_action_grainy", "live_action_clean"]
 
@@ -47,7 +47,7 @@ HDR_HEVC = {
     ]
 }
 # Captured before any fixture swaps it for a fake.
-_REAL_TRANSCODE = av1_hook.transcode_to_av1
+_REAL_TRANSCODE = encode_hook.transcode_file
 
 AV1_SRC = {"streams": [{"codec_type": "video", "codec_name": "av1", "width": 1920, "height": 1080}]}
 
@@ -60,9 +60,9 @@ INTERLACED_SRC = {"field_order": "tt",
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
-    monkeypatch.setattr(av1_hook, "_ENCODING", {})
-    monkeypatch.setattr(av1_hook, "_FAILED", av1_hook.deque(maxlen=av1_hook.FAILURE_BUFFER_SIZE))
-    monkeypatch.setattr(av1_hook, "_RETRY_PENDING", set())
+    monkeypatch.setattr(encode_hook, "_ENCODING", {})
+    monkeypatch.setattr(encode_hook, "_FAILED", encode_hook.deque(maxlen=encode_hook.FAILURE_BUFFER_SIZE))
+    monkeypatch.setattr(encode_hook, "_RETRY_PENDING", set())
 
 
 @pytest.fixture(autouse=True)
@@ -76,15 +76,15 @@ def interlace(monkeypatch):
         state.calls.append(path)
         return dict(state.result)
 
-    monkeypatch.setattr(av1_hook._load_classifier(), "probe_interlace", fake)
+    monkeypatch.setattr(encode_hook._load_classifier(), "probe_interlace", fake)
     return state
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Hook and classifier on; domain = tmp/_staging (with a tv library inside);
-    AV1 output = tmp/out; a sibling tmp/media/tv stands in for the real library.
-    ``transcode_to_av1`` is faked and records the plan it was given."""
+    Encode output = tmp/out; a sibling tmp/media/tv stands in for the real library.
+    ``transcode_file`` is faked and records the plan it was given."""
     domain = tmp_path / "_staging"
     lib = domain / "tv"
     lib.mkdir(parents=True)
@@ -92,11 +92,11 @@ def env(tmp_path, monkeypatch):
     library.mkdir(parents=True)
     out = tmp_path / "out"
     out.mkdir()
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
     monkeypatch.delenv("ENGRAM_CODEC_CLASSIFIER", raising=False)
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(out))
-    monkeypatch.setattr(av1_hook, "_probe", lambda p: SD_MPEG2)
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(out))
+    monkeypatch.setattr(encode_hook, "_probe", lambda p: SD_MPEG2)
 
     encodes: list[dict] = []
 
@@ -104,16 +104,16 @@ def env(tmp_path, monkeypatch):
         encodes.append({"src": Path(src), "plan": plan})
         return staging / Path(src).name
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
 
     classified: list[Path] = []
 
     def fake_classify(src, context):
         classified.append(src)
-        mod = av1_hook._load_classifier()
+        mod = encode_hook._load_classifier()
         return mod.plan_for_class("live_action_clean", res="sd")
 
-    monkeypatch.setattr(av1_hook, "_classify", fake_classify)
+    monkeypatch.setattr(encode_hook, "_classify", fake_classify)
     return SimpleNamespace(
         domain=domain,
         lib=lib,
@@ -132,7 +132,7 @@ def _rip(folder: Path, name: str = "Show - S01E01.mkv", data: bytes = b"src") ->
 
 
 def _marker(src: Path) -> dict:
-    return json.loads(av1_hook._marker_path(src).read_text())
+    return json.loads(encode_hook._marker_path(src).read_text())
 
 
 def _wait_for(pred, timeout: float = 5.0) -> bool:
@@ -150,9 +150,9 @@ def _wait_for(pred, timeout: float = 5.0) -> bool:
 
 
 def test_offered_classes_are_exactly_the_four():
-    assert list(av1_hook.OFFERED_CLASSES) == FOUR
-    assert "hdr" not in av1_hook.OFFERED_CLASSES
-    assert "interlaced" not in av1_hook.OFFERED_CLASSES
+    assert list(encode_hook.OFFERED_CLASSES) == FOUR
+    assert "hdr" not in encode_hook.OFFERED_CLASSES
+    assert "interlaced" not in encode_hook.OFFERED_CLASSES
 
 
 @pytest.mark.parametrize(
@@ -166,7 +166,7 @@ def test_offered_classes_are_exactly_the_four():
     ],
 )
 def test_forced_plan_keeps_the_source_resolution(tmp_path, probe, res, cls, crf):
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, probe)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", cls, probe)
     assert plan.class_name == cls
     assert plan.evidence["res"] == res
     assert plan.evidence["forced"] is True
@@ -176,7 +176,7 @@ def test_forced_plan_keeps_the_source_resolution(tmp_path, probe, res, cls, crf)
 @pytest.mark.parametrize("cls", FOUR)
 def test_forced_plan_never_yields_hdr_or_interlaced(tmp_path, cls, interlace):
     interlace.result = PROGRESSIVE_SRC
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
     assert plan.class_name == cls
     assert plan.class_name not in ("hdr", "interlaced")
     assert not plan.hdr
@@ -186,7 +186,7 @@ def test_forced_plan_never_yields_hdr_or_interlaced(tmp_path, cls, interlace):
 @pytest.mark.parametrize("cls", ["hdr", "interlaced", "bogus"])
 def test_forced_plan_refuses_classes_outside_the_four(tmp_path, cls):
     with pytest.raises(ValueError):
-        av1_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
+        encode_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ BWDIF = "bwdif=mode=send_frame:parity=auto:deint=all"
 @pytest.mark.parametrize("cls", ENCODING_FOUR)
 def test_forced_class_on_an_interlaced_source_still_gets_bwdif(tmp_path, cls, interlace):
     interlace.result = INTERLACED_SRC
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
     assert plan.class_name == cls  # the class still picks codec/CRF/preset
     assert plan.video_filters == [BWDIF]
     assert plan.evidence["interlaced"] == "yes"
@@ -212,7 +212,7 @@ def test_forced_class_on_an_interlaced_source_still_gets_bwdif(tmp_path, cls, in
 @pytest.mark.parametrize("cls", ENCODING_FOUR)
 def test_forced_class_on_a_progressive_source_does_not_get_bwdif(tmp_path, cls, interlace):
     interlace.result = PROGRESSIVE_SRC
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", cls, SD_MPEG2)
     assert plan.video_filters == []
     assert "-vf" not in plan.video_args(4)
     assert plan.evidence["interlaced"] == "no"
@@ -221,13 +221,13 @@ def test_forced_class_on_a_progressive_source_does_not_get_bwdif(tmp_path, cls, 
 def test_forced_plan_uses_idet_over_a_progressive_field_order_flag(tmp_path, interlace):
     """A DVD flagged progressive but combed in fact: idet decides, not the flag."""
     interlace.result = {**INTERLACED_SRC, "field_order": "progressive"}
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", "animation", SD_MPEG2)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", "animation", SD_MPEG2)
     assert plan.video_filters == [BWDIF]
 
 
 def test_forced_passthrough_skips_the_idet_probe(tmp_path, interlace):
     interlace.result = INTERLACED_SRC
-    plan = av1_hook.forced_plan(tmp_path / "x.mkv", "passthrough", SD_MPEG2)
+    plan = encode_hook.forced_plan(tmp_path / "x.mkv", "passthrough", SD_MPEG2)
     assert plan.is_passthrough and plan.video_filters == []
     assert interlace.calls == []
 
@@ -235,8 +235,8 @@ def test_forced_passthrough_skips_the_idet_probe(tmp_path, interlace):
 def test_a_pin_on_an_interlaced_source_encodes_deinterlaced(env, interlace):
     src = _rip(env.lib)
     interlace.result = INTERLACED_SRC
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    av1_hook.after_organize(str(src))
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook.after_organize(str(src))
     [enc] = env.encodes
     assert enc["plan"].class_name == "animation"
     assert enc["plan"].video_filters == [BWDIF]
@@ -246,7 +246,7 @@ def test_a_pin_on_an_interlaced_source_encodes_deinterlaced(env, interlace):
 def test_a_forced_retry_class_on_an_interlaced_source_encodes_deinterlaced(env, interlace):
     src = _rip(env.lib)
     interlace.result = INTERLACED_SRC
-    av1_hook.after_organize(str(src), forced_class="live_action_grainy")
+    encode_hook.after_organize(str(src), forced_class="live_action_grainy")
     [enc] = env.encodes
     assert enc["plan"].codec == "hevc"
     assert enc["plan"].video_filters == [BWDIF]
@@ -256,18 +256,18 @@ def test_forced_plan_carries_the_source_bit_depth(tmp_path):
     ten = {"streams": [{**SD_MPEG2["streams"][0], "pix_fmt": "yuv420p10le"}]}
     eight = {"streams": [{**SD_MPEG2["streams"][0], "pix_fmt": "yuv420p"}]}
     for cls in ENCODING_FOUR:
-        assert av1_hook.forced_plan(tmp_path / "x.mkv", cls, ten).pix_fmt == "yuv420p10le"
-        assert av1_hook.forced_plan(tmp_path / "x.mkv", cls, eight).pix_fmt == "yuv420p"
+        assert encode_hook.forced_plan(tmp_path / "x.mkv", cls, ten).pix_fmt == "yuv420p10le"
+        assert encode_hook.forced_plan(tmp_path / "x.mkv", cls, eight).pix_fmt == "yuv420p"
 
 
 def test_forced_class_problem():
-    assert av1_hook.forced_class_problem("animation", SD_MPEG2) is None
-    assert "cannot be forced" in av1_hook.forced_class_problem("hdr", HDR_HEVC)
-    assert "HDR" in av1_hook.forced_class_problem("live_action_clean", HDR_HEVC)
-    assert "AV1" in av1_hook.forced_class_problem("animation", AV1_SRC)
-    assert av1_hook.forced_class_problem("passthrough", AV1_SRC) is None
-    assert av1_hook.forced_class_problem("passthrough", HDR_HEVC) is None
-    assert av1_hook.forced_class_problem("animation", {}) is not None  # unprobeable
+    assert encode_hook.forced_class_problem("animation", SD_MPEG2) is None
+    assert "cannot be forced" in encode_hook.forced_class_problem("hdr", HDR_HEVC)
+    assert "HDR" in encode_hook.forced_class_problem("live_action_clean", HDR_HEVC)
+    assert "AV1" in encode_hook.forced_class_problem("animation", AV1_SRC)
+    assert encode_hook.forced_class_problem("passthrough", AV1_SRC) is None
+    assert encode_hook.forced_class_problem("passthrough", HDR_HEVC) is None
+    assert encode_hook.forced_class_problem("animation", {}) is not None  # unprobeable
 
 
 # ---------------------------------------------------------------------------
@@ -277,21 +277,21 @@ def test_forced_class_problem():
 
 def test_setting_a_pin_records_only(env):
     src = _rip(env.lib)
-    status = av1_hook.set_override(src, "animation", roots=env.roots)
+    status = encode_hook.set_override(src, "animation", roots=env.roots)
     assert env.encodes == [] and env.classified == []
     assert status["override"]["codec_class"] == "animation"
     assert status["override"]["stale"] is False
     assert status["done"] is False
     marker = _marker(src)
     assert set(marker) == {"override"}
-    assert not av1_hook._already_done(src)  # a pin is not a done record
+    assert not encode_hook._already_done(src)  # a pin is not a done record
 
 
 def test_pin_is_applied_not_skipped_and_does_not_loop(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook.set_override(src, "animation", roots=env.roots)
 
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     [enc] = env.encodes
     assert enc["plan"].class_name == "animation"
     assert enc["plan"].evidence["forced"] is True
@@ -300,7 +300,7 @@ def test_pin_is_applied_not_skipped_and_does_not_loop(env):
     assert marker["codec_class"] == "animation" and marker["forced"] is True
     assert marker["override"]["codec_class"] == "animation"  # merge kept the pin
 
-    av1_hook.after_organize(str(src))  # second sweep: done, so no re-encode
+    encode_hook.after_organize(str(src))  # second sweep: done, so no re-encode
     assert len(env.encodes) == 1
 
 
@@ -309,7 +309,7 @@ def test_pin_survives_a_restart(env):
     src = _rip(env.lib)
     st = src.stat()
     # As left by a previous process: nothing in memory knows about it.
-    av1_hook._marker_path(src).write_text(
+    encode_hook._marker_path(src).write_text(
         json.dumps(
             {
                 "override": {
@@ -321,22 +321,22 @@ def test_pin_survives_a_restart(env):
             }
         )
     )
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     [enc] = env.encodes
     assert enc["plan"].class_name == "live_action_grainy"
 
 
 def test_forced_class_takes_precedence_over_a_stored_pin(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    av1_hook.after_organize(str(src), forced_class="live_action_clean")
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook.after_organize(str(src), forced_class="live_action_clean")
     [enc] = env.encodes
     assert enc["plan"].class_name == "live_action_clean"
 
 
 def test_forced_passthrough_writes_a_done_marker_and_encodes_nothing(env):
     src = _rip(env.lib)
-    av1_hook.after_organize(str(src), forced_class="passthrough")
+    encode_hook.after_organize(str(src), forced_class="passthrough")
     assert env.encodes == []
     marker = _marker(src)
     assert marker["av1"] is None and marker["codec_class"] == "passthrough"
@@ -345,8 +345,8 @@ def test_forced_passthrough_writes_a_done_marker_and_encodes_nothing(env):
 
 def test_write_marker_merges_the_pin(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    av1_hook._write_marker(src, env.out / src.name, "animation", forced=True)
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook._write_marker(src, env.out / src.name, "animation", forced=True)
     marker = _marker(src)
     assert marker["override"]["codec_class"] == "animation"
     assert marker["av1"] == str(env.out / src.name)
@@ -360,13 +360,13 @@ def test_write_marker_merges_the_pin(env):
 
 def test_stale_pin_is_ignored_reported_and_dropped(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook.set_override(src, "animation", roots=env.roots)
     src.write_bytes(b"a different, longer revision of the rip")  # size changes
 
-    status = av1_hook.override_status(src, roots=env.roots)
+    status = encode_hook.override_status(src, roots=env.roots)
     assert status["override"]["stale"] is True
 
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     assert env.classified == [src]  # the classifier decided
     [enc] = env.encodes
     assert enc["plan"].class_name == "live_action_clean"
@@ -382,23 +382,23 @@ def test_stale_pin_is_ignored_reported_and_dropped(env):
 
 def test_clear_deletes_a_pin_only_marker_and_returns_to_the_classifier(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    assert av1_hook.clear_override(src, roots=env.roots) is True
-    assert not av1_hook._marker_path(src).exists()
-    assert av1_hook.clear_override(src, roots=env.roots) is False
-    av1_hook.after_organize(str(src))
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    assert encode_hook.clear_override(src, roots=env.roots) is True
+    assert not encode_hook._marker_path(src).exists()
+    assert encode_hook.clear_override(src, roots=env.roots) is False
+    encode_hook.after_organize(str(src))
     assert env.classified == [src]
     assert env.encodes[0]["plan"].class_name == "live_action_clean"
 
 
 def test_clear_keeps_the_done_record(env):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    av1_hook._write_marker(src, env.out / src.name, "animation", forced=True)
-    assert av1_hook.clear_override(src, roots=env.roots) is True
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook._write_marker(src, env.out / src.name, "animation", forced=True)
+    assert encode_hook.clear_override(src, roots=env.roots) is True
     marker = _marker(src)
     assert "override" not in marker
-    assert av1_hook._already_done(src)
+    assert encode_hook._already_done(src)
 
 
 # ---------------------------------------------------------------------------
@@ -408,9 +408,9 @@ def test_clear_keeps_the_done_record(env):
 
 def test_retry_strips_done_fields_but_keeps_the_pin(env, monkeypatch):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
-    av1_hook._write_marker(src, env.out / src.name, "animation", forced=True)
-    assert av1_hook._already_done(src)
+    encode_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook._write_marker(src, env.out / src.name, "animation", forced=True)
+    assert encode_hook._already_done(src)
 
     seen_markers: list[dict] = []
     started = threading.Event()
@@ -421,10 +421,10 @@ def test_retry_strips_done_fields_but_keeps_the_pin(env, monkeypatch):
         started.set()
         return staging / Path(s).name
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
-    av1_hook.retry_encode(src, roots=env.roots)
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
+    encode_hook.retry_encode(src, roots=env.roots)
     assert started.wait(5)
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
     assert seen_markers == [{"override": seen_markers[0]["override"]}]
     assert env.encodes[-1]["plan"].class_name == "animation"
     marker = _marker(src)
@@ -434,9 +434,9 @@ def test_retry_strips_done_fields_but_keeps_the_pin(env, monkeypatch):
 
 def test_retry_with_a_class_persists_the_pin_before_encoding(env):
     src = _rip(env.lib)
-    av1_hook._write_marker(src, env.out / src.name, "live_action_clean")
-    av1_hook.retry_encode(src, roots=env.roots, codec_class="live_action_grainy")
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    encode_hook._write_marker(src, env.out / src.name, "live_action_clean")
+    encode_hook.retry_encode(src, roots=env.roots, codec_class="live_action_grainy")
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
     [enc] = env.encodes
     assert enc["plan"].class_name == "live_action_grainy"
     marker = _marker(src)
@@ -447,20 +447,20 @@ def test_retry_with_a_class_persists_the_pin_before_encoding(env):
 @pytest.mark.parametrize("cls", ["hdr", "interlaced", "bogus"])
 def test_retry_refuses_classes_outside_the_four(env, cls):
     src = _rip(env.lib)
-    with pytest.raises(av1_hook.RetryInvalid) as exc:
-        av1_hook.retry_encode(src, roots=env.roots, codec_class=cls)
+    with pytest.raises(encode_hook.RetryInvalid) as exc:
+        encode_hook.retry_encode(src, roots=env.roots, codec_class=cls)
     assert exc.value.status == 422
-    assert not av1_hook._RETRY_PENDING
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._RETRY_PENDING
+    assert not encode_hook._marker_path(src).exists()
 
 
 def test_retry_refuses_a_lossy_class_on_av1_and_hdr_sources(env, monkeypatch):
     src = _rip(env.lib)
     for probe in (AV1_SRC, HDR_HEVC):
-        monkeypatch.setattr(av1_hook, "_probe", lambda p, probe=probe: probe)
-        with pytest.raises(av1_hook.RetryInvalid):
-            av1_hook.retry_encode(src, roots=env.roots, codec_class="animation")
-    assert not av1_hook._marker_path(src).exists()
+        monkeypatch.setattr(encode_hook, "_probe", lambda p, probe=probe: probe)
+        with pytest.raises(encode_hook.RetryInvalid):
+            encode_hook.retry_encode(src, roots=env.roots, codec_class="animation")
+    assert not encode_hook._marker_path(src).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -470,25 +470,25 @@ def test_retry_refuses_a_lossy_class_on_av1_and_hdr_sources(env, monkeypatch):
 
 def test_library_path_is_refused_by_retry_put_and_after_organize(env):
     src = _rip(env.library)
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(src, roots=env.roots, codec_class="animation")
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.set_override(src, "animation", roots=env.roots)
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.clear_override(src, roots=env.roots)
-    av1_hook.after_organize(str(src), forced_class="animation")
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(src, roots=env.roots, codec_class="animation")
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.set_override(src, "animation", roots=env.roots)
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.clear_override(src, roots=env.roots)
+    encode_hook.after_organize(str(src), forced_class="animation")
     assert env.encodes == []
-    assert not av1_hook._marker_path(src).exists()
-    status = av1_hook.override_status(src, roots=env.roots)
+    assert not encode_hook._marker_path(src).exists()
+    status = encode_hook.override_status(src, roots=env.roots)
     assert status["in_domain"] is False and status["override"] is None
 
 
 def test_status_outside_the_domain_never_reads_the_marker(env, monkeypatch):
     src = _rip(env.library)
     monkeypatch.setattr(
-        av1_hook, "_read_marker", lambda p: pytest.fail("read a marker outside the domain")
+        encode_hook, "_read_marker", lambda p: pytest.fail("read a marker outside the domain")
     )
-    assert av1_hook.override_status(src, roots=env.roots)["in_domain"] is False
+    assert encode_hook.override_status(src, roots=env.roots)["in_domain"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +500,7 @@ def test_transcode_refuses_when_dest_is_src(env, monkeypatch):
     out = env.out
     src = _rip(out)
     calls: list = []
-    monkeypatch.setattr(av1_hook.subprocess, "run", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(encode_hook.subprocess, "run", lambda *a, **k: calls.append(a))
     assert _REAL_TRANSCODE(src, out, None) is None
     assert calls == []
     assert src.read_bytes() == b"src"
@@ -511,20 +511,20 @@ def test_kill_switch_path_refuses_in_place(env, monkeypatch):
     staging dir is in the domain, and dest == src there."""
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     src = _rip(env.out)
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     assert env.encodes == []
     assert src.read_bytes() == b"src"
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._marker_path(src).exists()
 
 
-def test_retry_and_put_refuse_a_source_in_av1_staging(env):
+def test_retry_and_put_refuse_a_source_in_encode_staging(env):
     src = _rip(env.out)
-    with pytest.raises(av1_hook.RetryInvalid):
-        av1_hook.retry_encode(src, roots=env.roots)
-    with pytest.raises(av1_hook.RetryInvalid):
-        av1_hook.set_override(src, "animation", roots=env.roots)
-    assert not av1_hook._RETRY_PENDING
-    assert not av1_hook._marker_path(src).exists()
+    with pytest.raises(encode_hook.RetryInvalid):
+        encode_hook.retry_encode(src, roots=env.roots)
+    with pytest.raises(encode_hook.RetryInvalid):
+        encode_hook.set_override(src, "animation", roots=env.roots)
+    assert not encode_hook._RETRY_PENDING
+    assert not encode_hook._marker_path(src).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -535,23 +535,23 @@ def test_retry_and_put_refuse_a_source_in_av1_staging(env):
 def test_kill_switch_classify_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
     monkeypatch.setattr(
-        av1_hook, "_load_classifier", lambda: pytest.fail("classifier loaded despite kill switch")
+        encode_hook, "_load_classifier", lambda: pytest.fail("classifier loaded despite kill switch")
     )
-    assert av1_hook._classify(tmp_path / "x.mkv", None) is None
+    assert encode_hook._classify(tmp_path / "x.mkv", None) is None
 
 
 def test_kill_switch_refuses_a_forced_retry_and_ignores_a_pin(env, monkeypatch):
     src = _rip(env.lib)
-    av1_hook.set_override(src, "animation", roots=env.roots)
+    encode_hook.set_override(src, "animation", roots=env.roots)
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
-    monkeypatch.setattr(av1_hook, "_classify", lambda s, c: None)  # the real kill-switch result
-    with pytest.raises(av1_hook.RetryConflict) as exc:
-        av1_hook.retry_encode(src, roots=env.roots, codec_class="animation")
+    monkeypatch.setattr(encode_hook, "_classify", lambda s, c: None)  # the real kill-switch result
+    with pytest.raises(encode_hook.RetryConflict) as exc:
+        encode_hook.retry_encode(src, roots=env.roots, codec_class="animation")
     assert exc.value.status == 409
-    av1_hook.after_organize(str(src))
+    encode_hook.after_organize(str(src))
     [enc] = env.encodes
     assert enc["plan"] is None  # fixed settings, the pin did not apply
-    assert av1_hook.override_status(src, roots=env.roots)["classifier_enabled"] is False
+    assert encode_hook.override_status(src, roots=env.roots)["classifier_enabled"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -561,10 +561,10 @@ def test_kill_switch_refuses_a_forced_retry_and_ignores_a_pin(env, monkeypatch):
 
 def test_failed_rows_carry_class_and_forced(tmp_path):
     src = tmp_path / "a.mkv"
-    av1_hook._record_failure(
+    encode_hook._record_failure(
         src, tmp_path / "out" / "a.mkv", "boom", codec_class="animation", forced=True
     )
-    [row] = av1_hook.encoding_status()["failed"]
+    [row] = encode_hook.encoding_status()["failed"]
     assert row["codec_class"] == "animation" and row["forced"] is True
 
 
@@ -589,7 +589,7 @@ def api_env(env, monkeypatch):
 
     monkeypatch.setattr(config_service, "get_config", fake_get_config)
     runs: list = []
-    monkeypatch.setattr(av1_hook, "_run_retry", lambda src, key, loop: runs.append(src))
+    monkeypatch.setattr(encode_hook, "_run_retry", lambda src, key, loop: runs.append(src))
     env.runs = runs
     return env
 
@@ -625,7 +625,7 @@ async def test_api_put_get_delete_round_trip(client, api_env):
     assert resp.json()["override"]["stale"] is False
     resp = await client.delete("/api/encoding/override", params={"file": str(src)})
     assert resp.status_code == 200 and resp.json() == {"cleared": True}
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._marker_path(src).exists()
 
 
 @pytest.mark.parametrize("cls", ["hdr", "interlaced", "HDR", ""])
@@ -636,7 +636,7 @@ async def test_api_refuses_hdr_and_interlaced_with_422(client, api_env, cls):
     resp = await client.post("/api/encoding/retry", json={"file": str(src), "codec_class": cls})
     assert resp.status_code == 422
     assert api_env.runs == []
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._marker_path(src).exists()
 
 
 async def test_api_library_path_404_for_put_delete_and_retry(client, api_env):
@@ -653,7 +653,7 @@ async def test_api_library_path_404_for_put_delete_and_retry(client, api_env):
     assert resp.status_code == 404
     resp = await client.get("/api/encoding/override", params={"file": str(src)})
     assert resp.status_code == 200 and resp.json()["in_domain"] is False
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._marker_path(src).exists()
 
 
 async def test_api_retry_with_class_202_and_pin_on_disk(client, api_env):

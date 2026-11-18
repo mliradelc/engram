@@ -1,6 +1,6 @@
-"""Tests for the AV1 hook's process-wide encode concurrency gate.
+"""Tests for the encoding hook's process-wide encode concurrency gate.
 
-``av1_hook`` is loaded by file path, never through ``app.services`` (same
+``encode_hook`` is loaded by file path, never through ``app.services`` (same
 convention as ``test_codec_classifier.py``): that package's ``__init__`` imports
 the whole ASR stack.
 """
@@ -28,7 +28,7 @@ def _load(name: str):
     return mod
 
 
-av1_hook = _load("av1_hook")
+encode_hook = _load("encode_hook")
 
 PROBE_OK = json.dumps({"streams": [{"codec_type": "video", "codec_name": "av1"}]})
 
@@ -62,10 +62,10 @@ class FakeRun:
 
 @pytest.fixture(autouse=True)
 def _reset_gate(monkeypatch):
-    monkeypatch.delenv("ENGRAM_AV1_MAX_CONCURRENT", raising=False)
-    monkeypatch.setattr(av1_hook, "_gate_sem", None)
-    monkeypatch.setattr(av1_hook, "_gate_limit", None)
-    monkeypatch.setattr(av1_hook, "_gate_busy", 0)
+    monkeypatch.delenv("ENGRAM_ENCODE_MAX_CONCURRENT", raising=False)
+    monkeypatch.setattr(encode_hook, "_gate_sem", None)
+    monkeypatch.setattr(encode_hook, "_gate_limit", None)
+    monkeypatch.setattr(encode_hook, "_gate_busy", 0)
 
 
 def _sources(tmp_path: Path, n: int) -> list[Path]:
@@ -83,7 +83,7 @@ def _run_parallel(tmp_path: Path, n: int) -> list:
     results: list = [None] * n
 
     def work(i: int) -> None:
-        results[i] = av1_hook.transcode_to_av1(srcs[i], staging)
+        results[i] = encode_hook.transcode_file(srcs[i], staging)
 
     threads = [threading.Thread(target=work, args=(i,)) for i in range(n)]
     for t in threads:
@@ -99,7 +99,7 @@ def _overlaps(spans: list[tuple[float, float]]) -> bool:
 
 
 def test_limit_one_never_overlaps(tmp_path, monkeypatch):
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "1")
     fake = FakeRun()
     monkeypatch.setattr(subprocess, "run", fake)
     results = _run_parallel(tmp_path, 3)
@@ -109,7 +109,7 @@ def test_limit_one_never_overlaps(tmp_path, monkeypatch):
 
 
 def test_limit_zero_is_unlimited(tmp_path, monkeypatch):
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "0")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "0")
     fake = FakeRun()
     monkeypatch.setattr(subprocess, "run", fake)
     _run_parallel(tmp_path, 3)
@@ -118,8 +118,8 @@ def test_limit_zero_is_unlimited(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("value", ["abc", "-5", ""])
 def test_invalid_value_is_unlimited_and_does_not_raise(tmp_path, monkeypatch, value):
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", value)
-    assert av1_hook._max_concurrent() == 0
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", value)
+    assert encode_hook._max_concurrent() == 0
     fake = FakeRun()
     monkeypatch.setattr(subprocess, "run", fake)
     results = _run_parallel(tmp_path, 2)
@@ -128,7 +128,7 @@ def test_invalid_value_is_unlimited_and_does_not_raise(tmp_path, monkeypatch, va
 
 
 def test_limit_two_allows_two_at_once(tmp_path, monkeypatch):
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "2")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "2")
     fake = FakeRun(duration=0.2)
     monkeypatch.setattr(subprocess, "run", fake)
     _run_parallel(tmp_path, 3)
@@ -146,21 +146,21 @@ def test_limit_two_allows_two_at_once(tmp_path, monkeypatch):
     ids=["nonzero-returncode", "timeout"],
 )
 def test_permit_released_on_failure(tmp_path, monkeypatch, fake):
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "1")
     monkeypatch.setattr(subprocess, "run", fake)
     src = _sources(tmp_path, 1)[0]
-    assert av1_hook.transcode_to_av1(src, tmp_path / "out") is None
+    assert encode_hook.transcode_file(src, tmp_path / "out") is None
     # A leaked permit would make this block forever.
-    sem = av1_hook._get_gate(1)
+    sem = encode_hook._get_gate(1)
     assert sem.acquire(timeout=2)
     sem.release()
-    assert av1_hook._gate_busy == 0
+    assert encode_hook._gate_busy == 0
 
 
 def test_queue_wait_does_not_consume_encode_timeout(tmp_path, monkeypatch, caplog):
     """Second caller waits longer than the encode timeout yet still succeeds."""
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
-    monkeypatch.setattr(av1_hook, "ENCODE_TIMEOUT_SECONDS", 0.4)
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "1")
+    monkeypatch.setattr(encode_hook, "ENCODE_TIMEOUT_SECONDS", 0.4)
 
     class TimeoutAware(FakeRun):
         def __call__(self, cmd, **kw):
@@ -174,7 +174,7 @@ def test_queue_wait_does_not_consume_encode_timeout(tmp_path, monkeypatch, caplo
 
     fake = TimeoutAware(duration=0.3)
     monkeypatch.setattr(subprocess, "run", fake)
-    with caplog.at_level("INFO", logger=av1_hook.logger.name):
+    with caplog.at_level("INFO", logger=encode_hook.logger.name):
         results = _run_parallel(tmp_path, 2)
     # Total elapsed for the second caller (~0.6s) exceeds the 0.4s budget.
     assert all(r is not None for r in results)
@@ -183,7 +183,7 @@ def test_queue_wait_does_not_consume_encode_timeout(tmp_path, monkeypatch, caplo
 
 
 def test_disabled_hook_never_touches_gate(tmp_path, monkeypatch):
-    monkeypatch.delenv("ENGRAM_AV1_HOOK", raising=False)
+    monkeypatch.delenv("ENGRAM_ENCODE_HOOK", raising=False)
     src = _sources(tmp_path, 1)[0]
-    av1_hook.after_organize(str(src))
-    assert av1_hook._gate_sem is None
+    encode_hook.after_organize(str(src))
+    assert encode_hook._gate_sem is None

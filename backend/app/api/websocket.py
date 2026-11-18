@@ -367,7 +367,7 @@ class ConnectionManager:
         block), so the client keeps what it is showing. ``done`` marks the
         file's last message - finished, failed or timed out - and always comes
         with ``percent`` 100 so a client that only checks the percent drops
-        the row too. Sent from av1_hook's worker thread via
+        the row too. Sent from encode_hook's worker thread via
         ``run_coroutine_threadsafe``, throttled there to one per 2 s per file.
         """
         await self.broadcast(

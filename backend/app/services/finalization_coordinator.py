@@ -32,14 +32,14 @@ from app.services.matching_coordinator import (
 
 logger = logging.getLogger(__name__)
 
-from app.services import av1_hook  # noqa: E402  (post-organize AV1 hook)
+from app.services import encode_hook  # noqa: E402  (post-organize encoding hook)
 
 # The hook never imports the API layer; it publishes encode progress through this.
-av1_hook.set_progress_publisher(ws_manager.broadcast_encode_progress)
+encode_hook.set_progress_publisher(ws_manager.broadcast_encode_progress)
 
 
-def _av1_context(job, disc_title) -> dict | None:
-    """Identification context for the AV1 hook's codec classifier.
+def _encode_context(job, disc_title) -> dict | None:
+    """Identification context for the encoding hook's codec classifier.
 
     A hint only: the classifier trusts its own media probes over any of this.
     Never raises, because building a hint must not be able to disturb filing.
@@ -2331,7 +2331,7 @@ class FinalizationCoordinator:
                     success_count += 1
                     continue
 
-                _av1_pending = None
+                _encode_pending = None
                 source_file = Path(disc_title.output_filename)
                 if source_file.exists():
                     _lib_path = _library_path_for_job(job, "tv")
@@ -2401,10 +2401,10 @@ class FinalizationCoordinator:
                             disc_title.episode_group_id = ordering_group_id
                         disc_title.state = TitleState.COMPLETED
                         logger.info(f"Organized: {org_result['final_path']}")
-                        # The AV1 encode takes ~80 min per episode. Run it AFTER the commit below:
+                        # The encode takes ~80 min per episode. Run it AFTER the commit below:
                         # holding the session open across it left the title at REVIEW with a stale
                         # file_exists flag even though the file had already moved.
-                        _av1_pending = org_result.get("final_path")
+                        _encode_pending = org_result.get("final_path")
                     elif org_result.get("error_code") == "FILE_EXISTS":
                         conflict_count += 1
                         disc_title.state = TitleState.REVIEW
@@ -2431,16 +2431,16 @@ class FinalizationCoordinator:
                     await session.commit()
                     # Encode after the state is durable: a ~80 min encode must not gate the
                     # commit, or the title reads REVIEW/file_exists after its file has moved.
-                    if _av1_pending:
+                    if _encode_pending:
                         # Captured here, in async context: the worker thread has no loop.
-                        _av1_loop = asyncio.get_running_loop()
+                        _encode_loop = asyncio.get_running_loop()
                         await asyncio.to_thread(
-                            av1_hook.after_organize,
-                            _av1_pending,
-                            context=_av1_context(job, disc_title),
-                            loop=_av1_loop,
+                            encode_hook.after_organize,
+                            _encode_pending,
+                            context=_encode_context(job, disc_title),
+                            loop=_encode_loop,
                         )
-                        _av1_pending = None
+                        _encode_pending = None
                     await ws_manager.broadcast_title_update(
                         job_id,
                         disc_title.id,
@@ -2595,7 +2595,7 @@ class FinalizationCoordinator:
                 if not disc_title.output_filename:
                     continue
 
-                _av1_pending = None
+                _encode_pending = None
                 source_file = Path(disc_title.output_filename)
                 if not source_file.exists():
                     logger.warning(f"Source file not found: {source_file}")
@@ -2667,10 +2667,10 @@ class FinalizationCoordinator:
                         disc_title.episode_group_id = ordering_group_id
                     disc_title.state = TitleState.COMPLETED
                     logger.info(f"Organized: {org_result['final_path']}")
-                    # The AV1 encode takes ~80 min per episode. Run it AFTER the commit below:
+                    # The encode takes ~80 min per episode. Run it AFTER the commit below:
                     # holding the session open across it left the title at REVIEW with a stale
                     # file_exists flag even though the file had already moved.
-                    _av1_pending = org_result.get("final_path")
+                    _encode_pending = org_result.get("final_path")
                 elif org_result.get("error_code") == "FILE_EXISTS":
                     conflict_count += 1
                     disc_title.state = TitleState.REVIEW
@@ -2697,16 +2697,16 @@ class FinalizationCoordinator:
                 await session.commit()
                 # Encode after the state is durable: a ~80 min encode must not gate the
                 # commit, or the title reads REVIEW/file_exists after its file has moved.
-                if _av1_pending:
+                if _encode_pending:
                     # Captured here, in async context: the worker thread has no loop.
-                    _av1_loop = asyncio.get_running_loop()
+                    _encode_loop = asyncio.get_running_loop()
                     await asyncio.to_thread(
-                        av1_hook.after_organize,
-                        _av1_pending,
-                        context=_av1_context(job, disc_title),
-                        loop=_av1_loop,
+                        encode_hook.after_organize,
+                        _encode_pending,
+                        context=_encode_context(job, disc_title),
+                        loop=_encode_loop,
                     )
-                    _av1_pending = None
+                    _encode_pending = None
                 await ws_manager.broadcast_title_update(
                     job_id,
                     disc_title.id,

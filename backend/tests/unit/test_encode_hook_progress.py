@@ -1,8 +1,8 @@
-"""Tests for the AV1 hook's encode progress: ffmpeg -progress parsing, the
+"""Tests for the encoding hook's encode progress: ffmpeg -progress parsing, the
 in-memory encoding registry, and publishing over the event loop.
 
-``av1_hook`` is loaded by file path, never through ``app.services`` (same
-convention as ``test_av1_hook_concurrency.py``).
+``encode_hook`` is loaded by file path, never through ``app.services`` (same
+convention as ``test_encode_hook_concurrency.py``).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def _load(name: str):
     return mod
 
 
-av1_hook = _load("av1_hook")
+encode_hook = _load("encode_hook")
 
 DURATION = 100.0
 PROBE = json.dumps(
@@ -73,16 +73,16 @@ progress=end
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
-    monkeypatch.delenv("ENGRAM_AV1_MAX_CONCURRENT", raising=False)
-    monkeypatch.setattr(av1_hook, "_gate_sem", None)
-    monkeypatch.setattr(av1_hook, "_gate_limit", None)
-    monkeypatch.setattr(av1_hook, "_gate_busy", 0)
-    monkeypatch.setattr(av1_hook, "_ENCODING", {})
-    monkeypatch.setattr(av1_hook, "_progress_publisher", None)
+    monkeypatch.delenv("ENGRAM_ENCODE_MAX_CONCURRENT", raising=False)
+    monkeypatch.setattr(encode_hook, "_gate_sem", None)
+    monkeypatch.setattr(encode_hook, "_gate_limit", None)
+    monkeypatch.setattr(encode_hook, "_gate_busy", 0)
+    monkeypatch.setattr(encode_hook, "_ENCODING", {})
+    monkeypatch.setattr(encode_hook, "_progress_publisher", None)
     monkeypatch.setattr(
-        av1_hook, "_FAILED", av1_hook.deque(maxlen=av1_hook.FAILURE_BUFFER_SIZE)
+        encode_hook, "_FAILED", encode_hook.deque(maxlen=encode_hook.FAILURE_BUFFER_SIZE)
     )
-    monkeypatch.setattr(av1_hook, "_RETRY_PENDING", set())
+    monkeypatch.setattr(encode_hook, "_RETRY_PENDING", set())
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ def _reset(monkeypatch):
 
 
 def test_recorded_stream_percent_and_eta():
-    samples = list(av1_hook.iter_progress(RECORDED.splitlines(True), DURATION))
+    samples = list(encode_hook.iter_progress(RECORDED.splitlines(True), DURATION))
     assert len(samples) == 4
 
     first, second, third, last = samples
@@ -111,14 +111,14 @@ def test_recorded_stream_percent_and_eta():
 
 def test_speed_na_yields_no_eta_but_keeps_percent():
     lines = ["out_time_us=25000000\n", "speed=N/A\n", "progress=continue\n"]
-    (sample,) = av1_hook.iter_progress(lines, DURATION)
+    (sample,) = encode_hook.iter_progress(lines, DURATION)
     assert sample["percent"] == 25.0
     assert sample["eta"] is None
     assert sample["speed"] is None
 
 
 def test_missing_speed_yields_no_eta():
-    (sample,) = av1_hook.iter_progress(["out_time_us=1000000\n", "progress=continue\n"], 10.0)
+    (sample,) = encode_hook.iter_progress(["out_time_us=1000000\n", "progress=continue\n"], 10.0)
     assert sample["percent"] == 10.0
     assert sample["eta"] is None
 
@@ -135,31 +135,31 @@ def test_missing_speed_yields_no_eta():
     ],
 )
 def test_compute_progress_clamps(out_time, speed, duration, expected):
-    assert av1_hook.compute_progress(out_time, speed, duration) == expected
+    assert encode_hook.compute_progress(out_time, speed, duration) == expected
 
 
 @pytest.mark.parametrize("raw, value", [("0.216x", 0.216), ("1x", 1.0), ("N/A", None),
                                         ("", None), (None, None), ("0x", None), ("fast", None)])
 def test_parse_speed(raw, value):
-    assert av1_hook._parse_speed(raw) == value
+    assert encode_hook._parse_speed(raw) == value
 
 
 def test_out_time_ms_is_a_fallback_for_out_time_us():
     lines = ["out_time_ms=5000000\n", "speed=1x\n", "progress=continue\n"]
-    (sample,) = av1_hook.iter_progress(lines, 10.0)
+    (sample,) = encode_hook.iter_progress(lines, 10.0)
     assert sample["percent"] == 50.0 and sample["eta"] == 5
 
 
 def test_garbage_lines_are_ignored():
     lines = ["\n", "not a key value\n", "out_time_us=junk\n", "progress=continue\n"]
-    (sample,) = av1_hook.iter_progress(lines, 10.0)
+    (sample,) = encode_hook.iter_progress(lines, 10.0)
     assert sample["percent"] is None
 
 
 def test_duration_comes_from_format():
-    assert av1_hook._duration_seconds(json.loads(PROBE)) == DURATION
-    assert av1_hook._duration_seconds({}) is None
-    assert av1_hook._duration_seconds({"format": {"duration": "N/A"}}) is None
+    assert encode_hook._duration_seconds(json.loads(PROBE)) == DURATION
+    assert encode_hook._duration_seconds({}) is None
+    assert encode_hook._duration_seconds({"format": {"duration": "N/A"}}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ class ProgressRun:
             # Let the reader thread catch up before sampling the registry (well
             # inside the 2 s publish throttle, which a test relies on).
             time.sleep(0.1)
-            self.seen.append(av1_hook.encoding_snapshot())
+            self.seen.append(encode_hook.encoding_snapshot())
         if self.gate is not None:
             self.gate.wait(5)
         if self.raises is not None:
@@ -223,22 +223,22 @@ def _src(tmp_path: Path) -> Path:
 def test_command_reports_progress_on_stdout(tmp_path, monkeypatch):
     fake = ProgressRun(_blocks())
     monkeypatch.setattr(subprocess, "run", fake)
-    av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out")
+    encode_hook.transcode_file(_src(tmp_path), tmp_path / "out")
     i = fake.cmd.index("-progress")
     assert fake.cmd[i + 1] == "pipe:1" and "-nostats" in fake.cmd
     assert fake.cmd[-1].endswith(".partial.mkv")  # output stays last
     # stderr is still captured for the failure log line; stdin is detached.
     assert fake.encode_kwargs["stderr"] == subprocess.PIPE
     assert fake.encode_kwargs["stdin"] == subprocess.DEVNULL
-    assert fake.encode_kwargs["timeout"] == av1_hook.ENCODE_TIMEOUT_SECONDS
+    assert fake.encode_kwargs["timeout"] == encode_hook.ENCODE_TIMEOUT_SECONDS
 
 
 def test_snapshot_empty_before_populated_during_empty_after_success(tmp_path, monkeypatch):
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
     fake = ProgressRun(_blocks())
     monkeypatch.setattr(subprocess, "run", fake)
     src = _src(tmp_path)
-    out = av1_hook.transcode_to_av1(src, tmp_path / "out")
+    out = encode_hook.transcode_file(src, tmp_path / "out")
     assert out == tmp_path / "out" / src.name
 
     during = fake.seen[2]
@@ -251,7 +251,7 @@ def test_snapshot_empty_before_populated_during_empty_after_success(tmp_path, mo
     assert row["speed"] == "0.25x"
     assert row["codec"] == "av1"
     assert isinstance(row["started_at"], float)
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
 
 
 @pytest.mark.parametrize(
@@ -262,30 +262,30 @@ def test_snapshot_empty_before_populated_during_empty_after_success(tmp_path, mo
 def test_snapshot_empty_after_failed_encode(tmp_path, monkeypatch, kwargs):
     fake = ProgressRun(_blocks()[:2], **kwargs)
     monkeypatch.setattr(subprocess, "run", fake)
-    assert av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out") is None
+    assert encode_hook.transcode_file(_src(tmp_path), tmp_path / "out") is None
     assert fake.seen[-1] and fake.seen[-1][0]["percent"] == 8.0
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
 
 
 def test_failed_encode_still_logs_stderr(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(subprocess, "run", ProgressRun([], returncode=1))
-    with caplog.at_level("ERROR", logger=av1_hook.logger.name):
-        av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out")
+    with caplog.at_level("ERROR", logger=encode_hook.logger.name):
+        encode_hook.transcode_file(_src(tmp_path), tmp_path / "out")
     assert any("ffmpeg: boom" in r.getMessage() for r in caplog.records)
 
 
 def test_snapshot_returns_a_copy_sorted_by_start(monkeypatch):
-    av1_hook._ENCODING["/b"] = {"file": "b", "started_at": 2.0, "percent": 1.0}
-    av1_hook._ENCODING["/a"] = {"file": "a", "started_at": 1.0, "percent": 1.0}
-    snap = av1_hook.encoding_snapshot()
+    encode_hook._ENCODING["/b"] = {"file": "b", "started_at": 2.0, "percent": 1.0}
+    encode_hook._ENCODING["/a"] = {"file": "a", "started_at": 1.0, "percent": 1.0}
+    snap = encode_hook.encoding_snapshot()
     assert [r["file"] for r in snap] == ["a", "b"]
     snap[0]["percent"] = 99.0
-    assert av1_hook._ENCODING["/a"]["percent"] == 1.0
+    assert encode_hook._ENCODING["/a"]["percent"] == 1.0
 
 
 def test_queued_file_is_not_listed(tmp_path, monkeypatch):
     """Limit 1: the second file waits for a permit and must not show as encoding."""
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "1")
     gate = threading.Event()
     fake = ProgressRun(_blocks()[:2], gate=gate)
     monkeypatch.setattr(subprocess, "run", fake)
@@ -294,20 +294,20 @@ def test_queued_file_is_not_listed(tmp_path, monkeypatch):
     a.write_bytes(b"a")
     b.write_bytes(b"b")
     threads = [
-        threading.Thread(target=av1_hook.transcode_to_av1, args=(p, tmp_path / "out"))
+        threading.Thread(target=encode_hook.transcode_file, args=(p, tmp_path / "out"))
         for p in (a, b)
     ]
     for t in threads:
         t.start()
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and av1_hook._gate_busy == 0:
+    while time.monotonic() < deadline and encode_hook._gate_busy == 0:
         time.sleep(0.01)
     time.sleep(0.2)  # let the second thread reach the semaphore
-    assert len(av1_hook.encoding_snapshot()) == 1
+    assert len(encode_hook.encoding_snapshot()) == 1
     gate.set()
     for t in threads:
         t.join(timeout=10)
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
 
 
 # ---------------------------------------------------------------------------
@@ -321,9 +321,9 @@ def test_no_loop_skips_publishing_and_still_encodes(tmp_path, monkeypatch):
     async def publisher(**kw):
         called.append(kw)
 
-    av1_hook.set_progress_publisher(publisher)
+    encode_hook.set_progress_publisher(publisher)
     monkeypatch.setattr(subprocess, "run", ProgressRun(_blocks()))
-    assert av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out") is not None
+    assert encode_hook.transcode_file(_src(tmp_path), tmp_path / "out") is not None
     assert called == []
 
 
@@ -333,14 +333,14 @@ def test_progress_published_on_loop_throttled_and_terminated(tmp_path, monkeypat
     async def publisher(**kw):
         received.append(kw)
 
-    av1_hook.set_progress_publisher(publisher)
+    encode_hook.set_progress_publisher(publisher)
     loop = asyncio.new_event_loop()
     runner = threading.Thread(target=loop.run_forever, daemon=True)
     runner.start()
     try:
         monkeypatch.setattr(subprocess, "run", ProgressRun(_blocks()))
         src = _src(tmp_path)
-        assert av1_hook.transcode_to_av1(src, tmp_path / "out", loop=loop) is not None
+        assert encode_hook.transcode_file(src, tmp_path / "out", loop=loop) is not None
         # Let scheduled coroutines run.
         asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(2)
     finally:
@@ -365,14 +365,14 @@ def test_publisher_failure_never_breaks_the_encode(tmp_path, monkeypatch):
     def publisher(**kw):
         raise RuntimeError("socket gone")
 
-    av1_hook.set_progress_publisher(publisher)
+    encode_hook.set_progress_publisher(publisher)
     loop = asyncio.new_event_loop()
     try:
         monkeypatch.setattr(subprocess, "run", ProgressRun(_blocks()))
-        assert av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out", loop=loop) is not None
+        assert encode_hook.transcode_file(_src(tmp_path), tmp_path / "out", loop=loop) is not None
     finally:
         loop.close()
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
 
 
 @pytest.mark.skipif(
@@ -386,20 +386,20 @@ def test_real_ffmpeg_progress_stream_is_parsed(tmp_path, monkeypatch):
          "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
         check=True,
     )
-    monkeypatch.setenv("ENGRAM_AV1_PRESET", "12")
-    monkeypatch.setenv("ENGRAM_AV1_THREADS", "2")
+    monkeypatch.setenv("ENGRAM_ENCODE_PRESET", "12")
+    monkeypatch.setenv("ENGRAM_ENCODE_THREADS", "2")
     received: list[dict] = []
 
     async def publisher(**kw):
         received.append(kw)
 
-    av1_hook.set_progress_publisher(publisher)
-    monkeypatch.setattr(av1_hook, "PROGRESS_PUBLISH_INTERVAL", 0.0)  # see every sample
+    encode_hook.set_progress_publisher(publisher)
+    monkeypatch.setattr(encode_hook, "PROGRESS_PUBLISH_INTERVAL", 0.0)  # see every sample
     loop = asyncio.new_event_loop()
     runner = threading.Thread(target=loop.run_forever, daemon=True)
     runner.start()
     try:
-        out = av1_hook.transcode_to_av1(src, tmp_path / "out", loop=loop)
+        out = encode_hook.transcode_file(src, tmp_path / "out", loop=loop)
         asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(2)
     finally:
         loop.call_soon_threadsafe(loop.stop)
@@ -411,24 +411,24 @@ def test_real_ffmpeg_progress_stream_is_parsed(tmp_path, monkeypatch):
     # Registration (0%) plus at least the progress=end sample (100%).
     assert any(m["percent"] == 100.0 for m in progress)
     assert received[-1]["done"] is True
-    assert av1_hook.encoding_snapshot() == []
+    assert encode_hook.encoding_snapshot() == []
 
 
 def test_after_organize_forwards_loop(tmp_path, monkeypatch):
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "out"))
     # The fixture file stands in for a rip in Engram's staging root.
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(tmp_path),))
     seen = {}
 
     def fake_transcode(src, staging, plan=None, *, loop=None):
         seen["loop"] = loop
         return None
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
     sentinel = object()
-    av1_hook.after_organize(str(_src(tmp_path)), loop=sentinel)
+    encode_hook.after_organize(str(_src(tmp_path)), loop=sentinel)
     assert seen["loop"] is sentinel
 
 
@@ -436,7 +436,7 @@ def test_after_organize_refuses_a_library_path(tmp_path, monkeypatch, caplog):
     """A file in the library (``/media/tv``) is never Engram's to encode.
 
     Regression for the hook re-encoding files it never produced: the domain is
-    the staging root plus ``ENGRAM_AV1_STAGING``, and a library path is refused
+    the staging root plus ``ENGRAM_ENCODE_STAGING``, and a library path is refused
     before classification, encoding, or any marker write.
     """
     media = tmp_path / "media"
@@ -445,18 +445,18 @@ def test_after_organize_refuses_a_library_path(tmp_path, monkeypatch, caplog):
     show.mkdir(parents=True)
     src = show / "Show - S01E01.mkv"
     src.write_bytes(b"legacy rip")
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(media / "_staging"),))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "out"))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(media / "_staging"),))
     calls = []
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(encode_hook, "transcode_file", lambda *a, **k: calls.append(a))
 
-    with caplog.at_level("WARNING", logger=av1_hook.logger.name):
-        av1_hook.after_organize(str(src))
+    with caplog.at_level("WARNING", logger=encode_hook.logger.name):
+        encode_hook.after_organize(str(src))
 
     assert calls == []
-    assert not av1_hook._marker_path(src).exists()
+    assert not encode_hook._marker_path(src).exists()
     assert any(
         "refusing to encode" in r.getMessage() and "outside Engram's domain" in r.getMessage()
         for r in caplog.records
@@ -471,9 +471,9 @@ def test_after_organize_refuses_a_library_path(tmp_path, monkeypatch, caplog):
 def test_failed_encode_lands_in_the_failure_buffer(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", ProgressRun([], returncode=1))
     src = _src(tmp_path)
-    assert av1_hook.transcode_to_av1(src, tmp_path / "out") is None
+    assert encode_hook.transcode_file(src, tmp_path / "out") is None
 
-    status = av1_hook.encoding_status()
+    status = encode_hook.encoding_status()
     assert status["active"] == []
     assert len(status["failed"]) == 1
     row = status["failed"][0]
@@ -487,8 +487,8 @@ def test_failed_encode_lands_in_the_failure_buffer(tmp_path, monkeypatch):
 def test_timeout_reason_is_recorded(tmp_path, monkeypatch):
     fake = ProgressRun([], raises=subprocess.TimeoutExpired("ffmpeg", 1))
     monkeypatch.setattr(subprocess, "run", fake)
-    av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out")
-    assert av1_hook.failures_snapshot()[0]["reason"] == "Encode timed out"
+    encode_hook.transcode_file(_src(tmp_path), tmp_path / "out")
+    assert encode_hook.failures_snapshot()[0]["reason"] == "Encode timed out"
 
 
 def test_failure_buffer_caps_at_twenty_newest_first(tmp_path, monkeypatch):
@@ -496,9 +496,9 @@ def test_failure_buffer_caps_at_twenty_newest_first(tmp_path, monkeypatch):
     for i in range(25):
         p = tmp_path / f"ep{i:02d}.mkv"
         p.write_bytes(b"x")
-        av1_hook.transcode_to_av1(p, tmp_path / "out")
-    failed = av1_hook.failures_snapshot()
-    assert len(failed) == av1_hook.FAILURE_BUFFER_SIZE == 20
+        encode_hook.transcode_file(p, tmp_path / "out")
+    failed = encode_hook.failures_snapshot()
+    assert len(failed) == encode_hook.FAILURE_BUFFER_SIZE == 20
     assert failed[0]["file"] == "ep24.mkv"
     assert failed[-1]["file"] == "ep05.mkv"
 
@@ -506,19 +506,19 @@ def test_failure_buffer_caps_at_twenty_newest_first(tmp_path, monkeypatch):
 def test_failure_buffer_keeps_one_row_per_source(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", ProgressRun([], returncode=1))
     src = _src(tmp_path)
-    av1_hook.transcode_to_av1(src, tmp_path / "out")
-    av1_hook.transcode_to_av1(src, tmp_path / "out")
-    assert len(av1_hook.failures_snapshot()) == 1
+    encode_hook.transcode_file(src, tmp_path / "out")
+    encode_hook.transcode_file(src, tmp_path / "out")
+    assert len(encode_hook.failures_snapshot()) == 1
 
 
 def test_successful_encode_clears_its_failure(tmp_path, monkeypatch):
     src = _src(tmp_path)
     monkeypatch.setattr(subprocess, "run", ProgressRun([], returncode=1))
-    av1_hook.transcode_to_av1(src, tmp_path / "out")
-    assert av1_hook.failures_snapshot()
+    encode_hook.transcode_file(src, tmp_path / "out")
+    assert encode_hook.failures_snapshot()
     monkeypatch.setattr(subprocess, "run", ProgressRun([]))
-    assert av1_hook.transcode_to_av1(src, tmp_path / "out") is not None
-    assert av1_hook.failures_snapshot() == []
+    assert encode_hook.transcode_file(src, tmp_path / "out") is not None
+    assert encode_hook.failures_snapshot() == []
 
 
 def test_failure_is_recorded_before_the_terminal_publish(tmp_path, monkeypatch):
@@ -527,15 +527,15 @@ def test_failure_is_recorded_before_the_terminal_publish(tmp_path, monkeypatch):
 
     async def publisher(**kw):
         if kw["done"]:
-            seen_on_done.append(av1_hook.failures_snapshot())
+            seen_on_done.append(encode_hook.failures_snapshot())
 
-    av1_hook.set_progress_publisher(publisher)
+    encode_hook.set_progress_publisher(publisher)
     monkeypatch.setattr(subprocess, "run", ProgressRun([], returncode=1))
     loop = asyncio.new_event_loop()
     runner = threading.Thread(target=loop.run_forever, daemon=True)
     runner.start()
     try:
-        av1_hook.transcode_to_av1(_src(tmp_path), tmp_path / "out", loop=loop)
+        encode_hook.transcode_file(_src(tmp_path), tmp_path / "out", loop=loop)
         time.sleep(0.2)
     finally:
         loop.call_soon_threadsafe(loop.stop)
@@ -557,12 +557,12 @@ def hook_env(tmp_path, monkeypatch):
     anything outside ``_DOMAIN_ROOTS``, so the fixture must be inside the domain
     for a retry to reach the encoder at all.
     """
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "1")
     monkeypatch.setenv("ENGRAM_CODEC_CLASSIFIER", "0")
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "out"))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "out"))
     staging_root = tmp_path / "_staging"
     staging_root.mkdir()
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(staging_root),))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(staging_root),))
     return staging_root
 
 
@@ -574,9 +574,9 @@ def _staged_src(root: Path, name: str = "Show - S01E01.mkv") -> Path:
 
 def _write_done_marker(src: Path) -> Path:
     st = src.stat()
-    marker = av1_hook._marker_path(src)
+    marker = encode_hook._marker_path(src)
     marker.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime), "av1": "x"}))
-    assert av1_hook._already_done(src)
+    assert encode_hook._already_done(src)
     return marker
 
 
@@ -600,37 +600,37 @@ def test_retry_deletes_marker_and_starts_an_encode(hook_env, monkeypatch):
         done.set()
         return None
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
     sentinel = object()
-    assert av1_hook.retry_encode(str(src), loop=sentinel, roots=[hook_env]) is None
+    assert encode_hook.retry_encode(str(src), loop=sentinel, roots=[hook_env]) is None
     assert done.wait(5), "retry never reached the encoder"
     assert not marker.exists()
     assert calls == [{"src": src.resolve(), "marker_present": False, "loop": sentinel}]
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
 
 
 def test_retry_goes_through_the_shared_gate_and_registry(hook_env, monkeypatch):
     """A retried file takes an encode permit and shows in the active registry."""
-    monkeypatch.setenv("ENGRAM_AV1_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("ENGRAM_ENCODE_MAX_CONCURRENT", "1")
     src = _staged_src(hook_env)
     _write_done_marker(src)
     gate = threading.Event()
     monkeypatch.setattr(subprocess, "run", ProgressRun(_blocks()[:2], gate=gate))
 
-    av1_hook.retry_encode(src, roots=[hook_env])
-    assert _wait_for(lambda: av1_hook._gate_busy == 1)
-    assert [r["file"] for r in av1_hook.encoding_snapshot()] == [src.name]
+    encode_hook.retry_encode(src, roots=[hook_env])
+    assert _wait_for(lambda: encode_hook._gate_busy == 1)
+    assert [r["file"] for r in encode_hook.encoding_snapshot()] == [src.name]
     gate.set()
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
-    assert av1_hook.encoding_snapshot() == []
-    assert av1_hook._gate_busy == 0
-    assert av1_hook._already_done(src)  # a fresh marker for the new revision
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
+    assert encode_hook.encoding_snapshot() == []
+    assert encode_hook._gate_busy == 0
+    assert encode_hook._already_done(src)  # a fresh marker for the new revision
 
 
 def test_retry_moves_the_row_out_of_failed(hook_env, monkeypatch):
     src = _staged_src(hook_env)
-    av1_hook._record_failure(src.resolve(), av1_hook._staging_dir() / src.name, "boom")
-    assert len(av1_hook.failures_snapshot()) == 1
+    encode_hook._record_failure(src.resolve(), encode_hook._staging_dir() / src.name, "boom")
+    assert len(encode_hook.failures_snapshot()) == 1
     started = threading.Event()
     release = threading.Event()
 
@@ -639,12 +639,12 @@ def test_retry_moves_the_row_out_of_failed(hook_env, monkeypatch):
         release.wait(5)
         return None
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
-    av1_hook.retry_encode(src, roots=[hook_env])
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
+    encode_hook.retry_encode(src, roots=[hook_env])
     assert started.wait(5)
-    assert av1_hook.failures_snapshot() == []
+    assert encode_hook.failures_snapshot() == []
     release.set()
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
 
 
 @pytest.mark.parametrize("name", ["missing.mkv", "notes.txt"])
@@ -652,59 +652,59 @@ def test_retry_refuses_missing_or_non_mkv(hook_env, name):
     path = hook_env / name
     if name.endswith(".txt"):
         path.write_text("x")
-    with pytest.raises(av1_hook.RetryNotFound) as exc:
-        av1_hook.retry_encode(path, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryNotFound) as exc:
+        encode_hook.retry_encode(path, roots=[hook_env])
     assert exc.value.status == 404
-    assert not av1_hook._RETRY_PENDING
+    assert not encode_hook._RETRY_PENDING
 
 
 def test_retry_refuses_a_directory(hook_env):
     d = hook_env / "Season 01.mkv"
     d.mkdir()
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(d, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(d, roots=[hook_env])
 
 
 def test_retry_refuses_paths_outside_the_roots(hook_env, tmp_path):
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     src = _staged_src(outside)
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(src, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(src, roots=[hook_env])
     # ``..`` cannot climb out of a root either.
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(hook_env / ".." / "elsewhere" / src.name, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(hook_env / ".." / "elsewhere" / src.name, roots=[hook_env])
 
 
 def test_retry_refuses_a_sibling_prefix_root(hook_env, tmp_path):
     sibling = tmp_path / "_staging-old"
     sibling.mkdir()
     src = _staged_src(sibling)
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(src, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(src, roots=[hook_env])
 
 
 def test_retry_without_roots_fails_closed(hook_env, tmp_path, monkeypatch):
     """No roots: only Engram's domain is allowed, never a file outside it."""
     elsewhere = tmp_path / "media" / "_staging"
     elsewhere.mkdir(parents=True)
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(elsewhere),))
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(tmp_path / "staging" / "av1-out"))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(elsewhere),))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(tmp_path / "staging" / "av1-out"))
     src = _staged_src(hook_env)
-    with pytest.raises(av1_hook.RetryNotFound):
-        av1_hook.retry_encode(src)
-    assert not av1_hook._RETRY_PENDING
+    with pytest.raises(encode_hook.RetryNotFound):
+        encode_hook.retry_encode(src)
+    assert not encode_hook._RETRY_PENDING
 
 
 def test_retry_refused_while_the_file_is_encoding(hook_env, monkeypatch):
     src = _staged_src(hook_env)
     marker = _write_done_marker(src)
-    key = str(av1_hook._staging_dir() / src.name)
-    av1_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
+    key = str(encode_hook._staging_dir() / src.name)
+    encode_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
     called = []
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", lambda *a, **k: called.append(a))
-    with pytest.raises(av1_hook.RetryConflict) as exc:
-        av1_hook.retry_encode(src, roots=[hook_env])
+    monkeypatch.setattr(encode_hook, "transcode_file", lambda *a, **k: called.append(a))
+    with pytest.raises(encode_hook.RetryConflict) as exc:
+        encode_hook.retry_encode(src, roots=[hook_env])
     assert exc.value.status == 409
     assert marker.exists(), "a refused retry must not touch the marker"
     assert called == []
@@ -722,26 +722,26 @@ def test_second_retry_refused_while_the_first_is_queued(hook_env, monkeypatch):
         release.wait(5)
         return None
 
-    monkeypatch.setattr(av1_hook, "transcode_to_av1", fake_transcode)
-    av1_hook.retry_encode(src, roots=[hook_env])
+    monkeypatch.setattr(encode_hook, "transcode_file", fake_transcode)
+    encode_hook.retry_encode(src, roots=[hook_env])
     assert started.wait(5)
-    with pytest.raises(av1_hook.RetryConflict):
-        av1_hook.retry_encode(src, roots=[hook_env])
+    with pytest.raises(encode_hook.RetryConflict):
+        encode_hook.retry_encode(src, roots=[hook_env])
     release.set()
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
     assert len(calls) == 1
     # Once finished, the file can be retried again.
-    av1_hook.retry_encode(src, roots=[hook_env])
+    encode_hook.retry_encode(src, roots=[hook_env])
     assert _wait_for(lambda: len(calls) == 2)
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
 
 
 def test_retry_refused_when_the_hook_is_disabled(hook_env, monkeypatch):
-    monkeypatch.setenv("ENGRAM_AV1_HOOK", "0")
+    monkeypatch.setenv("ENGRAM_ENCODE_HOOK", "0")
     src = _staged_src(hook_env)
-    with pytest.raises(av1_hook.RetryConflict):
-        av1_hook.retry_encode(src, roots=[hook_env])
-    assert not av1_hook._RETRY_PENDING
+    with pytest.raises(encode_hook.RetryConflict):
+        encode_hook.retry_encode(src, roots=[hook_env])
+    assert not encode_hook._RETRY_PENDING
 
 
 def test_retry_worker_never_raises(hook_env, monkeypatch):
@@ -750,9 +750,9 @@ def test_retry_worker_never_raises(hook_env, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("encoder exploded")
 
-    monkeypatch.setattr(av1_hook, "after_organize", boom)
-    av1_hook.retry_encode(src, roots=[hook_env])
-    assert _wait_for(lambda: not av1_hook._RETRY_PENDING)
+    monkeypatch.setattr(encode_hook, "after_organize", boom)
+    encode_hook.retry_encode(src, roots=[hook_env])
+    assert _wait_for(lambda: not encode_hook._RETRY_PENDING)
 
 
 def test_default_retry_roots_skip_empty_and_honour_only_in_domain_paths(monkeypatch, tmp_path):
@@ -763,34 +763,34 @@ def test_default_retry_roots_skip_empty_and_honour_only_in_domain_paths(monkeypa
     staging = tmp_path / "staging" / "av1-out"
     for d in (inside, outside, staging):
         d.mkdir(parents=True)
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(staging))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(staging))
 
-    roots = av1_hook.default_retry_roots([str(inside), str(outside), "", None])
+    roots = encode_hook.default_retry_roots([str(inside), str(outside), "", None])
 
     assert roots == [domain, inside, staging]
     assert outside not in roots
 
 
 def test_domain_roots_are_staging_only_never_the_library(monkeypatch, tmp_path):
-    """The domain is the staging root plus ENGRAM_AV1_STAGING; /media/tv and
+    """The domain is the staging root plus ENGRAM_ENCODE_STAGING; /media/tv and
     /media/movies are the library and stay out even when configured as library paths.
     """
-    assert av1_hook._DOMAIN_ROOTS == ("/media/_staging",)
-    assert not {"/media/tv", "/media/movies"} & set(av1_hook._DOMAIN_ROOTS)
+    assert encode_hook._DOMAIN_ROOTS == ("/media/_staging",)
+    assert not {"/media/tv", "/media/movies"} & set(encode_hook._DOMAIN_ROOTS)
 
     media = tmp_path / "media"
     domain, tv, movies = media / "_staging", media / "tv", media / "movies"
     staging = tmp_path / "staging" / "av1-out"
     for d in (domain, tv, movies, staging):
         d.mkdir(parents=True)
-    monkeypatch.setattr(av1_hook, "_DOMAIN_ROOTS", (str(domain),))
-    monkeypatch.setenv("ENGRAM_AV1_STAGING", str(staging))
+    monkeypatch.setattr(encode_hook, "_DOMAIN_ROOTS", (str(domain),))
+    monkeypatch.setenv("ENGRAM_ENCODE_STAGING", str(staging))
 
-    roots = av1_hook.domain_roots([str(tv), str(movies)])
+    roots = encode_hook.domain_roots([str(tv), str(movies)])
 
     assert roots == [domain, staging]
-    assert av1_hook.in_domain(domain / "Show - S01E01.mkv", [str(tv), str(movies)])
-    assert av1_hook.in_domain(staging / "Show - S01E01.mkv")
-    assert not av1_hook.in_domain(tv / "Show - S01E01.mkv", [str(tv), str(movies)])
-    assert not av1_hook.in_domain(movies / "Film (2010).mkv", [str(tv), str(movies)])
+    assert encode_hook.in_domain(domain / "Show - S01E01.mkv", [str(tv), str(movies)])
+    assert encode_hook.in_domain(staging / "Show - S01E01.mkv")
+    assert not encode_hook.in_domain(tv / "Show - S01E01.mkv", [str(tv), str(movies)])
+    assert not encode_hook.in_domain(movies / "Film (2010).mkv", [str(tv), str(movies)])
