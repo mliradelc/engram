@@ -161,7 +161,7 @@ function MainDashboard() {
   }, [showImport]);
 
   // Job management with WebSocket
-  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, encodeFailures, retryEncode, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
+  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, encodeFailures, retryEncode, dismissEncodeFailure, loadEncodeOverride, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
 
   // Footer facts (#720): the detected optical drives and the effective ASR device.
   // Both are hardware/runtime facts that change rarely, so refresh on (re)connect
@@ -692,7 +692,13 @@ function MainDashboard() {
             column, so it is seen without scrolling. Always rendered, idle
             included; failed encodes list here with Retry. */}
         <div style={{ marginBottom: 14 }}>
-          <EncodeProgressPanel encodes={encodes} failures={encodeFailures} onRetry={retryEncode} />
+          <EncodeProgressPanel
+            encodes={encodes}
+            failures={encodeFailures}
+            onRetry={retryEncode}
+            onDismiss={dismissEncodeFailure}
+            loadOverride={loadEncodeOverride}
+          />
         </div>
         {filteredDiscs.length === 0 ? (
           <motion.div

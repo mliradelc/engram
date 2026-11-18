@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ApiError, apiFetch, apiFetchVoid, seasonAnswerBody, skipRipTitle, unskipRipTitle } from '../../api/client';
 import { recoveryErrorMessage, retryFromStaging } from '../../api/recoveryClient';
-import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage, EncodeFailure, EncodingStatus, EncodeRetryRequest, EncodeRetryResponse } from '../../types';
+import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage, EncodeFailure, EncodingStatus, EncodeRetryRequest, EncodeRetryResponse, EncodeClass, EncodeOverrideStatus, EncodeDismissResponse } from '../../types';
 import type { ArmedIdentity } from '../components/ArmedDriveCard';
 
 // Trailing-debounce window for refetches triggered by a burst of unknown
@@ -113,6 +113,10 @@ export function applyEncodeProgress(
         eta: data.eta ?? prev?.eta ?? null,
         speed: data.speed ?? prev?.speed ?? null,
         codec: data.codec ?? prev?.codec ?? null,
+        // `encode_progress` does not carry the class; it comes from the REST
+        // snapshot (or the optimistic retry row) and must survive every sample.
+        codec_class: prev?.codec_class ?? null,
+        forced: prev?.forced ?? false,
         started_at: prev?.started_at,
     });
     return next;
@@ -152,6 +156,7 @@ export function applyRetryOptimistic(
     encodes: Map<string, EncodeProgress>,
     failures: EncodeFailure[],
     failure: EncodeFailure,
+    codecClass?: EncodeClass,
 ): { encodes: Map<string, EncodeProgress>; failures: EncodeFailure[] } {
     const nextEncodes = new Map(encodes);
     if (!nextEncodes.has(failure.file)) {
@@ -162,6 +167,9 @@ export function applyRetryOptimistic(
             eta: null,
             speed: null,
             codec: null,
+            // Auto: unknown until the classifier runs (the snapshot fills it in).
+            codec_class: codecClass ?? null,
+            forced: codecClass !== undefined,
             started_at: Date.now() / 1000,
         });
     }
@@ -189,6 +197,9 @@ export function useJobManagement(devMode: boolean = false) {
     // Seeded from GET /api/encoding (late-joining tab), then folded from
     // `encode_progress` messages.
     const [encodes, setEncodes] = useState<Map<string, EncodeProgress>>(() => new Map());
+    // Files whose class this tab has fetched since their encode started. The
+    // WS message does not carry the class, so each start triggers one snapshot.
+    const encodeClassFetched = useRef(new Set<string>());
     // Recently-failed encodes (backend ring buffer, newest first); each row
     // offers Retry. REST-only: refreshed on seed, reconnect and every `done`.
     const [encodeFailures, setEncodeFailures] = useState<EncodeFailure[]>([]);
@@ -329,13 +340,29 @@ export function useJobManagement(devMode: boolean = false) {
         }
     }, []);
 
-    // Retry a failed encode. Optimistically moves the row to `active`; on a
-    // refusal, rolls back by resyncing from the server (which knows the truth).
-    const retryEncode = useCallback(async (failure: EncodeFailure) => {
-        setEncodes((prev) => applyRetryOptimistic(prev, [], failure).encodes);
+    // Retry a failed encode, forcing `codecClass` (persisted as the file's pin
+    // by the backend) or, for Auto, letting the classifier decide. Optimistically
+    // moves the row to `active`; on a refusal, rolls back by resyncing from the
+    // server (which knows the truth).
+    const retryEncode = useCallback(async (failure: EncodeFailure, codecClass?: EncodeClass) => {
+        setEncodes((prev) => applyRetryOptimistic(prev, [], failure, codecClass).encodes);
         setEncodeFailures((prev) => applyRetryOptimistic(new Map(), prev, failure).failures);
         try {
-            const body: EncodeRetryRequest = { file: failure.source };
+            if (codecClass === undefined) {
+                // Auto must mean the classifier: a retry without a class still
+                // honours a stored pin, so clear it first. 404 (no such file in
+                // the domain) is left for the retry itself to report.
+                try {
+                    await apiFetchVoid(`/api/encoding/override?file=${encodeURIComponent(failure.source)}`, {
+                        method: 'DELETE',
+                    });
+                } catch (error) {
+                    if (!(error instanceof ApiError && error.status === 404)) throw error;
+                }
+            }
+            const body: EncodeRetryRequest = codecClass === undefined
+                ? { file: failure.source }
+                : { file: failure.source, codec_class: codecClass };
             await apiFetch<EncodeRetryResponse>('/api/encoding/retry', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -351,6 +378,32 @@ export function useJobManagement(devMode: boolean = false) {
             await syncEncodes();
         }
     }, [syncEncodes]);
+
+    // Clear a failed row from the panel (the backend's buffer is in-memory).
+    const dismissEncodeFailure = useCallback(async (failure: EncodeFailure) => {
+        setEncodeFailures((prev) => prev.filter((f) => f.source !== failure.source));
+        try {
+            await apiFetch<EncodeDismissResponse>('/api/encoding/dismiss', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ file: failure.source }),
+            });
+        } catch (error) {
+            toast.error(`Could not dismiss ${failure.file}. ${errorText(error)}`);
+            await syncEncodes();
+        }
+    }, [syncEncodes]);
+
+    // The stored codec-class pin for one source (GET /api/encoding/override).
+    const loadEncodeOverride = useCallback(async (source: string): Promise<EncodeOverrideStatus | null> => {
+        try {
+            return await apiFetch<EncodeOverrideStatus>(
+                `/api/encoding/override?file=${encodeURIComponent(source)}`,
+            );
+        } catch {
+            return null; // Non-critical: the selector falls back to Auto.
+        }
+    }, []);
 
     // Resync on (re)connect so the UI recovers from any drift while disconnected.
     const handleSocketOpen = useCallback(() => {
@@ -637,6 +690,14 @@ export function useJobManagement(devMode: boolean = false) {
                     break;
 
                 case 'encode_progress':
+                    // An encode started (or an Auto retry began): fetch the snapshot
+                    // once for its class, which `encode_progress` does not carry.
+                    if (message.done) {
+                        encodeClassFetched.current.delete(message.file);
+                    } else if (!encodeClassFetched.current.has(message.file)) {
+                        encodeClassFetched.current.add(message.file);
+                        void syncEncodes();
+                    }
                     setEncodes(prev => applyEncodeProgress(prev, message));
                     // A finished encode may have failed; failures are REST-only,
                     // and the backend records one before sending `done`.
@@ -702,6 +763,8 @@ export function useJobManagement(devMode: boolean = false) {
         encodes,
         encodeFailures,
         retryEncode,
+        dismissEncodeFailure,
+        loadEncodeOverride,
         cancelJob,
         ejectJob,
         advanceJob,

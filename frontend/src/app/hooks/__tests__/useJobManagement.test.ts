@@ -797,3 +797,118 @@ describe("applyBackupProgress", () => {
     expect(result[0].eta_seconds).toBe(600);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Encode retry with a codec class, dismiss, and the stored pin
+// ---------------------------------------------------------------------------
+
+describe("encode retry / dismiss / override", () => {
+  const failure = {
+    file: "Show - S01E02.mkv",
+    source: "/media/_staging/tv/Show - S01E02.mkv",
+    destination_folder: "/staging/av1-out",
+    reason: "ffmpeg exited 1",
+    codec_class: "live_action_clean",
+    forced: false,
+    failed_at: 1,
+  };
+
+  beforeEach(() => {
+    toastErrorMock.mockClear();
+    toastSuccessMock.mockClear();
+    toastWarningMock.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubEncoding(overrides: Record<string, () => Response> = {}) {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.includes("/api/encoding")) {
+          calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+          const key = `${method} ${url.split("?")[0]}`;
+          if (overrides[key]) return Promise.resolve(overrides[key]());
+          if (url.endsWith("/api/encoding")) return Promise.resolve(okJson({ active: [], failed: [] }));
+          return Promise.resolve(okJson({ queued: true, file: failure.source }));
+        }
+        return Promise.resolve(okJson([]));
+      }),
+    );
+    return calls;
+  }
+
+  const writes = (calls: Array<{ url: string; method: string; body: unknown }>) =>
+    calls.filter((c) => c.method !== "GET");
+
+  it("a forced retry POSTs the class and does not touch the pin", async () => {
+    const calls = stubEncoding();
+    const { result } = renderHook(() => useJobManagement(false));
+    await act(async () => {
+      await result.current.retryEncode(failure, "animation");
+    });
+    expect(writes(calls)).toEqual([
+      {
+        url: "/api/encoding/retry",
+        method: "POST",
+        body: { file: failure.source, codec_class: "animation" },
+      },
+    ]);
+  });
+
+  it("an Auto retry clears the pin first, then POSTs without codec_class", async () => {
+    const calls = stubEncoding();
+    const { result } = renderHook(() => useJobManagement(false));
+    await act(async () => {
+      await result.current.retryEncode(failure);
+    });
+    const w = writes(calls);
+    expect(w.map((c) => c.method)).toEqual(["DELETE", "POST"]);
+    expect(w[0].url).toBe(`/api/encoding/override?file=${encodeURIComponent(failure.source)}`);
+    expect(w[1].body).toEqual({ file: failure.source });
+    expect(w[1].body).not.toHaveProperty("codec_class");
+  });
+
+  it("an Auto retry does not POST when the pin could not be cleared", async () => {
+    const calls = stubEncoding({ "DELETE /api/encoding/override": () => errResponse(500) });
+    const { result } = renderHook(() => useJobManagement(false));
+    await act(async () => {
+      await result.current.retryEncode(failure);
+    });
+    expect(writes(calls).map((c) => c.method)).toEqual(["DELETE"]);
+    expect(toastErrorMock).toHaveBeenCalled();
+  });
+
+  it("dismiss POSTs the source and drops the row", async () => {
+    const calls = stubEncoding({
+      "GET /api/encoding": () => okJson({ active: [], failed: [failure] }),
+    });
+    const { result } = renderHook(() => useJobManagement(false));
+    await waitFor(() => expect(result.current.encodeFailures).toHaveLength(1));
+    await act(async () => {
+      await result.current.dismissEncodeFailure(failure);
+    });
+    expect(writes(calls)).toEqual([
+      { url: "/api/encoding/dismiss", method: "POST", body: { file: failure.source } },
+    ]);
+    expect(result.current.encodeFailures).toHaveLength(0);
+  });
+
+  it("loadEncodeOverride reads GET /api/encoding/override?file=", async () => {
+    const status = { file: failure.source, override: { codec_class: "animation", stale: false } };
+    const calls = stubEncoding({ "GET /api/encoding/override": () => okJson(status) });
+    const { result } = renderHook(() => useJobManagement(false));
+    let got: unknown;
+    await act(async () => {
+      got = await result.current.loadEncodeOverride(failure.source);
+    });
+    expect(got).toEqual(status);
+    expect(calls.some((c) => c.url === `/api/encoding/override?file=${encodeURIComponent(failure.source)}`))
+      .toBe(true);
+  });
+});

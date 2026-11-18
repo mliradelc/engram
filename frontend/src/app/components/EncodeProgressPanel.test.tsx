@@ -1,14 +1,17 @@
 import '@testing-library/jest-dom';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { EncodeProgressPanel, formatEta } from './EncodeProgressPanel';
+import { EncodeProgressPanel } from './EncodeProgressPanel';
+import { formatEta } from './encodeClasses';
+import { EncodeClassBadge } from './EncodeClassBadge';
+import { EncodeClassSelect } from './EncodeClassSelect';
 import {
     applyEncodeProgress,
     applyRetryOptimistic,
     encodesFromSnapshot,
     failuresFromSnapshot,
 } from '../hooks/useJobManagement';
-import type { EncodeFailure, EncodeProgress } from '../../types';
+import type { EncodeFailure, EncodeOverrideStatus, EncodeProgress } from '../../types';
 
 const failure = (over: Partial<EncodeFailure> = {}): EncodeFailure => ({
     file: 'Show - S01E02.mkv',
@@ -200,5 +203,199 @@ describe('EncodeProgressPanel failed rows', () => {
     it('hides Retry when no handler is wired', () => {
         render(<EncodeProgressPanel encodes={[]} failures={[failure()]} />);
         expect(screen.queryByRole('button', { name: /Retry encoding/ })).not.toBeInTheDocument();
+    });
+});
+
+describe('EncodeClassSelect', () => {
+    it('offers Auto plus exactly the four forceable classes, never hdr or interlaced', () => {
+        render(<EncodeClassSelect value={undefined} onChange={vi.fn()} label="Codec class" />);
+        const select = screen.getByTestId('encode-class-select') as HTMLSelectElement;
+        const options = Array.from(select.options).map((o) => [o.value, o.textContent]);
+        expect(options).toEqual([
+            ['', 'Auto (classifier)'],
+            ['passthrough', 'passthrough'],
+            ['animation', 'animation'],
+            ['live_action_grainy', 'live_action_grainy'],
+            ['live_action_clean', 'live_action_clean'],
+        ]);
+        expect(select.value).toBe('');
+        expect(select).not.toHaveTextContent(/hdr|interlaced/i);
+    });
+
+    it('reports undefined for Auto and the class otherwise', () => {
+        const onChange = vi.fn();
+        render(<EncodeClassSelect value="animation" onChange={onChange} label="Codec class" />);
+        const select = screen.getByTestId('encode-class-select');
+        fireEvent.change(select, { target: { value: 'live_action_grainy' } });
+        expect(onChange).toHaveBeenLastCalledWith('live_action_grainy');
+        fireEvent.change(select, { target: { value: '' } });
+        expect(onChange).toHaveBeenLastCalledWith(undefined);
+    });
+});
+
+describe('EncodeClassBadge', () => {
+    it('shows the class and a FORCED chip only when forced', () => {
+        const { rerender } = render(<EncodeClassBadge codecClass="animation" forced />);
+        expect(screen.getByTestId('encode-class-badge')).toHaveTextContent('animation');
+        expect(screen.getByTestId('encode-class-forced')).toHaveTextContent('FORCED');
+        rerender(<EncodeClassBadge codecClass="live_action_clean" forced={false} />);
+        expect(screen.getByTestId('encode-class-badge')).toHaveTextContent('live_action_clean');
+        expect(screen.queryByTestId('encode-class-forced')).not.toBeInTheDocument();
+    });
+
+    it('renders a placeholder when the class is unknown', () => {
+        render(<EncodeClassBadge codecClass={null} />);
+        expect(screen.getByTestId('encode-class-badge')).toHaveTextContent('—');
+    });
+});
+
+const overrideStatus = (over: Partial<EncodeOverrideStatus> = {}): EncodeOverrideStatus => ({
+    file: failure().source,
+    in_domain: true,
+    done: false,
+    applied_class: null,
+    forced: false,
+    override: null,
+    classifier_enabled: true,
+    classes: ['passthrough', 'animation', 'live_action_grainy', 'live_action_clean'],
+    ...over,
+});
+
+describe('EncodeProgressPanel failed row controls', () => {
+    it('contains the badge, the selector, Retry and Dismiss', () => {
+        render(
+            <EncodeProgressPanel
+                encodes={[]}
+                failures={[failure({ codec_class: 'animation', forced: true })]}
+                onRetry={vi.fn()}
+                onDismiss={vi.fn()}
+            />,
+        );
+        const r = within(screen.getByTestId('encode-failed-row'));
+        expect(r.getByTestId('encode-class-badge')).toHaveTextContent('animation');
+        expect(r.getByTestId('encode-class-forced')).toBeInTheDocument();
+        expect(r.getByTestId('encode-class-select')).toBeInTheDocument();
+        expect(r.getByTestId('encode-retry')).toHaveTextContent('Retry');
+        expect(r.getByTestId('encode-dismiss')).toHaveTextContent('Dismiss');
+    });
+
+    it('Retry omits the class for Auto', async () => {
+        const onRetry = vi.fn();
+        const f = failure();
+        render(<EncodeProgressPanel encodes={[]} failures={[f]} onRetry={onRetry} />);
+        fireEvent.click(screen.getByTestId('encode-retry'));
+        await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+        expect(onRetry.mock.calls[0]).toEqual([f]);
+    });
+
+    it('Retry passes the chosen class', async () => {
+        const onRetry = vi.fn();
+        const f = failure();
+        render(<EncodeProgressPanel encodes={[]} failures={[f]} onRetry={onRetry} />);
+        fireEvent.change(screen.getByTestId('encode-class-select'), {
+            target: { value: 'live_action_grainy' },
+        });
+        fireEvent.click(screen.getByTestId('encode-retry'));
+        await waitFor(() => expect(onRetry).toHaveBeenCalledWith(f, 'live_action_grainy'));
+    });
+
+    it('Dismiss calls onDismiss with the failure', () => {
+        const onDismiss = vi.fn();
+        const f = failure();
+        render(<EncodeProgressPanel encodes={[]} failures={[f]} onDismiss={onDismiss} />);
+        fireEvent.click(screen.getByTestId('encode-dismiss'));
+        expect(onDismiss).toHaveBeenCalledWith(f);
+    });
+
+    it('preselects a fresh pin read from GET /encoding/override', async () => {
+        const loadOverride = vi.fn(async () =>
+            overrideStatus({
+                override: { codec_class: 'animation', set_at: 1, size: 3, mtime: 2, stale: false },
+            }),
+        );
+        const onRetry = vi.fn();
+        const f = failure();
+        render(
+            <EncodeProgressPanel encodes={[]} failures={[f]} onRetry={onRetry} loadOverride={loadOverride} />,
+        );
+        expect(loadOverride).toHaveBeenCalledWith(f.source);
+        const select = screen.getByTestId('encode-class-select') as HTMLSelectElement;
+        await waitFor(() => expect(select.value).toBe('animation'));
+        fireEvent.click(screen.getByTestId('encode-retry'));
+        await waitFor(() => expect(onRetry).toHaveBeenCalledWith(f, 'animation'));
+    });
+
+    it('ignores a stale pin (stale lives inside the override object)', async () => {
+        const loadOverride = vi.fn(async () =>
+            overrideStatus({
+                override: { codec_class: 'animation', set_at: 1, size: 3, mtime: 2, stale: true },
+            }),
+        );
+        render(
+            <EncodeProgressPanel encodes={[]} failures={[failure()]} onRetry={vi.fn()} loadOverride={loadOverride} />,
+        );
+        await waitFor(() =>
+            expect(screen.getByTestId('encode-failed-row')).toHaveTextContent('stale pin ignored'),
+        );
+        expect((screen.getByTestId('encode-class-select') as HTMLSelectElement).value).toBe('');
+    });
+
+    it('locks the selector to Auto when the classifier is off', async () => {
+        const loadOverride = vi.fn(async () => overrideStatus({ classifier_enabled: false }));
+        render(
+            <EncodeProgressPanel encodes={[]} failures={[failure()]} onRetry={vi.fn()} loadOverride={loadOverride} />,
+        );
+        await waitFor(() => expect(screen.getByTestId('encode-class-select')).toBeDisabled());
+    });
+
+    it('a manual choice is not overwritten by a late pin load', async () => {
+        let resolve!: (s: EncodeOverrideStatus) => void;
+        const loadOverride = vi.fn(() => new Promise<EncodeOverrideStatus>((r) => { resolve = r; }));
+        render(
+            <EncodeProgressPanel encodes={[]} failures={[failure()]} onRetry={vi.fn()} loadOverride={loadOverride} />,
+        );
+        const select = screen.getByTestId('encode-class-select') as HTMLSelectElement;
+        fireEvent.change(select, { target: { value: 'passthrough' } });
+        await act(async () => {
+            resolve(overrideStatus({
+                override: { codec_class: 'animation', set_at: 1, size: 3, mtime: 2, stale: false },
+            }));
+        });
+        expect(select.value).toBe('passthrough');
+    });
+
+    it('shows the class badge on an active row', () => {
+        render(<EncodeProgressPanel encodes={[row({ codec_class: 'live_action_grainy', forced: true })]} />);
+        const r = within(screen.getByTestId('encode-progress-row'));
+        expect(r.getByTestId('encode-class-badge')).toHaveTextContent('live_action_grainy');
+        expect(r.getByTestId('encode-class-forced')).toBeInTheDocument();
+    });
+});
+
+describe('applyEncodeProgress keeps the class', () => {
+    it('preserves codec_class and forced across WebSocket samples, which do not carry them', () => {
+        const seeded = encodesFromSnapshot({
+            active: [row({ file: 'a.mkv', codec_class: 'animation', forced: true, percent: 5 })],
+            failed: [],
+        });
+        const msg = { file: 'a.mkv', destination_folder: '/out', percent: 10, eta: 90, speed: '1x', codec: 'av1' };
+        let m = applyEncodeProgress(seeded, msg);
+        m = applyEncodeProgress(m, { ...msg, percent: 20, eta: null });
+        expect(m.get('a.mkv')).toMatchObject({ percent: 20, codec_class: 'animation', forced: true });
+    });
+
+    it('defaults to an unknown, unforced class for a file first seen over WS', () => {
+        const m = applyEncodeProgress(new Map(), {
+            file: 'b.mkv', destination_folder: '/out', percent: 1, eta: null, speed: null, codec: 'av1',
+        });
+        expect(m.get('b.mkv')).toMatchObject({ codec_class: null, forced: false });
+    });
+
+    it('applyRetryOptimistic records the forced class, or none for Auto', () => {
+        const f = failure();
+        expect(applyRetryOptimistic(new Map(), [f], f, 'animation').encodes.get(f.file))
+            .toMatchObject({ codec_class: 'animation', forced: true });
+        expect(applyRetryOptimistic(new Map(), [f], f).encodes.get(f.file))
+            .toMatchObject({ codec_class: null, forced: false });
     });
 });

@@ -1,27 +1,25 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { IcoError, IcoIdle, IcoRetry, IcoRipping } from "./icons";
 import { sv, SvPanel } from "./synapse";
-import type { EncodeFailure, EncodeProgress } from "../../types";
+import { EncodeClassBadge } from "./EncodeClassBadge";
+import { EncodeClassSelect } from "./EncodeClassSelect";
+import { formatEta, isEncodeClass } from "./encodeClasses";
+import type { EncodeClass, EncodeFailure, EncodeOverrideStatus, EncodeProgress } from "../../types";
 
 interface EncodeProgressPanelProps {
   /** Undefined renders the empty state (e.g. a test double of the hook). */
   encodes?: Map<string, EncodeProgress> | EncodeProgress[];
   /** Recently-failed encodes (newest first); each gets a Retry button. */
   failures?: EncodeFailure[];
-  /** POSTs /api/encoding/retry. Without it, failed rows show no Retry button. */
-  onRetry?: (failure: EncodeFailure) => void | Promise<void>;
-}
-
-/** Seconds -> "1h 05m" / "4m 10s" / "12s"; null -> an em dash (ETA unknown). */
-export function formatEta(seconds: number | null | undefined): string {
-  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return "—";
-  const s = Math.round(seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const rest = s % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
-  if (m > 0) return `${m}m ${String(rest).padStart(2, "0")}s`;
-  return `${rest}s`;
+  /**
+   * POSTs /api/encoding/retry with the chosen class; called with the failure
+   * alone for Auto. Without it, failed rows show no Retry button or selector.
+   */
+  onRetry?: (failure: EncodeFailure, codecClass?: EncodeClass) => void | Promise<void>;
+  /** POSTs /api/encoding/dismiss. Without it, failed rows show no Dismiss button. */
+  onDismiss?: (failure: EncodeFailure) => void | Promise<void>;
+  /** GET /api/encoding/override?file= — preselects a row's stored pin. */
+  loadOverride?: (source: string) => Promise<EncodeOverrideStatus | null>;
 }
 
 /** Epoch seconds -> "14:05" today, else "Nov 3 14:05". */
@@ -47,6 +45,155 @@ const ellipsis = {
   whiteSpace: "nowrap" as const,
 };
 
+const actionButton = (busy: boolean, color: string) => ({
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  flexShrink: 0,
+  background: "transparent",
+  border: `1px solid ${sv.lineMid}`,
+  color: busy ? sv.inkFaint : color,
+  ...microLabel,
+  fontWeight: 700,
+  padding: "6px 10px",
+  cursor: busy ? "wait" : "pointer",
+});
+
+interface FailedEncodeRowProps {
+  failure: EncodeFailure;
+  busy: boolean;
+  onRetry?: (failure: EncodeFailure, codecClass?: EncodeClass) => void;
+  onDismiss?: (failure: EncodeFailure) => void;
+  loadOverride?: (source: string) => Promise<EncodeOverrideStatus | null>;
+}
+
+/**
+ * One failed encode: what it ran as (badge), the class to retry with
+ * (selector, preselected from the file's stored pin), Retry and Dismiss.
+ */
+function FailedEncodeRow({ failure: f, busy, onRetry, onDismiss, loadOverride }: FailedEncodeRowProps) {
+  const [choice, setChoice] = useState<EncodeClass | undefined>(undefined);
+  const [touched, setTouched] = useState(false);
+  const [status, setStatus] = useState<EncodeOverrideStatus | null>(null);
+
+  useEffect(() => {
+    if (!loadOverride) return;
+    let live = true;
+    void loadOverride(f.source).then((s) => {
+      if (live) setStatus(s);
+    });
+    return () => {
+      live = false;
+    };
+  }, [loadOverride, f.source]);
+
+  const pin = status?.override ?? null;
+  const pinned = pin && !pin.stale && isEncodeClass(pin.codec_class) ? pin.codec_class : undefined;
+  // The stored pin preselects until the operator picks something themselves.
+  const selected = touched ? choice : pinned;
+  const classifierOff = status?.classifier_enabled === false;
+  const selectTitle = classifierOff
+    ? "The codec classifier is off: only Auto (fixed settings) can run"
+    : pinned
+      ? `Pinned: ${pinned}. Auto clears the pin.`
+      : pin?.stale
+        ? "The stored pin is stale (the source changed) and is ignored"
+        : "Auto lets the classifier decide";
+
+  return (
+    <li
+      data-testid="encode-failed-row"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: 12,
+        fontFamily: sv.mono,
+        borderLeft: `2px solid ${sv.magenta}99`,
+        paddingLeft: 10,
+      }}
+    >
+      <IcoError size={14} color={sv.magenta} />
+      <div style={{ flex: "1 1 220px", minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <div title={f.source} style={{ ...ellipsis, fontSize: 13, color: sv.ink }}>
+            {f.file}
+          </div>
+          <EncodeClassBadge codecClass={f.codec_class} forced={f.forced} />
+        </div>
+        <div
+          data-testid="encode-failed-reason"
+          title={f.reason}
+          style={{ ...ellipsis, fontSize: 11, color: sv.magentaHi, marginTop: 2 }}
+        >
+          {f.reason}
+        </div>
+        <div style={{ ...ellipsis, fontSize: 10, color: sv.inkFaint, marginTop: 2 }}>
+          {formatFailedAt(f.failed_at)} · → {f.destination_folder}
+          {pin?.stale ? " · stale pin ignored" : ""}
+        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        {onRetry && (
+          <>
+            <EncodeClassSelect
+              label={`Codec class for ${f.file}`}
+              title={selectTitle}
+              value={classifierOff ? undefined : selected}
+              disabled={busy || classifierOff}
+              onChange={(value) => {
+                setTouched(true);
+                setChoice(value);
+              }}
+            />
+            <button
+              type="button"
+              data-testid="encode-retry"
+              onClick={() => onRetry(f, classifierOff ? undefined : selected)}
+              disabled={busy}
+              aria-label={`Retry encoding ${f.file}`}
+              style={actionButton(busy, sv.cyan)}
+              onMouseEnter={(e) => {
+                if (busy) return;
+                e.currentTarget.style.color = sv.cyanHi;
+                e.currentTarget.style.borderColor = sv.lineHi;
+              }}
+              onMouseLeave={(e) => {
+                e.currentTarget.style.color = busy ? sv.inkFaint : sv.cyan;
+                e.currentTarget.style.borderColor = sv.lineMid;
+              }}
+            >
+              <IcoRetry size={12} />
+              Retry
+            </button>
+          </>
+        )}
+        {onDismiss && (
+          <button
+            type="button"
+            data-testid="encode-dismiss"
+            onClick={() => onDismiss(f)}
+            disabled={busy}
+            aria-label={`Dismiss failed encode of ${f.file}`}
+            style={actionButton(busy, sv.inkDim)}
+            onMouseEnter={(e) => {
+              if (busy) return;
+              e.currentTarget.style.color = sv.ink;
+              e.currentTarget.style.borderColor = sv.lineHi;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = busy ? sv.inkFaint : sv.inkDim;
+              e.currentTarget.style.borderColor = sv.lineMid;
+            }}
+          >
+            Dismiss
+          </button>
+        )}
+      </div>
+    </li>
+  );
+}
+
 /**
  * Post-organize AV1/x265 encodes, as a dashboard card. Sits above the job
  * list and is always rendered, idle included: hiding it when idle would make
@@ -56,9 +203,17 @@ const ellipsis = {
  * folder) are seeded from GET /api/encoding and kept live by `encode_progress`
  * messages (see useJobManagement). A queued file is not shown: the backend
  * lists a file only once it holds an encode slot. Failed rows come from the
- * backend's ring buffer of recent failures and offer Retry.
+ * backend's ring buffer of recent failures and offer Retry (with a codec
+ * class: Auto or one of the four forceable ones) and Dismiss. Each row carries
+ * the class it ran as and a FORCED chip when an operator chose it.
  */
-export function EncodeProgressPanel({ encodes, failures, onRetry }: EncodeProgressPanelProps) {
+export function EncodeProgressPanel({
+  encodes,
+  failures,
+  onRetry,
+  onDismiss,
+  loadOverride,
+}: EncodeProgressPanelProps) {
   const source = encodes ?? [];
   const rows = (Array.isArray(source) ? source : Array.from(source.values()))
     .slice()
@@ -70,11 +225,12 @@ export function EncodeProgressPanel({ encodes, failures, onRetry }: EncodeProgre
   const status = active ? `${rows.length} Active` : failed.length > 0 ? `${failed.length} Failed` : "Idle";
   const statusColor = active ? sv.cyan : failed.length > 0 ? sv.magenta : sv.inkFaint;
 
-  const retry = async (failure: EncodeFailure) => {
+  const retry = async (failure: EncodeFailure, codecClass?: EncodeClass) => {
     if (!onRetry || retrying.has(failure.source)) return;
     setRetrying((prev) => new Set(prev).add(failure.source));
     try {
-      await onRetry(failure);
+      // Auto calls with the failure alone, so the hook omits codec_class.
+      await (codecClass === undefined ? onRetry(failure) : onRetry(failure, codecClass));
     } finally {
       setRetrying((prev) => {
         const next = new Set(prev);
@@ -141,11 +297,14 @@ export function EncodeProgressPanel({ encodes, failures, onRetry }: EncodeProgre
                 const pct = Math.min(100, Math.max(0, row.percent ?? 0));
                 return (
                   <li key={row.file} data-testid="encode-progress-row" style={{ fontFamily: sv.mono }}>
-                    <div
-                      title={row.file}
-                      style={{ ...ellipsis, color: sv.cyanHi, fontSize: 13, fontWeight: 600 }}
-                    >
-                      {row.file}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                      <div
+                        title={row.file}
+                        style={{ ...ellipsis, color: sv.cyanHi, fontSize: 13, fontWeight: 600 }}
+                      >
+                        {row.file}
+                      </div>
+                      <EncodeClassBadge codecClass={row.codec_class} forced={row.forced} />
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
                       <div
@@ -231,73 +390,16 @@ export function EncodeProgressPanel({ encodes, failures, onRetry }: EncodeProgre
               Failed recently
             </div>
             <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: 10 }}>
-              {failed.map((f) => {
-                const busy = retrying.has(f.source);
-                return (
-                  <li
-                    key={f.source}
-                    data-testid="encode-failed-row"
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 12,
-                      fontFamily: sv.mono,
-                      borderLeft: `2px solid ${sv.magenta}99`,
-                      paddingLeft: 10,
-                    }}
-                  >
-                    <IcoError size={14} color={sv.magenta} />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div title={f.source} style={{ ...ellipsis, fontSize: 13, color: sv.ink }}>
-                        {f.file}
-                      </div>
-                      <div
-                        data-testid="encode-failed-reason"
-                        title={f.reason}
-                        style={{ ...ellipsis, fontSize: 11, color: sv.magentaHi, marginTop: 2 }}
-                      >
-                        {f.reason}
-                      </div>
-                      <div style={{ ...ellipsis, fontSize: 10, color: sv.inkFaint, marginTop: 2 }}>
-                        {formatFailedAt(f.failed_at)} · → {f.destination_folder}
-                      </div>
-                    </div>
-                    {onRetry && (
-                      <button
-                        type="button"
-                        onClick={() => void retry(f)}
-                        disabled={busy}
-                        aria-label={`Retry encoding ${f.file}`}
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 6,
-                          flexShrink: 0,
-                          background: "transparent",
-                          border: `1px solid ${sv.lineMid}`,
-                          color: busy ? sv.inkFaint : sv.cyan,
-                          ...microLabel,
-                          fontWeight: 700,
-                          padding: "6px 10px",
-                          cursor: busy ? "wait" : "pointer",
-                        }}
-                        onMouseEnter={(e) => {
-                          if (busy) return;
-                          e.currentTarget.style.color = sv.cyanHi;
-                          e.currentTarget.style.borderColor = sv.lineHi;
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.color = busy ? sv.inkFaint : sv.cyan;
-                          e.currentTarget.style.borderColor = sv.lineMid;
-                        }}
-                      >
-                        <IcoRetry size={12} />
-                        Retry
-                      </button>
-                    )}
-                  </li>
-                );
-              })}
+              {failed.map((f) => (
+                <FailedEncodeRow
+                  key={f.source}
+                  failure={f}
+                  busy={retrying.has(f.source)}
+                  onRetry={onRetry ? (failure, cls) => void retry(failure, cls) : undefined}
+                  onDismiss={onDismiss ? (failure) => void onDismiss(failure) : undefined}
+                  loadOverride={loadOverride}
+                />
+              ))}
             </ul>
           </div>
         )}

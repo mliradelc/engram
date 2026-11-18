@@ -237,6 +237,10 @@ export interface EncodeProgress {
     eta: number | null;
     speed: string | null;
     codec: string | null;
+    /** Codec class the encode runs as; null on the fixed (classifier-off) path. */
+    codec_class?: string | null;
+    /** True when the class was forced or pinned by an operator. */
+    forced?: boolean;
     started_at?: number;
 }
 
@@ -250,6 +254,8 @@ export interface EncodeFailure {
     source: string;
     destination_folder: string;
     reason: string;
+    codec_class?: string | null;
+    forced?: boolean;
     failed_at: number;
 }
 
@@ -262,12 +268,48 @@ export interface EncodingStatus {
 /** `POST /api/encoding/retry` body. */
 export interface EncodeRetryRequest {
     file: string;
+    /** Force (and pin) this class; omitted for Auto (the classifier decides). */
+    codec_class?: EncodeClass;
 }
 
-/** `POST /api/encoding/retry` 202 response. */
+/** `POST /api/encoding/retry` 202 response; `codec_class` only when one was sent. */
 export interface EncodeRetryResponse {
     queued: boolean;
     file: string;
+    codec_class?: EncodeClass;
+}
+
+/**
+ * The codec classes an operator may force. `hdr` and `interlaced` are decided
+ * from the source and are never offered (the backend refuses them with 422).
+ */
+export type EncodeClass = 'passthrough' | 'animation' | 'live_action_grainy' | 'live_action_clean';
+
+/** A stored pin, as reported by `GET /api/encoding/override`. */
+export interface EncodeOverride {
+    codec_class: EncodeClass | null;
+    set_at: number | null;
+    size: number | null;
+    mtime: number | null;
+    /** The source changed since the pin was set; a stale pin is ignored. */
+    stale: boolean;
+}
+
+/** `GET /api/encoding/override?file=` payload. */
+export interface EncodeOverrideStatus {
+    file: string;
+    in_domain: boolean;
+    done: boolean;
+    applied_class: string | null;
+    forced: boolean;
+    override: EncodeOverride | null;
+    classifier_enabled: boolean;
+    classes: EncodeClass[];
+}
+
+/** `POST /api/encoding/dismiss` response. */
+export interface EncodeDismissResponse {
+    dismissed: number;
 }
 
 export interface TitlesDiscovered {
