@@ -83,6 +83,8 @@ import importlib.util
 import json
 import logging
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
@@ -774,6 +776,52 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
     return _legacy_video_args(threads), "av1", None
 
 
+# Encoder chatter that is never the failure.  Only *info* banners: an
+# ``Svt[error]:`` / ``x265 [error]:`` line is a genuine encoder fault and must survive.
+_STDERR_NOISE = re.compile(
+    r"^svt\[(info|warn)\]"
+    r"|-{10,}"
+    r"|^x265 \[(info|warning)\]"
+    r"|options: cpuid="
+    r"|frame=.*\bfps=",
+    re.IGNORECASE,
+)
+_STDERR_ERROR = re.compile(
+    r"error|invalid|no such file|permission denied|cannot|failed|unable|unknown"
+    r"|not found|unrecognized",
+    re.IGNORECASE,
+)
+# fftools/ffmpeg.c exits 255 when it caught SIGINT/SIGTERM (it reports
+# "received signal" only at info level, which ``-v error`` hides).
+_FFMPEG_INTERRUPTED_RC = 255
+
+
+def _failure_reason(returncode: int | None, stderr: str | None) -> str:
+    """Pick the panel's failure reason from ffmpeg's exit status and stderr.
+
+    The *last* stderr line is the wrong choice: when ffmpeg is interrupted the
+    tail is SVT-AV1's startup banner, which reads like a codec fault.  Banner
+    noise is dropped, the first error-looking line wins, else the first line
+    that survived.  A signal death (negative return code) is named as such.
+    """
+    if returncode is not None and returncode < 0:
+        num = -returncode
+        try:
+            name = f" ({signal.Signals(num).name})"
+        except ValueError:
+            name = ""
+        head = f"ffmpeg killed by signal {num}{name}"
+    elif returncode == _FFMPEG_INTERRUPTED_RC:
+        head = f"ffmpeg exited {returncode} (interrupted by a signal)"
+    else:
+        head = f"ffmpeg exited {returncode}"
+
+    lines = [ln.strip() for ln in (stderr or "").splitlines()]
+    lines = [ln for ln in lines if ln and not _STDERR_NOISE.search(ln)]
+    pick = next((ln for ln in lines if _STDERR_ERROR.search(ln)), lines[0] if lines else "")
+    return f"{head}: {pick[:200]}" if pick else head
+
+
 def _encode_and_verify(
     cmd: list[str], src: Path, tmp: Path, *, key: str, duration: float | None, loop,
     expect_codec: str, active,
@@ -793,10 +841,10 @@ def _encode_and_verify(
 
     if run.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
         stderr = (run.stderr or "").strip()
+        # The log keeps the raw tail; only the panel's reason is cleaned.
         logger.error("Encoding hook: encode failed for %s: %s", src.name, stderr[-500:])
         tmp.unlink(missing_ok=True)
-        last = stderr.splitlines()[-1][-200:] if stderr else ""
-        return f"ffmpeg exited {run.returncode}" + (f": {last}" if last else "")
+        return _failure_reason(run.returncode, stderr)
 
     # Verify before publishing: codec must be what was asked for and track counts must match.
     src_probe = _probe(src)

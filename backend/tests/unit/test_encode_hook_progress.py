@@ -794,3 +794,91 @@ def test_domain_roots_are_staging_only_never_the_library(monkeypatch, tmp_path):
     assert encode_hook.in_domain(staging / "Show - S01E01.mkv")
     assert not encode_hook.in_domain(tv / "Show - S01E01.mkv", [str(tv), str(movies)])
     assert not encode_hook.in_domain(movies / "Film (2010).mkv", [str(tv), str(movies)])
+
+
+# ---------------------------------------------------------------------------
+# Failure reason: the most informative stderr line, not the last
+# ---------------------------------------------------------------------------
+
+SVT_BANNER = "\n".join([
+    "Svt[info]: -------------------------------------------",
+    "Svt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v2.3.0",
+    "Svt[info]: SVT [build]  :\tGCC 13.2.0\t 64 bit",
+    "Svt[info]: LIB Build date: Jan  1 2026 00:00:00",
+    "Svt[info]: -------------------------------------------",
+    "Svt[info]: Level of Parallelism: 5",
+    "Svt[info]: -------------------------------------------",
+])
+
+
+def test_failure_reason_banner_only_does_not_surface_the_banner():
+    reason = encode_hook._failure_reason(255, SVT_BANNER)
+    assert "exited 255" in reason
+    assert "Svt[info]" not in reason
+    assert "-----" not in reason
+
+
+def test_failure_reason_prefers_the_error_line_over_the_banner():
+    stderr = SVT_BANNER + "\nError: Invalid data found when processing input\n"
+    reason = encode_hook._failure_reason(1, stderr)
+    assert reason == "ffmpeg exited 1: Error: Invalid data found when processing input"
+
+
+def test_failure_reason_prefers_first_error_line_not_last_line():
+    stderr = "\n".join([
+        "/in/ep.mkv: Permission denied",
+        "Svt[info]: -------------------------------------------",
+        "Conversion failed!",
+    ])
+    assert encode_hook._failure_reason(1, stderr) == "ffmpeg exited 1: /in/ep.mkv: Permission denied"
+
+
+def test_failure_reason_keeps_genuine_encoder_errors():
+    stderr = SVT_BANNER + "\nSvt[error]: Instance 1: Source Width must be even for YUV_420"
+    reason = encode_hook._failure_reason(1, stderr)
+    assert "Svt[error]: Instance 1: Source Width must be even" in reason
+
+
+def test_failure_reason_empty_stderr():
+    assert encode_hook._failure_reason(1, "") == "ffmpeg exited 1"
+    assert encode_hook._failure_reason(1, None) == "ffmpeg exited 1"
+
+
+def test_failure_reason_signal_death_is_named():
+    reason = encode_hook._failure_reason(-9, SVT_BANNER)
+    assert reason == "ffmpeg killed by signal 9 (SIGKILL)"
+    assert "-9" not in reason
+
+
+def test_failure_reason_falls_back_to_first_surviving_line():
+    stderr = "\n".join([
+        "Svt[info]: -------------------------------------------",
+        "first plain line",
+        "x265 [info]: frame I: 12, Avg QP:20.1",
+        "frame=  120 fps= 30 q=-0.0 size=    1024kB time=00:00:05.00",
+        "second plain line",
+    ])
+    assert encode_hook._failure_reason(1, stderr) == "ffmpeg exited 1: first plain line"
+
+
+def test_failure_reason_truncates_to_200_chars():
+    reason = encode_hook._failure_reason(1, "Error: " + "x" * 400)
+    assert reason == "ffmpeg exited 1: " + ("Error: " + "x" * 400)[:200]
+
+
+def test_failed_encode_logs_raw_stderr_but_panel_gets_clean_reason(tmp_path, monkeypatch, caplog):
+    class BannerRun(ProgressRun):
+        def __call__(self, cmd, **kw):
+            result = super().__call__(cmd, **kw)
+            if cmd[0] == "ffprobe":
+                return result
+            return subprocess.CompletedProcess(cmd, 255, None, SVT_BANNER)
+
+    monkeypatch.setattr(subprocess, "run", BannerRun([], returncode=255))
+    src = _src(tmp_path)
+    with caplog.at_level("ERROR", logger=encode_hook.logger.name):
+        assert encode_hook.transcode_file(src, tmp_path / "out") is None
+
+    reason = encode_hook.failures_snapshot()[0]["reason"]
+    assert reason == "ffmpeg exited 255 (interrupted by a signal)"
+    assert any("Svt[info]" in r.getMessage() for r in caplog.records)
