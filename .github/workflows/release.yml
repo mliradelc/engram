@@ -1,4 +1,5 @@
-name: Release
+name: Release Binaries (Windows / macOS / Linux)
+run-name: Binaries ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
@@ -17,6 +18,13 @@ on:
 
 permissions:
   contents: write
+
+# Keyed on the tag, and distinct from docker.yml's group: a duplicate binaries
+# run for the same tag (tag push + dispatch) cancels the older one, but nothing
+# here can ever cancel the container-image build.
+concurrency:
+  group: release-binaries-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
 
 # See ci.yml for context on the Node 24 opt-in.
 env:

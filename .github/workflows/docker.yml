@@ -1,4 +1,5 @@
-name: Docker
+name: Release Container Image (GHCR)
+run-name: Container image ${{ inputs.tag || github.ref_name }} → GHCR
 
 on:
   push:
@@ -28,6 +29,12 @@ env:
 permissions:
   contents: read
   packages: write
+
+# Keyed on the tag, and distinct from release.yml's group: a duplicate image
+# run for the same tag cancels the older one, but never the binaries build.
+concurrency:
+  group: docker-image-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   docker:
