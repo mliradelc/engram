@@ -1192,3 +1192,244 @@ def test_real_progressive_1080p_gets_no_bwdif(tmp_path):
     assert plan.evidence["interlaced"] == "no"
     assert plan.video_filters == []
     assert cc.forced_class_plan(cc.ANIMATION, cc.probe_interlace(str(src))).video_filters == []
+
+
+# ---------------------------------------------------------------------------
+# Telecine: IVTC (fieldmatch,decimate) only on a MEASURED telecine verdict.
+#
+# Measured on synthetic sources: telecined 29.97 -> fieldmatch,decimate gives
+# 23.976 (correct); true interlaced 25 -> fieldmatch,decimate gives 20 fps with
+# one frame in five destroyed (catastrophic).  idet's "Repeated Fields" line is
+# the discriminator: progressive and true interlaced both read 0.
+# ---------------------------------------------------------------------------
+
+# idet's "Repeated Fields" counters as _probe_idet accumulates them.
+TELECINE_REPEATS = {"repeated_neither": 108, "repeated_top": 36, "repeated_bottom": 36}
+CLEAN_REPEATS = {"repeated_neither": 150, "repeated_top": 0, "repeated_bottom": 0}
+TELECINED_IDET = {**INTERLACED_IDET, **TELECINE_REPEATS}
+
+# Real ffmpeg 7.1 idet output (two summaries: the first instance is empty).
+_IDET_STDERR_TELECINE = b"""\
+[Parsed_idet_0 @ 0x1] Repeated Fields: Neither:     0 Top:     0 Bottom:     0
+[Parsed_idet_0 @ 0x1] Single frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     0
+[Parsed_idet_0 @ 0x1] Multi frame detection: TFF:     0 BFF:     0 Progressive:     0 Undetermined:     0
+[Parsed_idet_0 @ 0x2] Repeated Fields: Neither:    54 Top:    18 Bottom:    18
+[Parsed_idet_0 @ 0x2] Single frame detection: TFF:    36 BFF:     0 Progressive:    50 Undetermined:     4
+[Parsed_idet_0 @ 0x2] Multi frame detection: TFF:    90 BFF:     0 Progressive:     0 Undetermined:     0
+"""
+_IDET_STDERR_CLEAN = b"""\
+[Parsed_idet_0 @ 0x2] Repeated Fields: Neither:    75 Top:     0 Bottom:     0
+[Parsed_idet_0 @ 0x2] Single frame detection: TFF:    70 BFF:     0 Progressive:     5 Undetermined:     0
+[Parsed_idet_0 @ 0x2] Multi frame detection: TFF:    75 BFF:     0 Progressive:     0 Undetermined:     0
+"""
+
+
+def test_repeated_fields_line_is_parsed_last_instance_wins():
+    det, rep = cc._parse_idet(_IDET_STDERR_TELECINE)
+    assert rep == {"repeated_neither": 54, "repeated_top": 18, "repeated_bottom": 18}
+    # The detection counters are unchanged: still the LAST Multi frame row.
+    assert det == {"tff": 90, "bff": 0, "progressive": 0, "undetermined": 0}
+
+
+def test_a_clean_repeated_fields_line_yields_zero():
+    det, rep = cc._parse_idet(_IDET_STDERR_CLEAN)
+    assert rep == {"repeated_neither": 75, "repeated_top": 0, "repeated_bottom": 0}
+    assert det["tff"] == 75
+    assert cc._parse_idet(b"no idet here") == (None, None)
+
+
+def test_probe_idet_sums_repeated_fields_across_samples(monkeypatch):
+    outputs = iter([_IDET_STDERR_TELECINE, _IDET_STDERR_CLEAN, _IDET_STDERR_TELECINE])
+    monkeypatch.setattr(cc, "_run", lambda cmd, timeout=None: subprocess.CompletedProcess(
+        cmd, 0, b"", next(outputs)))
+    total = cc._probe_idet("x.mkv", [1.0, 2.0, 3.0])
+    assert total == {"tff": 90 + 75 + 90, "bff": 0, "progressive": 0, "undetermined": 0,
+                     "repeated_neither": 54 + 75 + 54, "repeated_top": 36,
+                     "repeated_bottom": 36}
+
+
+def test_telecine_verdict_fraction_and_threshold():
+    tele, frac, basis = cc.telecine_verdict({"idet": TELECINED_IDET, "fps": 29.97})
+    assert tele is True and frac == pytest.approx(72 / 180) and basis == "repeated_fields"
+    assert cc.telecine_verdict({"idet": {**INTERLACED_IDET, **CLEAN_REPEATS},
+                                "fps": 29.97})[:2] == (False, 0.0)
+    # Just below / at the threshold.
+    below = {"repeated_neither": 87, "repeated_top": 7, "repeated_bottom": 6}  # 0.13
+    at = {"repeated_neither": 85, "repeated_top": 8, "repeated_bottom": 7}  # 0.15
+    assert cc.telecine_verdict({"idet": below, "fps": 29.97})[0] is False
+    assert cc.telecine_verdict({"idet": at, "fps": 29.97})[0] is True
+    # Too few counted frames, or no repeated-field counters at all: never telecined.
+    few = {"repeated_neither": 5, "repeated_top": 3, "repeated_bottom": 3}
+    assert cc.telecine_verdict({"idet": few, "fps": 29.97})[0] is False
+    assert cc.telecine_verdict({"idet": INTERLACED_IDET, "fps": 29.97})[0] is False
+    assert cc.telecine_verdict({"fps": 29.97})[0] is False
+
+
+@pytest.mark.parametrize("fps", [25.0, 50.0, 23.976, None])
+def test_repeated_fields_at_a_non_ntsc_rate_never_select_ivtc(fps):
+    """3:2 pulldown only produces 29.97/30.  IVTC on PAL 25 is the 20 fps disaster."""
+    p = {"idet": TELECINED_IDET, "field_order": "tt"}
+    if fps is not None:
+        p["fps"] = fps
+    assert cc.telecine_verdict(p)[0] is False
+    vf, ev = cc.deinterlace_filter(p)
+    assert vf == cc.DEINTERLACE_FILTER and ev["telecined"] == "no"
+
+
+def test_telecined_probe_selects_ivtc_on_every_path():
+    p = probe(idet=TELECINED_IDET, fps=29.97, field_order="tt", width=720, height=480)
+    vf, ev = cc.deinterlace_filter(p)
+    assert vf == cc.IVTC_FILTER and ev["telecined"] == "yes"
+    assert ev["repeated_frac"] == 0.4
+    auto = cc.classify(p)
+    assert auto.class_name == cc.INTERLACED
+    assert auto.video_filters == [cc.IVTC_FILTER]
+    assert "telecined=yes" in auto.describe()
+    assert cc.validate_plan(auto) == []
+    for name in (cc.ANIMATION, cc.LIVE_ACTION_CLEAN, cc.LIVE_ACTION_GRAINY, cc.INTERLACED):
+        assert cc.forced_class_plan(name, p).video_filters == [cc.IVTC_FILTER], name
+
+
+def test_telecine_wins_over_plain_interlacing():
+    """A telecined source is ALSO interlaced; the order of the checks matters."""
+    p = {"idet": TELECINED_IDET, "fps": 29.97, "field_order": "tt"}
+    assert cc.interlaced_verdict(p)[0] is True
+    assert cc.telecine_verdict(p)[0] is True
+    assert cc.deinterlace_filter(p)[0] == cc.IVTC_FILTER
+
+
+def test_true_interlaced_probe_gets_bwdif_not_fieldmatch():
+    """Regression guard for the 20 fps disaster: zero repeated fields -> never IVTC."""
+    for fps in (25.0, 29.97):
+        p = probe(idet={**INTERLACED_IDET, **CLEAN_REPEATS}, fps=fps, field_order="tt")
+        plan = cc.classify(p)
+        assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+        assert "fieldmatch" not in " ".join(plan.video_args(4))
+        forced = cc.forced_class_plan(cc.LIVE_ACTION_CLEAN, p)
+        assert forced.video_filters == [cc.DEINTERLACE_FILTER]
+
+
+def test_progressive_probe_gets_neither_filter():
+    p = probe(idet={**PROGRESSIVE, "repeated_neither": 214, "repeated_top": 0,
+                    "repeated_bottom": 0})
+    assert cc.deinterlace_filter(p)[0] is None
+    args = " ".join(cc.classify(p).video_args(4))
+    assert "bwdif" not in args and "fieldmatch" not in args and "decimate" not in args
+
+
+def test_undecided_probe_gets_bwdif_never_ivtc():
+    for p in ({}, None, {"fps": 29.97}, {"idet": {"undetermined": 400}, "fps": 29.97}):
+        vf, ev = cc.deinterlace_filter(p)
+        assert vf == cc.DEINTERLACE_FILTER, p
+        assert ev["interlaced"] == "unknown" and ev["telecined"] == "no"
+
+
+def test_ivtc_filter_carries_no_bwdif_options():
+    assert cc.IVTC_FILTER == "fieldmatch,decimate"
+    assert "deint" not in cc.IVTC_FILTER and "mode=" not in cc.IVTC_FILTER
+    assert "bwdif" not in cc.IVTC_FILTER
+    # Telecined HDR keeps HDR handling with exactly one deinterlace filter.
+    plan = cc.classify(probe(idet=TELECINED_IDET, fps=29.97, color_transfer="smpte2084"))
+    assert plan.class_name == cc.HDR and plan.video_filters == [cc.IVTC_FILTER]
+
+
+def test_no_telecine_plan_changes_the_frame_rate_by_flag():
+    tele = probe(idet=TELECINED_IDET, fps=29.97)
+    plans = [cc.classify(tele), cc.forced_class_plan(cc.ANIMATION, tele),
+             cc.forced_class_plan(cc.LIVE_ACTION_GRAINY, tele)]
+    for plan in plans:
+        for optional in (True, False):
+            args = plan.video_args(4, optional=optional)
+            assert not set(args) & set(_FRAME_RATE_FLAGS), args
+            assert _vf(args) == cc.IVTC_FILTER
+
+
+def test_hook_command_for_a_telecined_source_ivtcs_and_keeps_it_on_fallback(hook, monkeypatch):
+    src, tmp = hook
+    plan = cc.classify(probe(idet=TELECINED_IDET, fps=29.97, pix_fmt="yuv420p"))
+    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    calls: list = []
+    base = _Run(calls, lambda c: _streams(pix="yuv420p"))
+
+    def run(cmd, **kw):  # the encoder rejects every class setting -> fixed command
+        if cmd[0] == "ffmpeg" and "testsrc=size=128x128" in " ".join(cmd):
+            return subprocess.CompletedProcess(cmd, 1, "", "bad param")
+        return base(cmd, **kw)
+
+    monkeypatch.setattr(av1_hook.subprocess, "run", run)
+    av1_hook.after_organize(str(src))
+    (cmd,) = _encode_cmds(calls)
+    assert cmd[cmd.index("-vf") + 1] == cc.IVTC_FILTER
+    assert not set(cmd) & set(_FRAME_RATE_FLAGS)
+
+
+def _repeats_after(src: Path, vf: str | None) -> tuple[int, int]:
+    """(repeated top+bottom, frames) measured by idet after ``vf``."""
+    chain = f"{vf},idet" if vf else "idet"
+    run = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-v", "info", "-i", str(src),
+                          "-vf", chain, "-f", "null", "-"], capture_output=True)
+    _, rep = cc._parse_idet(run.stderr)
+    return rep["repeated_top"] + rep["repeated_bottom"], sum(rep.values())
+
+
+def _encode_fps(src: Path, plan, out: Path) -> float:
+    args = plan.video_args(2)
+    args[args.index("-preset") + 1] = "12"
+    run = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0",
+                          *args, str(out)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    return cc._probe_stream(str(out))["fps"]
+
+
+@needs_ffmpeg
+def test_real_telecined_source_is_inverse_telecined_to_23976(tmp_path):
+    src = _make_source(
+        tmp_path / "telecined.mkv", "testsrc2=size=320x240:rate=24000/1001",
+        ["-vf", "telecine=pattern=23,format=yuv420p", "-c:v", "mpeg2video", "-q:v", "2",
+         "-flags", "+ildct+ilme"], seconds=3)
+    assert cc._probe_stream(str(src))["fps"] == pytest.approx(30000 / 1001)
+
+    p = cc.probe_interlace(str(src))
+    tele, frac, _ = cc.telecine_verdict(p)
+    assert tele is True and frac == pytest.approx(0.40, abs=0.05)
+    plan = cc.plan_for_file(str(src))
+    assert plan.video_filters == [cc.IVTC_FILTER], plan.evidence
+    vf = _vf(plan.video_args(2))
+    assert "fieldmatch" in vf and "decimate" in vf and "bwdif" not in vf
+    assert cc.forced_class_plan(cc.LIVE_ACTION_CLEAN, p).video_filters == [cc.IVTC_FILTER]
+
+    # Causal, not correlated: IVTC removes the repeated fields, bwdif does not.
+    assert _repeats_after(src, None)[0] > 0
+    assert _repeats_after(src, cc.IVTC_FILTER)[0] == 0
+    assert _repeats_after(src, cc.DEINTERLACE_FILTER)[0] > 0
+
+    assert _encode_fps(src, plan, tmp_path / "out.mkv") == pytest.approx(24000 / 1001)
+
+
+@needs_ffmpeg
+def test_real_true_interlaced_25_is_bwdif_not_fieldmatch(tmp_path):
+    """THE regression guard: IVTC here would give 20 fps and destroy 1 frame in 5."""
+    src = _make_source(
+        tmp_path / "25i.mkv", "testsrc2=size=320x240:rate=50",
+        ["-vf", "interlace=scan=tff,format=yuv420p", "-c:v", "mpeg2video", "-q:v", "2",
+         "-flags", "+ildct+ilme", "-top", "1"], seconds=3)
+    p = cc.probe_interlace(str(src))
+    assert p["fps"] == 25.0
+    assert p["idet"]["repeated_top"] + p["idet"]["repeated_bottom"] == 0
+    assert cc.telecine_verdict(p)[0] is False
+    plan = cc.plan_for_file(str(src))
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER], plan.evidence
+    assert "fieldmatch" not in " ".join(plan.video_args(2))
+    forced = cc.forced_class_plan(cc.LIVE_ACTION_CLEAN, p)
+    assert forced.video_filters == [cc.DEINTERLACE_FILTER]
+    assert _encode_fps(src, plan, tmp_path / "out.mkv") == 25.0
+
+
+@needs_ffmpeg
+def test_real_progressive_gets_neither_filter(tmp_path):
+    src = _make_source(tmp_path / "24p.mkv", "testsrc2=size=320x240:rate=24000/1001",
+                       ["-c:v", "mpeg2video", "-q:v", "2"], seconds=3)
+    p = cc.probe_interlace(str(src))
+    assert cc.telecine_verdict(p)[0] is False
+    assert cc.plan_for_file(str(src)).video_filters == []
+    assert cc.forced_class_plan(cc.ANIMATION, p).video_filters == []

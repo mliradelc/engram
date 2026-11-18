@@ -16,7 +16,7 @@ Evaluated top to bottom; first match wins. `sd` = width < 1200, `hd` = 1200-2999
 | Class | Detected by | Action | Settings |
 |---|---|---|---|
 | `passthrough` | source codec already AV1; or `is_extra` and shorter than 180 s | none (file left as filed, marker written) | n/a |
-| `interlaced` | idet says interlaced with a dominant field order; or `field_order` says so when idet is inconclusive; **or interlacing cannot be decided at all** | **deinterlace, then encode** (no flag needed) | `bwdif=mode=send_frame:parity=auto:deint=all`, then AV1 CRF 24, preset 6, film-grain 0 |
+| `interlaced` | idet says interlaced with a dominant field order; or `field_order` says so when idet is inconclusive; **or interlacing cannot be decided at all** | **deinterlace, then encode** (no flag needed) | `bwdif=mode=send_frame:parity=auto:deint=all` (telecined: `fieldmatch,decimate`), then AV1 CRF 24, preset 6, film-grain 0 |
 | `hdr` | `color_transfer` = `smpte2084` (PQ) or `arib-std-b67` (HLG) | AV1, or x265 if the title is also grainy | AV1 CRF 24, preset 6 (8 at uhd), film-grain 4 (0 at uhd), **no luminance-qp-bias**; x265 CRF 20 |
 | `animation` | animation score >= 0.60 and grain below threshold | AV1 | CRF 27, preset 6 (8 uhd), film-grain 0, variance-boost strength 1 |
 | `live_action_grainy` | normalised grain >= 0.40 | **x265** | CRF 20 (sd) / 21, preset medium (fast at uhd), `aq-mode=3` |
@@ -30,16 +30,36 @@ Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-d
 
 ## Deinterlacing: the rule
 
-**An interlaced source is deinterlaced; a progressive source is not.** It is decided per source
-file, from the probe, by one function (`codec_classifier.needs_deinterlace`), on every path:
-automatic classification, a forced class, a pinned class, a retry, and the API. No class, preset,
-pin or setting can turn it on or off; there is no opt-in flag any more (the old
-`ENGRAM_CODEC_INTERLACED` is ignored).
+**An interlaced source is deinterlaced; a progressive source is not; a telecined source is
+inverse-telecined.** It is decided per source file, from the probe, by one function
+(`codec_classifier.deinterlace_filter`, which returns the filter or none; `needs_deinterlace` is its
+boolean form), on every path: automatic classification, a forced class, a pinned class, a retry, and
+the API. No class, preset, pin or setting can turn it on or off; there is no opt-in flag any more
+(the old `ENGRAM_CODEC_INTERLACED` is ignored).
 
+Three-way, checked in this order:
+
+1. **Telecined** (3:2 pulldown, 23.976 film stored as 29.97 interlaced) -> `fieldmatch,decimate`
+   (`IVTC_FILTER`). Checked first because a telecined source is *also* interlaced. Output is 23.976,
+   the film's true rate; `bwdif` would keep 29.97 with the duplicated fields baked in.
+2. **Interlaced, not telecined** (or **undecided**) -> `bwdif`.
+3. **Progressive** -> no filter.
+
+* **Telecine is proven, never assumed.** The signal is idet's `Repeated Fields: Neither/Top/Bottom`
+  line (TFF/BFF cannot tell telecine from true interlacing; both read mostly TFF). Telecined if
+  `(top + bottom) / (neither + top + bottom) >= 0.15` over at least 20 counted frames **and** the
+  stream is ~29.97/30 fps. Measured: progressive 0/144, true interlaced 25i 0/150, telecined 29.97
+  72/180 = 0.40 (3:2 pulldown repeats 2 fields in 10). 0.15 sits in the empty gap. After
+  `fieldmatch,decimate` the telecined count drops to 0; after `bwdif` it stays, so the signal is
+  causal. The 29.97 gate exists because IVTC on true interlaced video is catastrophic and silent:
+  25i through `fieldmatch,decimate` comes out at **20 fps with one frame in five destroyed**. 3:2
+  pulldown cannot produce any other rate, so a PAL (or unknown-rate) source with repeated fields
+  stays on `bwdif`. An undecided probe never selects IVTC.
+* `fieldmatch,decimate` carries no `deint=` / `mode=` options; it is a separate constant.
 * **Interlaced** -> `bwdif` then an ordinary encode. Under a forced or pinned class the class still
   picks codec/CRF/preset and `bwdif` is put in front of it. An interlaced HDR source keeps its HDR
   plan with `bwdif` in front.
-* **Progressive** -> no `bwdif` in the command at all.
+* **Progressive** -> no `bwdif` and no `fieldmatch` in the command at all.
 * **Undecided** (no usable idet and no usable `field_order`, idet combed with no consistent field
   order and no usable `field_order`, or the probe/classifier failed) -> **deinterlaced**. `bwdif`
   on a progressive frame is visually near-lossless; combing baked into an encode is permanent.
@@ -50,10 +70,10 @@ pin or setting can turn it on or off; there is no opt-in flag any more (the old
     field-paired 1080i/25 file tagged progressive: `deint=interlaced` left all 50 frames combed,
     `deint=all` left none.
   * `mode=send_frame` emits one frame per input frame: 1080i/25 stays 25 fps (not 50p), 480i/29.97
-    stays 29.97. No command carries `-r`, `-fps_mode` or `-vsync`; the frame rate follows the content.
-* If the encoder rejects the class settings and the hook falls to the fixed command, `bwdif` is
-  kept. The `ENGRAM_CODEC_CLASSIFIER=0` kill switch is unchanged and byte-identical (no `-vf`).
-* Telecined film is deinterlaced, not inverse-telecined (no IVTC).
+    stays 29.97. No command carries `-r`, `-fps_mode` or `-vsync`; the frame rate follows the content
+    (IVTC's 29.97 -> 23.976 is the filters restoring the true rate, not a forced one).
+* If the encoder rejects the class settings and the hook falls to the fixed command, the
+  deinterlace filter (`bwdif` or `fieldmatch,decimate`) is kept. The `ENGRAM_CODEC_CLASSIFIER=0` kill switch is unchanged and byte-identical (no `-vf`).
 * A marker left by the old "interlaced, left untouched" skip (`codec_class: interlaced`, `av1: null`)
   no longer counts as done, so such a file is encoded the next time the hook or a retry reaches it.
 
@@ -71,6 +91,7 @@ All probes are cheap and best-effort; a failed probe just leaves its key out.
   itself. With fewer than 20 decided frames idet is ignored and `field_order` decides the same way.
   Fewer than 30 % combed frames is progressive whatever `field_order` says (progressive film
   flagged `tt` is common on DVD). A file under 30 s, or with no duration, is sampled from the start only.
+  The same idet runs also accumulate the `Repeated Fields` counters that decide telecine (above).
 * **Resolution, frame rate, colour**: `ffprobe` width/height, `avg_frame_rate`, `color_transfer`.
   Frame-rate class (film24 / pal25 / ntsc30 / high / other) is logged as evidence; it does not
   change settings.
@@ -121,8 +142,8 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
   earlier "not encoded by default" behaviour, which skipped every interlaced DVD and 1080i Blu-ray.
 * A **forced or pinned** class decides codec, CRF and preset only. Deinterlacing is the source's:
   before a forced class is applied, the same idet sampling runs (stream probe + idet, none of the
-  pixel probes), and an interlaced source gets `bwdif` whichever class was chosen. A pin cannot
-  produce combed output. `passthrough` encodes nothing and skips the probe.
+  pixel probes), and an interlaced source gets `bwdif` (a telecined one `fieldmatch,decimate`)
+  whichever class was chosen. A pin cannot produce combed output. `passthrough` encodes nothing and skips the probe.
 * AV1 preset 6 floor; UHD gets 8 and no grain synthesis (SVT warns synthesis above preset 6 is a
   large compute cost).
 
@@ -135,10 +156,15 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
   the `codec_classifier:` log lines from a handful of real titles.
 * DVD MPEG-2 compression noise and mosquito noise read as grain; a clean DVD may land in `grainy`
   (x265 is the slower encode, so that is the costly mistake) and noisy anime may miss `animation`.
-* Telecined or mixed progressive/interlaced film is usually reported as interlaced and is
-  deinterlaced with `bwdif` rather than inverse-telecined, which costs some vertical detail versus a
-  proper IVTC. idet can also misread fast, sharp progressive motion; that errs toward deinterlacing,
-  which is near-lossless on a progressive frame.
+* **Mixed telecine/video** (a 29.97 disc that is part film, part native video, e.g. a
+  documentary or video-edited credits) is a single per-file decision. At >= 0.15 repeated fields
+  (roughly >= 37 % of the sampled material telecined) the whole file is IVTC'd and its video
+  sections are decimated to 23.976 (judder there); below it the whole file gets `bwdif` and the
+  film sections keep their pulldown. Only hard telecine is seen; soft (flag-based) telecine decodes
+  as progressive and correctly gets no filter. The telecine threshold was checked only on synthetic
+  sources (`testsrc2` + `telecine=pattern=23`), not on a real NTSC DVD.
+* idet can misread fast, sharp progressive motion; that errs toward deinterlacing, which is
+  near-lossless on a progressive frame.
 * Already-skipped interlaced files are not swept automatically: they are encoded when the hook next
   sees them, or on a retry from the encode panel.
 * HDR10+ / Dolby Vision dynamic metadata is dropped by both encoders, as before.

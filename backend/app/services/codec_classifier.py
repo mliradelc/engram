@@ -13,8 +13,8 @@ file is importable and testable on its own, independent of the ASR stack that
 Class set (six, evaluated in this order; first match wins)
 ----------------------------------------------------------
 ``passthrough``          already AV1, or a very short extra  -> leave file alone
-``interlaced``           idet / field_order says interlaced, -> deinterlace with
-                         or interlacing cannot be decided      bwdif, then AV1
+``interlaced``           idet / field_order says interlaced, -> bwdif (or IVTC
+                         or interlacing cannot be decided      when telecined), then AV1
 ``hdr``                PQ / HLG transfer                  -> AV1 10-bit, or
                          x265 when the HDR title is also heavily grained
 ``animation``            flat regions, small palette        -> AV1, no grain synth
@@ -82,14 +82,23 @@ Where this module deliberately departs from a source:
   preserve the source's bit depth.  HDR and unknown-depth sources get 10-bit.
 * An operator-forced class decides codec / CRF / preset only.  Resolution, bit
   depth and deinterlacing are the source's (:func:`forced_class_plan`): an
-  interlaced source gets ``bwdif`` under any forced class.
+  interlaced source gets ``bwdif`` (a telecined one IVTC) under any forced class.
 
 Deinterlacing (the principal's rule): **an interlaced source is deinterlaced,
 a progressive source is not.**  It is decided per source file from the probe
-by :func:`needs_deinterlace`, on every path (automatic, forced, pinned, retry,
-API), never by a class, preset, pin or setting; there is no opt-in flag.
+by :func:`deinterlace_filter` (three-way: IVTC / bwdif / nothing), on every
+path (automatic, forced, pinned, retry, API), never by a class, preset, pin or
+setting; there is no opt-in flag.
 
-* Interlaced -> ``bwdif`` (:data:`DEINTERLACE_FILTER`), then an ordinary AV1
+* Telecined (3:2 pulldown: 23.976 film stored as 29.97 interlaced) ->
+  ``fieldmatch,decimate`` (:data:`IVTC_FILTER`), checked FIRST because a
+  telecined source is also interlaced.  Proven, never assumed, by idet's
+  ``Repeated Fields`` line (:func:`telecine_verdict`): progressive and true
+  interlaced sources both measure 0 repeated fields, hard telecine ~0.40.  IVTC
+  restores the true 23.976 fps; ``bwdif`` would keep 29.97 with the duplicated
+  fields baked in.  IVTC on *true* interlaced video is catastrophic (25 fps ->
+  20 fps, one frame in five destroyed), hence the proof and the NTSC-rate gate.
+* Interlaced, not telecined -> ``bwdif`` (:data:`DEINTERLACE_FILTER`), then an ordinary AV1
   encode.  ``deint=all``: every frame of a source judged interlaced is
   deinterlaced, including frames the container tags progressive (with
   ``deint=interlaced`` those passed through still combed).
@@ -99,8 +108,8 @@ API), never by a class, preset, pin or setting; there is no opt-in flag.
 * **Undecided -> deinterlace.**  When neither idet nor ``field_order`` can tell
   (or the probe failed outright), the source is treated as interlaced: bwdif on
   a progressive frame is visually near-lossless, combing in an encode is
-  permanent.  The original stays in the library either way.
-* Telecined film is deinterlaced, not inverse-telecined: IVTC is not attempted.
+  permanent.  The original stays in the library either way.  Undecided never
+  means IVTC: only a measured telecine verdict selects ``fieldmatch``.
 
 
 Presets: preset 6 is the floor for AV1 (i3-7100T, software only); UHD also uses 6.
@@ -164,6 +173,15 @@ _PIX_DEPTH_RE = re.compile(r"(\d+)(?:le|be)$")
 #                    been judged interlaced, so "all" is exactly the rule.
 DEINTERLACE_FILTER = "bwdif=mode=send_frame:parity=auto:deint=all"
 
+# Inverse telecine for 3:2-pulldown sources (see telecine_verdict).  fieldmatch
+# rebuilds the original progressive frames from matching fields; decimate drops
+# the one duplicate in every five, so 29.97 -> 23.976, the film's true rate.
+# Deliberately a separate constant with NO bwdif options: ``deint=`` / ``mode=``
+# mean nothing to fieldmatch/decimate.  No ``-r`` / ``-fps_mode`` / ``-vsync``:
+# the filters set the rate.
+IVTC_FILTER = "fieldmatch,decimate"
+_DEINT_FILTERS = (DEINTERLACE_FILTER, IVTC_FILTER)
+
 SHORT_EXTRA_SECONDS = 180  # an *extra* shorter than this is not worth an encode
 INTERLACED_FRACTION = 0.30  # (tff+bff) / (tff+bff+prog) over idet-decided frames
 IDET_MIN_FRAMES = 20  # fewer decided frames than this and idet is not trusted
@@ -175,6 +193,15 @@ IDET_PARITY_DOMINANCE = 0.75  # real interlace has ONE field order; a TFF/BFF co
 GRAIN_THRESHOLD = 0.40  # normalised grain at/above this -> grainy
 ANIMATION_THRESHOLD = 0.60  # animation score at/above this -> animation
 HINT_NUDGE = 0.05  # how far a tv/movie hint may move a threshold (never a verdict)
+# Telecine: (top + bottom) / (neither + top + bottom) from idet's "Repeated
+# Fields" counter.  3:2 pulldown duplicates 2 fields in every 10 (2 of every 5
+# frames carry a repeat), so hard telecine measures ~0.40 (measured: 36+36 of
+# 180).  Clean progressive and clean true-interlaced sources both measure 0.00
+# (as do static and noise-only interlaced clips), so 0.15 sits in an empty
+# region and needs no tuning.  It also means a disc that is mostly video with
+# some telecined film stays on bwdif: under 0.15 means under ~37 % of the
+# sampled material is telecined, and IVTC would decimate the video parts.
+TELECINE_FRACTION = 0.15
 
 _INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 _HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}  # PQ, HLG
@@ -250,7 +277,8 @@ class CodecPlan:
         """One log line: class, the evidence that drove it, and the outcome."""
         ev = self.evidence
         bits = [f"class={self.class_name}"]
-        for key in ("grain", "animation", "interlaced", "hdr", "res", "fps_class"):
+        for key in ("grain", "animation", "interlaced", "telecined", "hdr", "res",
+                    "fps_class"):
             if key in ev and ev[key] is not None:
                 val = ev[key]
                 bits.append(f"{key}={val:.2f}" if isinstance(val, float) else f"{key}={val}")
@@ -512,10 +540,22 @@ def _plan_for_class(
 
 
 def deinterlaced_plan(res: str, evidence: dict, source_pix_fmt: str | None = None,
-                      reason: str = "") -> CodecPlan:
-    """The plan for an interlaced (or undecided) source: bwdif, then AV1."""
-    return plan_for_class(INTERLACED, res=res, evidence=evidence, reason=reason,
+                      reason: str = "", video_filter: str = DEINTERLACE_FILTER) -> CodecPlan:
+    """The plan for an interlaced (or undecided) source: bwdif, then AV1.
+
+    ``video_filter`` is :func:`deinterlace_filter`'s answer; a telecined source
+    passes :data:`IVTC_FILTER` and gets ``fieldmatch,decimate`` instead.
+    """
+    plan = plan_for_class(INTERLACED, res=res, evidence=evidence, reason=reason,
                           source_pix_fmt=source_pix_fmt)
+    return _with_deint_filter(plan, video_filter)
+
+
+def _with_deint_filter(plan: CodecPlan, video_filter: str | None) -> CodecPlan:
+    """Put exactly the decided deinterlace filter (or none) in front of the plan's own."""
+    rest = [f for f in plan.video_filters if f not in _DEINT_FILTERS]
+    plan.video_filters = ([video_filter] if video_filter else []) + rest
+    return plan
 
 
 def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") -> CodecPlan:
@@ -524,9 +564,10 @@ def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") 
     The class picks codec / CRF / preset.  It does **not** decide what belongs to
     the source: resolution, bit depth and deinterlacing come from ``probe``
     (the flat dict :func:`probe_interlace` returns, plus width/height/pix_fmt).
-    An interlaced source gets ``bwdif`` whichever class was forced, so a pin
-    cannot produce combed output; the decision is :func:`needs_deinterlace`,
-    the same one the automatic path uses (an undecided source deinterlaces).
+    An interlaced source gets ``bwdif`` (a telecined one ``fieldmatch,decimate``)
+    whichever class was forced, so a pin cannot produce combed output; the
+    decision is :func:`deinterlace_filter`, the same one the automatic path uses
+    (an undecided source deinterlaces).
     ``hdr`` / ``interlaced`` are not forceable and are the caller's to refuse;
     this function does not re-check them.
     """
@@ -539,11 +580,9 @@ def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") 
                           source_pix_fmt=p.get("pix_fmt"))
     if plan.is_passthrough:
         return plan  # nothing is encoded, so there is nothing to deinterlace
-    deint, inter_ev = needs_deinterlace(p)
+    vf, inter_ev = deinterlace_filter(p)
     plan.evidence.update(inter_ev)
-    if deint and DEINTERLACE_FILTER not in plan.video_filters:
-        plan.video_filters = [DEINTERLACE_FILTER, *plan.video_filters]
-    return plan
+    return _with_deint_filter(plan, vf)
 
 
 # --------------------------------------------------------------------------
@@ -612,26 +651,85 @@ def interlaced_verdict(probe: dict) -> tuple[bool | None, float | None, str]:
     return None, None, "none"
 
 
-def needs_deinterlace(probe: dict | None) -> tuple[bool, dict]:
-    """THE deinterlace decision: (deinterlace?, evidence).  Never raises.
+def telecine_verdict(probe: dict) -> tuple[bool, float | None, str]:
+    """(telecined?, repeated-field fraction, basis).  Never ``None``: unproven is False.
 
-    The rule: an interlaced source is deinterlaced, a progressive one is not.
-    It depends on the source's probe only, never on a class, preset, pin or
-    setting.  When the probe cannot decide (no usable idet and no usable
-    ``field_order``, or no probe at all) the answer is **deinterlace**: bwdif
-    on a progressive frame is visually near-lossless, while combing left in an
-    encode is permanent.  Every path (automatic, forced, pinned, retry, API)
-    reaches the encoder through this function.
+    The discriminator is idet's ``Repeated Fields`` counter, not TFF/BFF: hard
+    3:2 pulldown and true interlacing both look mostly TFF, but only pulldown
+    *duplicates* fields.  Measured: progressive and true interlaced 0 of N,
+    telecined 29.97 36+36 of 180 (~0.40); after ``fieldmatch,decimate`` the
+    count drops to 0, after ``bwdif`` it stays, so the signal is causal.
+
+    Telecine is only ever declared when it is proven: fewer than
+    :data:`IDET_MIN_FRAMES` counted frames, a fraction under
+    :data:`TELECINE_FRACTION`, or a frame rate that 3:2 pulldown cannot produce
+    (anything but ~29.97/30, or unknown; PAL 25 in particular, where IVTC
+    destroys one frame in five) all answer False, which falls back to the
+    ordinary interlaced/progressive decision.
     """
+    idet = probe.get("idet")
+    if not isinstance(idet, dict):
+        return False, None, "no_repeated_fields"
+    neither, top, bottom = (int(_num(idet.get(k), 0) or 0)
+                            for k in ("repeated_neither", "repeated_top", "repeated_bottom"))
+    counted = neither + top + bottom
+    if counted < IDET_MIN_FRAMES:
+        return False, None, "repeated_fields_too_few"
+    frac = (top + bottom) / counted
+    if frac < TELECINE_FRACTION:
+        return False, frac, "repeated_fields"
+    fpc = fps_class(_num(probe.get("fps")))
+    if fpc != "ntsc30":
+        return False, frac, f"repeated_fields_but_fps_{fpc or 'unknown'}"
+    return True, frac, "repeated_fields"
+
+
+def deinterlace_filter(probe: dict | None) -> tuple[str | None, dict]:
+    """THE deinterlace decision: (filter to apply or None, evidence).  Never raises.
+
+    Three-way, in this order:
+
+    1. telecined (:func:`telecine_verdict`) -> :data:`IVTC_FILTER`.  First,
+       because a telecined source is also interlaced and would otherwise get
+       bwdif, which keeps the repeated fields and the 29.97 rate.
+    2. interlaced, or **undecided** (:func:`interlaced_verdict` is None) ->
+       :data:`DEINTERLACE_FILTER` (bwdif): on a progressive frame it is visually
+       near-lossless, while combing left in an encode is permanent.
+    3. progressive -> None.
+
+    Undecided never selects IVTC: ``fieldmatch,decimate`` on true interlaced
+    video turns 25 fps into 20, so it runs only on a measured telecine verdict.
+    It depends on the source's probe only, never on a class, preset, pin or
+    setting.  Every path (automatic, forced, pinned, retry, API) reaches the
+    encoder through this function.
+    """
+    p = probe if isinstance(probe, dict) else {}
     try:
-        inter, frac, basis = interlaced_verdict(probe if isinstance(probe, dict) else {})
+        inter, frac, basis = interlaced_verdict(p)
     except Exception:  # noqa: BLE001 - an unreadable probe is an undecided one
         inter, frac, basis = None, None, "error"
+    try:
+        tele, tfrac, tbasis = telecine_verdict(p)
+    except Exception:  # noqa: BLE001 - unproven telecine is no telecine
+        tele, tfrac, tbasis = False, None, "error"
     ev: dict = {"interlaced": "yes" if inter else ("no" if inter is False else "unknown"),
-                "interlaced_basis": basis}
+                "interlaced_basis": basis,
+                "telecined": "yes" if tele else "no", "telecine_basis": tbasis}
     if frac is not None:
         ev["interlaced_frac"] = round(frac, 3)
-    return inter is not False, ev
+    if tfrac is not None:
+        ev["repeated_frac"] = round(tfrac, 3)
+    if tele:
+        return IVTC_FILTER, ev
+    if inter is not False:
+        return DEINTERLACE_FILTER, ev
+    return None, ev
+
+
+def needs_deinterlace(probe: dict | None) -> tuple[bool, dict]:
+    """(any deinterlace filter?, evidence): :func:`deinterlace_filter` as a boolean."""
+    vf, ev = deinterlace_filter(probe)
+    return vf is not None, ev
 
 
 def _classify(probe: dict, context: dict) -> CodecPlan:
@@ -663,20 +761,24 @@ def _classify(probe: dict, context: dict) -> CodecPlan:
         return plan_for_class(PASSTHROUGH, res=res, evidence=ev,
                               reason=f"short extra ({duration:.0f}s)")
 
-    # 2. interlaced (or undecided) wins over everything below, including an
-    #    animation hint: it is deinterlaced, then encoded.
-    deint, inter_ev = needs_deinterlace(probe)
+    # 2. telecined / interlaced (or undecided) wins over everything below,
+    #    including an animation hint: it is IVTC'd or deinterlaced, then encoded.
+    vf, inter_ev = deinterlace_filter(probe)
     ev.update(inter_ev)
     ev["hints"] = hints
     transfer = str(probe.get("color_transfer") or "").lower()
     is_hdr = transfer in _HDR_TRANSFERS
-    if deint and not is_hdr:
-        reason = ("interlaced source, deinterlaced" if ev["interlaced"] == "yes"
-                  else "interlacing undecided, deinterlaced to be safe")
-        return deinterlaced_plan(res, ev, reason=reason)
+    if vf and not is_hdr:
+        if vf == IVTC_FILTER:
+            reason = "telecined source, inverse-telecined"
+        elif ev["interlaced"] == "yes":
+            reason = "interlaced source, deinterlaced"
+        else:
+            reason = "interlacing undecided, deinterlaced to be safe"
+        return deinterlaced_plan(res, ev, reason=reason, video_filter=vf)
 
     # 3. HDR.  (Deinterlacing never drops HDR handling: an HDR source that also
-    #    needs it keeps the HDR plan and gets bwdif in front.)
+    #    needs it keeps the HDR plan and gets the decided filter in front.)
     ev["hdr"] = transfer if is_hdr else "no"
 
     grain = _num(probe.get("grain"))
@@ -704,9 +806,7 @@ def _classify(probe: dict, context: dict) -> CodecPlan:
         meta = probe.get("hdr_meta") if isinstance(probe.get("hdr_meta"), dict) else None
         plan = plan_for_class(HDR, res=res, hdr_meta=meta, grainy_hdr=grainy,
                               evidence=ev, reason=f"transfer={transfer}")
-        if deint:
-            plan.video_filters = [DEINTERLACE_FILTER, *plan.video_filters]
-        return plan
+        return _with_deint_filter(plan, vf)
 
     # 4. animation, 5. grainy live action, 6. default.
     # Cel animation has flat fields; measurable grain contradicts that, so a high
@@ -840,10 +940,33 @@ _IDET_RE = re.compile(
     rb"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)"
     rb"\s*Undetermined:\s*(\d+)"
 )
+# The telecine signal (see telecine_verdict): fields idet found duplicated
+# from the previous frame.
+_REPEAT_RE = re.compile(
+    rb"Repeated Fields:\s*Neither:\s*(\d+)\s*Top:\s*(\d+)\s*Bottom:\s*(\d+)"
+)
+_REPEAT_KEYS = ("repeated_neither", "repeated_top", "repeated_bottom")
+
+
+def _parse_idet(stderr: bytes) -> tuple[dict | None, dict | None]:
+    """(detection counts, repeated-field counts) from ONE idet run's stderr.
+
+    ffmpeg 7.x prints the idet summary twice; the first is an empty throw-away
+    filter instance (all zeros), so the real one is the LAST of each line.
+    """
+    found = _IDET_RE.findall(stderr or b"")
+    det = (dict(zip(("tff", "bff", "progressive", "undetermined"),
+                    (int(v) for v in found[-1]), strict=True)) if found else None)
+    reps = _REPEAT_RE.findall(stderr or b"")
+    rep = dict(zip(_REPEAT_KEYS, (int(v) for v in reps[-1]), strict=True)) if reps else None
+    return det, rep
 
 
 def _probe_idet(path: str, times: list[float]) -> dict | None:
-    total = {"tff": 0, "bff": 0, "progressive": 0, "undetermined": 0}
+    """idet over each sample, summed: TFF/BFF/progressive/undetermined plus the
+    repeated-field counters (``repeated_neither/top/bottom``)."""
+    total = {"tff": 0, "bff": 0, "progressive": 0, "undetermined": 0,
+             **dict.fromkeys(_REPEAT_KEYS, 0)}
     seen = False
     for t in times:
         cmd = ["ffmpeg", "-nostdin", "-nostats", "-hide_banner", "-v", "info", "-ss", f"{t:.2f}",
@@ -852,14 +975,15 @@ def _probe_idet(path: str, times: list[float]) -> dict | None:
         run = _run(cmd)
         if not run:
             continue
-        # ffmpeg 7.x prints the idet summary twice; the first is an empty
-        # throw-away filter instance (all zeros), so the real one is the LAST.
-        found = _IDET_RE.findall(run.stderr or b"")
-        m = found[-1] if found else None
-        if m:
+        det, rep = _parse_idet(run.stderr or b"")
+        if det:
             seen = True
-            for key, val in zip(("tff", "bff", "progressive", "undetermined"), m, strict=True):
-                total[key] += int(val)
+            for key, val in det.items():
+                total[key] += val
+        # Only counted alongside a detection row, so both cover the same samples.
+        if det and rep:
+            for key, val in rep.items():
+                total[key] += val
     return total if seen else None
 
 
