@@ -32,8 +32,9 @@ Configuration (environment):
     ENGRAM_AV1_THREADS       encoder thread count, SVT ``lp`` / x265 ``pools``
                              (default 4; applies on every path)
     ENGRAM_CODEC_CLASSIFIER  "0" disables the classifier (fixed CRF/preset).
-    ENGRAM_CODEC_INTERLACED  "deinterlace" to encode interlaced sources through
-                             bwdif; anything else leaves them untouched.
+                             (Deinterlacing is not configurable: an interlaced or
+                             undecided source always gets bwdif, a progressive one
+                             never does.  The old ENGRAM_CODEC_INTERLACED is ignored.)
     ENGRAM_AV1_CRF           fixed-path SVT-AV1 CRF (default 22)      } fallback
     ENGRAM_AV1_PRESET        fixed-path SVT-AV1 preset (default 6)    } path only
     ENGRAM_AV1_MAX_CONCURRENT
@@ -509,9 +510,15 @@ def _already_done(src: Path) -> bool:
     Reads only the top-level ``size``/``mtime``.  The ``override`` pin carries its
     own size/mtime (for staleness) and must never count as "done", or a pin set
     on a fresh rip would make the hook skip the very encode it is meant to steer.
+
+    A record of the old "interlaced, left untouched" skip (class ``interlaced``,
+    no output) is not done: interlaced sources are now deinterlaced and encoded,
+    so such a file is encoded the next time the hook sees it.
     """
     data = _read_marker(src)
     if not data:
+        return False
+    if data.get("codec_class") == "interlaced" and data.get("av1") is None:
         return False
     try:
         st = src.stat()
@@ -741,6 +748,10 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
     Order: the plan's full parameter set, then only its essential parameters
     (drops tuning extras an older encoder may not know), then the fixed legacy
     command.  Returns (args, expected output codec_name, plan-or-None).
+
+    The plan's video filters (``bwdif`` on an interlaced source) belong to the
+    source, not to the settings, so they survive the fall to the fixed command:
+    an encoder rejecting a tuning parameter must not leave combing in.
     """
     if plan is not None:
         for optional in (True, False):
@@ -753,6 +764,9 @@ def _select_video_args(plan, threads: str) -> tuple[list[str], str, object | Non
                 return args, plan.output_codec_name or "av1", plan
         logger.warning("AV1 hook: encoder rejected class=%s settings; using fixed settings",
                        plan.class_name)
+        filters = list(getattr(plan, "video_filters", None) or [])
+        if filters:
+            return ["-vf", ",".join(filters), *_legacy_video_args(threads)], "av1", None
     return _legacy_video_args(threads), "av1", None
 
 
@@ -919,8 +933,9 @@ def _classify(src: Path, context: dict | None):
     if mod is None:
         return None
     try:
-        deinterlace = _cfg("ENGRAM_CODEC_INTERLACED", "").strip().lower() == "deinterlace"
-        plan = mod.plan_for_file(str(src), context, deinterlace=deinterlace)
+        # Deinterlacing is the source's (codec_classifier.needs_deinterlace);
+        # no setting turns it on or off.
+        plan = mod.plan_for_file(str(src), context)
         logger.info("AV1 hook: codec_classifier: %s (%s)", plan.describe(), src.name)
         return plan
     except Exception:  # noqa: BLE001 - fail-open: fixed settings

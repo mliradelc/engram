@@ -13,9 +13,9 @@ file is importable and testable on its own, independent of the ASR stack that
 Class set (six, evaluated in this order; first match wins)
 ----------------------------------------------------------
 ``passthrough``          already AV1, or a very short extra  -> leave file alone
-``interlaced``           idet / field_order says interlaced -> leave file alone
-                         (opt-in: deinterlace with bwdif, then encode as AV1)
-``hdr``                  PQ / HLG transfer                  -> AV1 10-bit, or
+``interlaced``           idet / field_order says interlaced, -> deinterlace with
+                         or interlacing cannot be decided      bwdif, then AV1
+``hdr``                PQ / HLG transfer                  -> AV1 10-bit, or
                          x265 when the HDR title is also heavily grained
 ``animation``            flat regions, small palette        -> AV1, no grain synth
 ``live_action_grainy``   high measured grain                -> x265 10-bit
@@ -23,7 +23,7 @@ Class set (six, evaluated in this order; first match wins)
                          light grain synthesis
 
 Why this set: each class differs in a decision that changes the *command*, not
-just a number.  Interlacing decides whether to encode at all; HDR decides
+just a number.  Interlacing decides the deinterlace filter; HDR decides
 metadata handling and forbids luma-bias; animation decides grain synthesis and
 variance-boost strength; grain decides the codec.  Finer genre splits (sitcom
 vs. drama, CGI vs. anime) are not separable by cheap probes and would be
@@ -83,11 +83,25 @@ Where this module deliberately departs from a source:
 * An operator-forced class decides codec / CRF / preset only.  Resolution, bit
   depth and deinterlacing are the source's (:func:`forced_class_plan`): an
   interlaced source gets ``bwdif`` under any forced class.
-* Interlaced material is **not encoded** by default.  Automatic deinterlacing
-  is irreversible, and telecined film (where idet reports mixed frames) needs
-  IVTC, not a deinterlacer; guessing wrong bakes in combing or ghosting.  The
-  original is already in the library, so skipping loses nothing.  Opt in with
-  ``deinterlace=True`` (hook env ``ENGRAM_CODEC_INTERLACED=deinterlace``).
+
+Deinterlacing (the principal's rule): **an interlaced source is deinterlaced,
+a progressive source is not.**  It is decided per source file from the probe
+by :func:`needs_deinterlace`, on every path (automatic, forced, pinned, retry,
+API), never by a class, preset, pin or setting; there is no opt-in flag.
+
+* Interlaced -> ``bwdif`` (:data:`DEINTERLACE_FILTER`), then an ordinary AV1
+  encode.  ``deint=all``: every frame of a source judged interlaced is
+  deinterlaced, including frames the container tags progressive (with
+  ``deint=interlaced`` those passed through still combed).
+* ``mode=send_frame``: one frame out per frame in, so 1080i/25 stays 25 fps and
+  480i/29.97 stays 29.97; no command carries ``-r`` / ``-fps_mode`` / ``-vsync``.
+* Progressive -> no ``bwdif`` at all.
+* **Undecided -> deinterlace.**  When neither idet nor ``field_order`` can tell
+  (or the probe failed outright), the source is treated as interlaced: bwdif on
+  a progressive frame is visually near-lossless, combing in an encode is
+  permanent.  The original stays in the library either way.
+* Telecined film is deinterlaced, not inverse-telecined: IVTC is not attempted.
+
 
 Presets: preset 6 is the floor for AV1 (i3-7100T, software only); UHD also uses 6.
 Preset 2-4 is never emitted.  x265 uses ``slow`` at HD, ``medium`` at SD, ``fast`` at UHD.
@@ -123,7 +137,9 @@ LIVE_ACTION_GRAINY = "live_action_grainy"
 LIVE_ACTION_CLEAN = "live_action_clean"
 
 CLASSES = (PASSTHROUGH, INTERLACED, HDR, ANIMATION, LIVE_ACTION_GRAINY, LIVE_ACTION_CLEAN)
-DEFAULT_CLASS = LIVE_ACTION_CLEAN  # what an empty / unusable probe falls back to
+# What a progressive source with no grain/animation measurement falls back to.
+# (A probe too empty to decide interlacing goes to INTERLACED: see needs_deinterlace.)
+DEFAULT_CLASS = LIVE_ACTION_CLEAN
 
 # Output bit depth follows the source ("preserve bit"): never reduce a 10-bit
 # source to 8-bit, never pad an 8-bit source to 10-bit.  Chroma is always 4:2:0
@@ -136,13 +152,26 @@ PIX_FMT = PIX_FMT_10BIT
 OUTPUT_PIX_FMTS = (PIX_FMT_8BIT, PIX_FMT_10BIT)
 _PIX_DEPTH_RE = re.compile(r"(\d+)(?:le|be)$")
 
-DEINTERLACE_FILTER = "bwdif=mode=send_frame:parity=auto:deint=interlaced"
+# The one deinterlacer, used by the automatic path and the forced/pinned path
+# alike (both read this constant; there is no second variant).
+#   mode=send_frame  one frame out per frame in: 1080i/25 stays 25 fps, never 50p
+#                    (the frame rate follows the content and is not changed).
+#   parity=auto      field order from each frame's flag (TFF when unflagged).
+#   deint=all        deinterlace EVERY frame.  ``deint=interlaced`` only touches
+#                    frames whose flag says interlaced, so a combed source whose
+#                    frames are tagged progressive (common on DVD) passed through
+#                    still combed.  The filter is only added once the *source* has
+#                    been judged interlaced, so "all" is exactly the rule.
+DEINTERLACE_FILTER = "bwdif=mode=send_frame:parity=auto:deint=all"
 
 SHORT_EXTRA_SECONDS = 180  # an *extra* shorter than this is not worth an encode
 INTERLACED_FRACTION = 0.30  # (tff+bff) / (tff+bff+prog) over idet-decided frames
 IDET_MIN_FRAMES = 20  # fewer decided frames than this and idet is not trusted
 IDET_PARITY_DOMINANCE = 0.75  # real interlace has ONE field order; a TFF/BFF coin-flip
-# is idet misreading sharp progressive detail (measured on synthetic test patterns)
+# is idet misreading sharp progressive detail (measured on synthetic test patterns).
+# Below it idet's "interlaced" is not trusted *on its own*: the container's
+# field_order decides, and with no usable field_order the source is undecided,
+# which deinterlaces (see interlaced_verdict).  It never declares progressive.
 GRAIN_THRESHOLD = 0.40  # normalised grain at/above this -> grainy
 ANIMATION_THRESHOLD = 0.60  # animation score at/above this -> animation
 HINT_NUDGE = 0.05  # how far a tv/movie hint may move a threshold (never a verdict)
@@ -443,9 +472,18 @@ def _plan_for_class(
     # 4K is too high for this software-only CPU, independent of the preset number.
     grain_ok = res != "uhd"
 
-    if class_name == PASSTHROUGH or class_name == INTERLACED:
+    if class_name == PASSTHROUGH:
         return CodecPlan(class_name=class_name, codec="none", reason=reason or class_name,
                          evidence=ev)
+
+    if class_name == INTERLACED:
+        # bwdif, then a conservative AV1 encode.  Film grain synthesis is off:
+        # grain on interlaced sources is unmeasured (field combing inflates the
+        # grain estimate).
+        req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
+        return CodecPlan(INTERLACED, "av1", reason or "interlaced source, deinterlaced",
+                         24, preset, svt_required=req, svt_optional=opt,
+                         video_filters=[DEINTERLACE_FILTER], evidence=ev)
 
     if class_name == ANIMATION:
         req, opt = _av1_base(res, grain=0, vb_strength=1, luma_bias=True)
@@ -473,20 +511,11 @@ def _plan_for_class(
                      svt_required=req, svt_optional=opt, evidence=ev)
 
 
-def deinterlaced_plan(res: str, evidence: dict, source_pix_fmt: str | None = None) -> CodecPlan:
-    """Opt-in path for interlaced sources: bwdif, then a conservative AV1 encode.
-
-    Film grain synthesis is off: grain on interlaced sources is unmeasured
-    (field combing inflates the grain estimate).
-    """
-    req, opt = _av1_base(res, grain=0, vb_strength=2, luma_bias=True)
-    return CodecPlan(
-        INTERLACED, "av1", "interlaced source, deinterlace opted in",
-        24, "6", source_pix_fmt=source_pix_fmt,
-        svt_required=req, svt_optional=opt,
-        video_filters=[DEINTERLACE_FILTER],
-        evidence=evidence,
-    )
+def deinterlaced_plan(res: str, evidence: dict, source_pix_fmt: str | None = None,
+                      reason: str = "") -> CodecPlan:
+    """The plan for an interlaced (or undecided) source: bwdif, then AV1."""
+    return plan_for_class(INTERLACED, res=res, evidence=evidence, reason=reason,
+                          source_pix_fmt=source_pix_fmt)
 
 
 def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") -> CodecPlan:
@@ -496,8 +525,10 @@ def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") 
     the source: resolution, bit depth and deinterlacing come from ``probe``
     (the flat dict :func:`probe_interlace` returns, plus width/height/pix_fmt).
     An interlaced source gets ``bwdif`` whichever class was forced, so a pin
-    cannot produce combed output.  ``hdr`` / ``interlaced`` are not forceable
-    and are the caller's to refuse; this function does not re-check them.
+    cannot produce combed output; the decision is :func:`needs_deinterlace`,
+    the same one the automatic path uses (an undecided source deinterlaces).
+    ``hdr`` / ``interlaced`` are not forceable and are the caller's to refuse;
+    this function does not re-check them.
     """
     p = probe if isinstance(probe, dict) else {}
     width = int(_num(p.get("width"), 0) or 0) or None
@@ -508,12 +539,9 @@ def forced_class_plan(class_name: str, probe: dict | None, *, reason: str = "") 
                           source_pix_fmt=p.get("pix_fmt"))
     if plan.is_passthrough:
         return plan  # nothing is encoded, so there is nothing to deinterlace
-    inter, frac, basis = interlaced_verdict(p)
-    plan.evidence["interlaced"] = "yes" if inter else ("no" if inter is False else "unknown")
-    if frac is not None:
-        plan.evidence["interlaced_frac"] = round(frac, 3)
-    plan.evidence["interlaced_basis"] = basis
-    if inter and DEINTERLACE_FILTER not in plan.video_filters:
+    deint, inter_ev = needs_deinterlace(p)
+    plan.evidence.update(inter_ev)
+    if deint and DEINTERLACE_FILTER not in plan.video_filters:
         plan.video_filters = [DEINTERLACE_FILTER, *plan.video_filters]
     return plan
 
@@ -547,10 +575,13 @@ def fps_class(fps: float | None) -> str | None:
 
 
 def interlaced_verdict(probe: dict) -> tuple[bool | None, float | None, str]:
-    """(interlaced?, idet fraction, basis).  ``None`` means unknown.
+    """(interlaced?, idet fraction, basis).  ``None`` means undecided.
 
     idet on a spread of samples beats the container's ``field_order`` flag:
     a progressive film flagged ``tt`` is common on DVD, and the reverse exists.
+    ``field_order`` is the tie-breaker when idet is too thin to trust or is
+    combed-looking with no consistent field order.  This function only reports;
+    :func:`needs_deinterlace` turns ``None`` into "deinterlace".
     """
     idet = probe.get("idet")
     if isinstance(idet, dict):
@@ -561,13 +592,17 @@ def interlaced_verdict(probe: dict) -> tuple[bool | None, float | None, str]:
             if frac >= INTERLACED_FRACTION:
                 if max(tff, bff) / (tff + bff) >= IDET_PARITY_DOMINANCE:
                     return True, frac, "idet"
-                # Combed-looking but with no consistent field order: do not trust
-                # idet over the container; fall through to field_order.
+                # Combed-looking but with no consistent field order (idet can
+                # misread sharp progressive detail this way, and a real source
+                # can switch field order at edits).  Not trusted on its own and
+                # never read as progressive: field_order decides, else undecided.
                 basis = "idet_mixed_parity"
                 fo = str(probe.get("field_order") or "").lower()
                 if fo in _INTERLACED_FIELD_ORDERS:
                     return True, frac, basis + "+field_order"
-                return False, frac, basis
+                if fo == "progressive":
+                    return False, frac, basis + "+field_order"
+                return None, frac, basis
             return False, frac, "idet"
     fo = str(probe.get("field_order") or "").lower()
     if fo in _INTERLACED_FIELD_ORDERS:
@@ -577,7 +612,29 @@ def interlaced_verdict(probe: dict) -> tuple[bool | None, float | None, str]:
     return None, None, "none"
 
 
-def _classify(probe: dict, context: dict, deinterlace: bool) -> CodecPlan:
+def needs_deinterlace(probe: dict | None) -> tuple[bool, dict]:
+    """THE deinterlace decision: (deinterlace?, evidence).  Never raises.
+
+    The rule: an interlaced source is deinterlaced, a progressive one is not.
+    It depends on the source's probe only, never on a class, preset, pin or
+    setting.  When the probe cannot decide (no usable idet and no usable
+    ``field_order``, or no probe at all) the answer is **deinterlace**: bwdif
+    on a progressive frame is visually near-lossless, while combing left in an
+    encode is permanent.  Every path (automatic, forced, pinned, retry, API)
+    reaches the encoder through this function.
+    """
+    try:
+        inter, frac, basis = interlaced_verdict(probe if isinstance(probe, dict) else {})
+    except Exception:  # noqa: BLE001 - an unreadable probe is an undecided one
+        inter, frac, basis = None, None, "error"
+    ev: dict = {"interlaced": "yes" if inter else ("no" if inter is False else "unknown"),
+                "interlaced_basis": basis}
+    if frac is not None:
+        ev["interlaced_frac"] = round(frac, 3)
+    return inter is not False, ev
+
+
+def _classify(probe: dict, context: dict) -> CodecPlan:
     ev: dict = {}
     hints: list[str] = []
 
@@ -606,22 +663,20 @@ def _classify(probe: dict, context: dict, deinterlace: bool) -> CodecPlan:
         return plan_for_class(PASSTHROUGH, res=res, evidence=ev,
                               reason=f"short extra ({duration:.0f}s)")
 
-    # 2. interlaced wins over everything below, including an animation hint.
-    inter, frac, basis = interlaced_verdict(probe)
-    ev["interlaced"] = "yes" if inter else ("no" if inter is False else "unknown")
-    if frac is not None:
-        ev["interlaced_frac"] = round(frac, 3)
-    ev["interlaced_basis"] = basis
+    # 2. interlaced (or undecided) wins over everything below, including an
+    #    animation hint: it is deinterlaced, then encoded.
+    deint, inter_ev = needs_deinterlace(probe)
+    ev.update(inter_ev)
     ev["hints"] = hints
-    if inter:
-        if deinterlace:
-            return deinterlaced_plan(res, ev)
-        return plan_for_class(INTERLACED, res=res, evidence=ev,
-                              reason="interlaced source left untouched (deinterlace not enabled)")
-
-    # 3. HDR.
     transfer = str(probe.get("color_transfer") or "").lower()
     is_hdr = transfer in _HDR_TRANSFERS
+    if deint and not is_hdr:
+        reason = ("interlaced source, deinterlaced" if ev["interlaced"] == "yes"
+                  else "interlacing undecided, deinterlaced to be safe")
+        return deinterlaced_plan(res, ev, reason=reason)
+
+    # 3. HDR.  (Deinterlacing never drops HDR handling: an HDR source that also
+    #    needs it keeps the HDR plan and gets bwdif in front.)
     ev["hdr"] = transfer if is_hdr else "no"
 
     grain = _num(probe.get("grain"))
@@ -647,8 +702,11 @@ def _classify(probe: dict, context: dict, deinterlace: bool) -> CodecPlan:
     grainy = grain is not None and grain >= grain_thr
     if is_hdr:
         meta = probe.get("hdr_meta") if isinstance(probe.get("hdr_meta"), dict) else None
-        return plan_for_class(HDR, res=res, hdr_meta=meta, grainy_hdr=grainy,
+        plan = plan_for_class(HDR, res=res, hdr_meta=meta, grainy_hdr=grainy,
                               evidence=ev, reason=f"transfer={transfer}")
+        if deint:
+            plan.video_filters = [DEINTERLACE_FILTER, *plan.video_filters]
+        return plan
 
     # 4. animation, 5. grainy live action, 6. default.
     # Cel animation has flat fields; measurable grain contradicts that, so a high
@@ -661,21 +719,27 @@ def _classify(probe: dict, context: dict, deinterlace: bool) -> CodecPlan:
     return plan_for_class(LIVE_ACTION_CLEAN, res=res, evidence=ev, reason=reason)
 
 
-def classify(probe: dict | None, context: dict | None = None, *,
-             deinterlace: bool = False) -> CodecPlan:
+def _undecided_plan(error: str, reason: str) -> CodecPlan:
+    """What a failure falls back to: nothing is known, so it deinterlaces."""
+    return deinterlaced_plan("hd", {"error": error, "interlaced": "unknown",
+                                    "interlaced_basis": "error"}, reason=reason)
+
+
+def classify(probe: dict | None, context: dict | None = None) -> CodecPlan:
     """Pick a plan from a probe dict and an optional identification context.
 
-    Never raises: any error yields the safe default class with the error recorded.
+    Never raises: an error yields the undecided-source plan (deinterlace, then
+    AV1) with the error recorded.
     """
     try:
         p = probe if isinstance(probe, dict) else {}
-        plan = _classify(p, context if isinstance(context, dict) else {}, deinterlace)
+        plan = _classify(p, context if isinstance(context, dict) else {})
         # Bit depth belongs to the source, whichever class was chosen.
         plan.source_pix_fmt = p.get("pix_fmt")
         return plan
     except Exception as exc:  # noqa: BLE001 - classifier must never break the hook
-        logger.warning("codec_classifier: classify failed (%s); using default class", exc)
-        return plan_for_class(DEFAULT_CLASS, evidence={"error": str(exc)}, reason="classify error")
+        logger.warning("codec_classifier: classify failed (%s); deinterlacing to be safe", exc)
+        return _undecided_plan(str(exc), "classify error")
 
 
 # --------------------------------------------------------------------------
@@ -961,11 +1025,10 @@ def probe_interlace(path: str) -> dict:
     return probe
 
 
-def plan_for_file(path: str, context: dict | None = None, *,
-                  deinterlace: bool = False) -> CodecPlan:
+def plan_for_file(path: str, context: dict | None = None) -> CodecPlan:
     """Probe ``path`` and classify it.  Never raises."""
     try:
-        return classify(probe_media(str(path)), context, deinterlace=deinterlace)
+        return classify(probe_media(str(path)), context)
     except Exception as exc:  # noqa: BLE001
         logger.warning("codec_classifier: plan_for_file failed (%s)", exc)
-        return plan_for_class(DEFAULT_CLASS, evidence={"error": str(exc)}, reason="probe error")
+        return _undecided_plan(str(exc), "probe error")

@@ -16,11 +16,11 @@ Evaluated top to bottom; first match wins. `sd` = width < 1200, `hd` = 1200-2999
 | Class | Detected by | Action | Settings |
 |---|---|---|---|
 | `passthrough` | source codec already AV1; or `is_extra` and shorter than 180 s | none (file left as filed, marker written) | n/a |
-| `interlaced` | idet says interlaced with a dominant field order, or `field_order` says so when idet is inconclusive | **none by default**; opt in to deinterlace | opt-in: `bwdif=send_frame`, then AV1 CRF 24, preset 6 (8 at uhd), film-grain 0 |
+| `interlaced` | idet says interlaced with a dominant field order; or `field_order` says so when idet is inconclusive; **or interlacing cannot be decided at all** | **deinterlace, then encode** (no flag needed) | `bwdif=mode=send_frame:parity=auto:deint=all`, then AV1 CRF 24, preset 6, film-grain 0 |
 | `hdr` | `color_transfer` = `smpte2084` (PQ) or `arib-std-b67` (HLG) | AV1, or x265 if the title is also grainy | AV1 CRF 24, preset 6 (8 at uhd), film-grain 4 (0 at uhd), **no luminance-qp-bias**; x265 CRF 20 |
 | `animation` | animation score >= 0.60 and grain below threshold | AV1 | CRF 27, preset 6 (8 uhd), film-grain 0, variance-boost strength 1 |
 | `live_action_grainy` | normalised grain >= 0.40 | **x265** | CRF 20 (sd) / 21, preset medium (fast at uhd), `aq-mode=3` |
-| `live_action_clean` | everything else, **and the fallback for an empty/unusable probe** | AV1 | CRF 23 (sd) / 25, preset 6 (8 uhd), film-grain 4 (0 at uhd), variance-boost strength 2, luminance-qp-bias 25 |
+| `live_action_clean` | everything else (a progressive source with no grain/animation measurement lands here; a probe too empty to decide interlacing goes to `interlaced`) | AV1 | CRF 23 (sd) / 25, preset 6 (8 uhd), film-grain 4 (0 at uhd), variance-boost strength 2, luminance-qp-bias 25 |
 
 Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-denoise=0`
 (this SVT build defaults denoising **on**, which would stack on top of real grain) and
@@ -28,16 +28,49 @@ Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-d
 `variance-boost-strength`, `tf-strength=1`, `sharpness=1`, `luminance-qp-bias` (SDR only),
 `tile-columns` (1 at hd, 2 at uhd). AV1 preset 2-4 is never emitted (i3-7100T, software only).
 
+## Deinterlacing: the rule
+
+**An interlaced source is deinterlaced; a progressive source is not.** It is decided per source
+file, from the probe, by one function (`codec_classifier.needs_deinterlace`), on every path:
+automatic classification, a forced class, a pinned class, a retry, and the API. No class, preset,
+pin or setting can turn it on or off; there is no opt-in flag any more (the old
+`ENGRAM_CODEC_INTERLACED` is ignored).
+
+* **Interlaced** -> `bwdif` then an ordinary encode. Under a forced or pinned class the class still
+  picks codec/CRF/preset and `bwdif` is put in front of it. An interlaced HDR source keeps its HDR
+  plan with `bwdif` in front.
+* **Progressive** -> no `bwdif` in the command at all.
+* **Undecided** (no usable idet and no usable `field_order`, idet combed with no consistent field
+  order and no usable `field_order`, or the probe/classifier failed) -> **deinterlaced**. `bwdif`
+  on a progressive frame is visually near-lossless; combing baked into an encode is permanent.
+* The filter is one shared constant, `DEINTERLACE_FILTER = bwdif=mode=send_frame:parity=auto:deint=all`:
+  * `deint=all` deinterlaces every frame of a source judged interlaced. The previous
+    `deint=interlaced` only touched frames *flagged* interlaced, so a combed source whose frames
+    are tagged progressive (common on DVD) came out still combed. Verified on a synthetic
+    field-paired 1080i/25 file tagged progressive: `deint=interlaced` left all 50 frames combed,
+    `deint=all` left none.
+  * `mode=send_frame` emits one frame per input frame: 1080i/25 stays 25 fps (not 50p), 480i/29.97
+    stays 29.97. No command carries `-r`, `-fps_mode` or `-vsync`; the frame rate follows the content.
+* If the encoder rejects the class settings and the hook falls to the fixed command, `bwdif` is
+  kept. The `ENGRAM_CODEC_CLASSIFIER=0` kill switch is unchanged and byte-identical (no `-vf`).
+* Telecined film is deinterlaced, not inverse-telecined (no IVTC).
+* A marker left by the old "interlaced, left untouched" skip (`codec_class: interlaced`, `av1: null`)
+  no longer counts as done, so such a file is encoded the next time the hook or a retry reaches it.
+
 ## Detection signals
 
 All probes are cheap and best-effort; a failed probe just leaves its key out.
 
 * **Interlacing**: `ffmpeg -vf idet` on five 3-second samples spread across the title (12/30/48/66/84 %
-  of the duration, not the first seconds, which are often a logo or black). Interlaced if at least 30 %
-  of decided frames are TFF/BFF **and** one field order dominates (>= 75 %). A coin-flip TFF/BFF
-  split is idet misreading sharp progressive detail (observed on synthetic test patterns), so it is
-  not trusted over the container's `field_order`. With fewer than 20 decided frames idet is ignored
-  and `field_order` (`tt/bb/tb/bt` = interlaced) decides.
+  of the duration, not the first seconds, which are often a logo or black, and a Blu-ray may open on a
+  progressive title sequence). Interlaced if at least 30 % of decided frames are TFF/BFF **and** one
+  field order dominates (>= 75 %). A coin-flip TFF/BFF split can be idet misreading sharp progressive
+  detail (observed on synthetic test patterns), so on its own it is not trusted: `field_order`
+  decides (`tt/bb/tb/bt` = interlaced, `progressive` = progressive), and with no usable
+  `field_order` the source is undecided, which deinterlaces. It is never read as progressive by
+  itself. With fewer than 20 decided frames idet is ignored and `field_order` decides the same way.
+  Fewer than 30 % combed frames is progressive whatever `field_order` says (progressive film
+  flagged `tt` is common on DVD). A file under 30 s, or with no duration, is sampled from the start only.
 * **Resolution, frame rate, colour**: `ffprobe` width/height, `avg_frame_rate`, `color_transfer`.
   Frame-rate class (film24 / pal25 / ntsc30 / high / other) is logged as evidence; it does not
   change settings.
@@ -84,9 +117,8 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
 * Grainy live action goes to x265. With `film-grain-denoise=0` SVT keeps real grain and pays for
   it; JET puts the AV1/x265 crossover near CRF 20. Denoise-then-synthesise was rejected: it
   removes detail and JET calls SVT's denoiser poor.
-* Interlaced is **not** encoded by default. Deinterlacing is irreversible, and telecined film
-  needs IVTC rather than a deinterlacer; guessing wrong bakes in combing. The original is already in
-  the library, so skipping loses nothing.
+* Interlaced is **deinterlaced and encoded** (see "Deinterlacing: the rule"). This replaces the
+  earlier "not encoded by default" behaviour, which skipped every interlaced DVD and 1080i Blu-ray.
 * A **forced or pinned** class decides codec, CRF and preset only. Deinterlacing is the source's:
   before a forced class is applied, the same idet sampling runs (stream probe + idet, none of the
   pixel probes), and an interlaced source gets `bwdif` whichever class was chosen. A pin cannot
@@ -103,10 +135,12 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
   the `codec_classifier:` log lines from a handful of real titles.
 * DVD MPEG-2 compression noise and mosquito noise read as grain; a clean DVD may land in `grainy`
   (x265 is the slower encode, so that is the costly mistake) and noisy anime may miss `animation`.
-* Telecined or mixed progressive/interlaced film is usually reported as interlaced and skipped.
-  idet can also misread fast, sharp progressive motion. Both fail safe: nothing is encoded.
-* Passthrough writes a marker, so flipping `ENGRAM_CODEC_INTERLACED=deinterlace` later does not
-  revisit already-skipped files (delete the `*.engram-av1.json` marker to retry).
+* Telecined or mixed progressive/interlaced film is usually reported as interlaced and is
+  deinterlaced with `bwdif` rather than inverse-telecined, which costs some vertical detail versus a
+  proper IVTC. idet can also misread fast, sharp progressive motion; that errs toward deinterlacing,
+  which is near-lossless on a progressive frame.
+* Already-skipped interlaced files are not swept automatically: they are encoded when the hook next
+  sees them, or on a retry from the encode panel.
 * HDR10+ / Dolby Vision dynamic metadata is dropped by both encoders, as before.
 * x265 output is HEVC in an `.mkv` named like the source. The hook only writes it to the staging
   directory; confirm the curator/media server accepts HEVC there before enabling grainy-class
@@ -127,7 +161,7 @@ the Doom9 SVT-AV1 thread; the Netflix grain-synthesis post is cited by the spec 
 |---|---|
 | `ENGRAM_AV1_HOOK=1` | enables the hook (unchanged) |
 | `ENGRAM_CODEC_CLASSIFIER=0` | **kill switch**: restores the original fixed command exactly (`-c:v libsvtav1 -crf 22 -preset 6 -svtav1-params tune=0:lp=4`, no `-pix_fmt`); the classifier is not even loaded |
-| `ENGRAM_CODEC_INTERLACED=deinterlace` | encode interlaced sources through `bwdif` instead of leaving them alone |
+| ~~`ENGRAM_CODEC_INTERLACED`~~ | **removed, ignored.** Deinterlacing follows the source, not a setting |
 | `ENGRAM_AV1_THREADS` | SVT `lp` / x265 `pools`; applies on every path |
 | `ENGRAM_AV1_CRF`, `ENGRAM_AV1_PRESET` | **fallback path only** (kill switch, classifier failure, or encoder rejecting the class settings). They no longer influence classified encodes |
 | `ENGRAM_AV1_STAGING` | output directory (unchanged) |

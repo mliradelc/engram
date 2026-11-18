@@ -87,10 +87,14 @@ def test_short_extra_is_passthrough_only_when_flagged_as_extra():
 @pytest.mark.parametrize("bad", [None, {}, [], "garbage", 42,
                                  {"width": "wide", "grain": "lots", "idet": "yes", "fps": []},
                                  {"idet": {"tff": None, "bff": "x"}, "color_transfer": 5}])
-def test_unknown_or_malformed_probe_falls_back_and_never_raises(bad):
+def test_unknown_or_malformed_probe_deinterlaces_and_never_raises(bad):
+    # Nothing tells interlacing apart, so the source is treated as interlaced:
+    # bwdif on progressive is near-lossless, combing in an encode is permanent.
     plan = cc.classify(bad, None)
-    assert plan.class_name == cc.DEFAULT_CLASS
+    assert plan.class_name == cc.INTERLACED
     assert plan.codec == "av1"
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    assert plan.evidence["interlaced"] == "unknown"
     assert cc.validate_plan(plan) == []
 
 
@@ -102,7 +106,9 @@ def test_malformed_context_never_raises(ctx):
 
 def test_plan_for_file_on_a_missing_file_returns_the_default():
     plan = cc.plan_for_file("/nonexistent/definitely-not-here.mkv", {"content_type": "tv"})
-    assert plan.class_name == cc.DEFAULT_CLASS
+    # An unprobeable file is undecided, which deinterlaces.
+    assert plan.class_name == cc.INTERLACED
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
 
 
 # ---------------------------------------------------------------------------
@@ -114,12 +120,17 @@ def test_interlaced_detection_beats_an_animation_hint():
     p = probe(idet=INTERLACED_IDET, field_order="tt", animation=0.95, grain=0.0)
     plan = cc.classify(p, {"content_type": "tv", "is_extra": False})
     assert plan.class_name == cc.INTERLACED
-    assert plan.is_passthrough
+    assert not plan.is_passthrough
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
 
 
-def test_interlaced_beats_hdr_and_grain_too():
-    p = probe(idet=INTERLACED_IDET, color_transfer="smpte2084", grain=0.9)
-    assert cc.classify(p).class_name == cc.INTERLACED
+def test_interlaced_beats_grain_and_keeps_hdr_with_bwdif():
+    assert cc.classify(probe(idet=INTERLACED_IDET, grain=0.9)).class_name == cc.INTERLACED
+    # Deinterlacing never costs an HDR source its HDR handling.
+    plan = cc.classify(probe(idet=INTERLACED_IDET, color_transfer="smpte2084", grain=0.1))
+    assert plan.class_name == cc.HDR and plan.hdr
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    assert cc.validate_plan(plan) == []
 
 
 def test_idet_overrules_a_misleading_field_order_flag():
@@ -147,9 +158,11 @@ def test_field_order_is_used_when_idet_is_inconclusive():
             == cc.LIVE_ACTION_CLEAN)
 
 
-def test_interlaced_can_opt_in_to_deinterlace_and_still_forces_denoise_off():
+def test_interlaced_source_is_deinterlaced_with_no_flag_and_forces_denoise_off(monkeypatch):
+    # The old opt-in variable must not matter, either way.
+    monkeypatch.delenv("ENGRAM_CODEC_INTERLACED", raising=False)
     p = probe(idet=INTERLACED_IDET)
-    plan = cc.classify(p, deinterlace=True)
+    plan = cc.classify(p)
     assert plan.class_name == cc.INTERLACED and plan.codec == "av1"
     args = plan.video_args(4)
     assert "bwdif" in args[args.index("-vf") + 1]
@@ -309,8 +322,7 @@ def test_every_x265_plan_requires_anti_smoothing_params(res, optional):
 @pytest.mark.parametrize("res", ["sd", "hd", "uhd"])
 def test_no_plan_emits_av1_preset_8(res):
     plans = [cc.plan_for_class(n, res=res, hdr_meta=HDR_META) for n in cc.CLASSES]
-    plans.append(cc.classify(probe(idet=INTERLACED_IDET, width=720 if res == "sd" else 1920),
-                             deinterlace=True))
+    plans.append(cc.classify(probe(idet=INTERLACED_IDET, width=720 if res == "sd" else 1920)))
     assert any(p.codec == "av1" for p in plans)
     for p in plans:
         if p.codec == "av1":
@@ -337,8 +349,7 @@ def test_clean_crf_is_24_hd_and_23_sd():
 @pytest.mark.parametrize("name", list(cc.CLASSES))
 def test_film_grain_denoise_zero_in_every_av1_param_string(name, res, optional):
     for plan in (cc.plan_for_class(name, res=res, hdr_meta=HDR_META),
-                 cc.classify(probe(idet=INTERLACED_IDET, width=720 if res == "sd" else 1920),
-                             deinterlace=True)):
+                 cc.classify(probe(idet=INTERLACED_IDET, width=720 if res == "sd" else 1920))):
         if plan.codec != "av1":
             continue
         args = plan.video_args(4, optional=optional)
@@ -393,7 +404,7 @@ def test_classify_derives_pix_fmt_from_the_probe(name, src_fmt, want):
 @pytest.mark.parametrize("name", ENCODING_CLASSES)
 def test_no_class_ever_emits_a_pix_fmt_shallower_than_its_source(name, src_fmt):
     plans = [cc.plan_for_class(name, res="hd", hdr_meta=HDR_META, source_pix_fmt=src_fmt),
-             cc.classify(probe(idet=INTERLACED_IDET, pix_fmt=src_fmt), deinterlace=True)]
+             cc.classify(probe(idet=INTERLACED_IDET, pix_fmt=src_fmt))]
     for plan in plans:
         out = cc.source_bit_depth(plan.pix_fmt)
         assert out >= min(cc.source_bit_depth(src_fmt), 10)
@@ -566,8 +577,8 @@ class _FakeClassifier:
     def __init__(self, plan):
         self._plan = plan
 
-    def plan_for_file(self, path, context=None, *, deinterlace=False):
-        self.seen = (path, context, deinterlace)
+    def plan_for_file(self, path, context=None):
+        self.seen = (path, context)
         return self._plan
 
 
@@ -658,7 +669,7 @@ def test_hdr_transfer_loss_aborts_the_swap(hook, monkeypatch):
 
 def test_passthrough_plan_encodes_nothing_and_writes_an_idempotent_marker(hook, monkeypatch):
     src, tmp = hook
-    plan = cc.plan_for_class(cc.INTERLACED, reason="interlaced")
+    plan = cc.plan_for_class(cc.PASSTHROUGH, reason="source already AV1")
     monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
     calls: list = []
     monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
@@ -666,7 +677,7 @@ def test_passthrough_plan_encodes_nothing_and_writes_an_idempotent_marker(hook, 
     assert _encode_cmds(calls) == []
     assert not (tmp / "stage").exists() or not any((tmp / "stage").iterdir())
     marker = json.loads((src.parent / (src.name + av1_hook.MARKER_SUFFIX)).read_text())
-    assert marker["av1"] is None and marker["codec_class"] == cc.INTERLACED
+    assert marker["av1"] is None and marker["codec_class"] == cc.PASSTHROUGH
     # Second call is a no-op (marker matches size+mtime).
     monkeypatch.setattr(av1_hook, "_load_classifier",
                         lambda: pytest.fail("re-classified an already-handled file"))
@@ -811,7 +822,7 @@ def test_emitted_command_encodes_to_the_intended_codec_and_pix_fmt(name, res, sy
 
 @needs_ffmpeg
 def test_deinterlace_command_parses_and_encodes_av1_10_bit(synth, tmp_path):
-    plan = cc.classify(probe(idet=INTERLACED_IDET), deinterlace=True)
+    plan = cc.classify(probe(idet=INTERLACED_IDET))
     args = plan.video_args(2)
     args[args.index("-preset") + 1] = "12"
     out = tmp_path / "d.mkv"
@@ -951,3 +962,233 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
     src_counts = av1_hook._track_counts(av1_hook._probe(src))
     assert av1_hook._track_counts(probe_out) == src_counts == (1, 1)
     assert (src.parent / (src.name + av1_hook.MARKER_SUFFIX)).exists()
+
+
+# ---------------------------------------------------------------------------
+# The deinterlace rule: interlaced source -> deinterlace; progressive -> don't.
+# ---------------------------------------------------------------------------
+
+_FRAME_RATE_FLAGS = ("-r", "-fps_mode", "-vsync", "-filter:v:r")
+
+
+def _vf(args: list[str]) -> str | None:
+    return args[args.index("-vf") + 1] if "-vf" in args else None
+
+
+def test_deinterlace_filter_is_deint_all_send_frame():
+    f = cc.DEINTERLACE_FILTER
+    assert f == "bwdif=mode=send_frame:parity=auto:deint=all"
+    assert "mode=send_frame" in f and "send_field" not in f
+    assert "deint=interlaced" not in f
+
+
+def test_automatic_and_forced_paths_use_the_identical_filter():
+    """One shared constant: the two paths cannot diverge."""
+    auto = cc.classify(probe(idet=INTERLACED_IDET))
+    forced = cc.forced_class_plan(cc.LIVE_ACTION_CLEAN,
+                                  {"width": 1920, "height": 1080, "idet": INTERLACED_IDET})
+    undecided = cc.classify({})
+    assert auto.video_filters == forced.video_filters == undecided.video_filters \
+        == [cc.DEINTERLACE_FILTER]
+    assert _vf(auto.video_args(4)) == _vf(forced.video_args(4)) == cc.DEINTERLACE_FILTER
+
+
+@pytest.mark.parametrize("name", [n for n in cc.CLASSES if n != cc.PASSTHROUGH])
+def test_progressive_source_never_gets_bwdif(name):
+    prog = {"width": 1920, "height": 1080, "field_order": "progressive", "idet": PROGRESSIVE}
+    if name == cc.INTERLACED:
+        plan = cc.classify(probe())  # automatic path on a progressive source
+        assert plan.class_name != cc.INTERLACED
+    elif name == cc.HDR:
+        plan = cc.classify(probe(color_transfer="smpte2084"))
+    else:
+        plan = cc.forced_class_plan(name, prog)
+    assert plan.video_filters == []
+    assert "bwdif" not in " ".join(plan.video_args(4))
+
+
+def test_interlaced_class_is_a_real_encode_not_a_no_op():
+    plan = cc.plan_for_class(cc.INTERLACED, res="sd", source_pix_fmt="yuv420p")
+    assert not plan.is_passthrough and plan.codec == "av1"
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    assert plan.pix_fmt == "yuv420p"  # bit depth still follows the source
+    assert cc.validate_plan(plan) == []
+
+
+def test_old_opt_in_variable_is_ignored(monkeypatch):
+    for value in ("", "off", "deinterlace"):
+        monkeypatch.setenv("ENGRAM_CODEC_INTERLACED", value)
+        assert cc.classify(probe(idet=INTERLACED_IDET)).video_filters == [cc.DEINTERLACE_FILTER]
+        assert cc.classify(probe()).video_filters == []
+
+
+@pytest.mark.parametrize("p", [
+    {},  # nothing at all
+    {"field_order": "unknown"},
+    {"idet": {"tff": 3, "bff": 2, "progressive": 4, "undetermined": 400}},  # too few decided
+    # combed-looking but no consistent field order, and no usable field_order
+    {"idet": {"tff": 149, "bff": 151, "progressive": 65, "undetermined": 0}},
+])
+def test_undecidable_probe_deinterlaces(p):
+    inter, _, _ = cc.interlaced_verdict(p)
+    assert inter is None
+    deint, ev = cc.needs_deinterlace(p)
+    assert deint is True and ev["interlaced"] == "unknown"
+    assert cc.classify({**p, "width": 1920, "height": 1080}).video_filters \
+        == [cc.DEINTERLACE_FILTER]
+    assert cc.forced_class_plan(cc.ANIMATION, p).video_filters == [cc.DEINTERLACE_FILTER]
+
+
+def test_mixed_parity_falls_back_to_field_order_never_straight_to_progressive():
+    mixed = {"tff": 149, "bff": 151, "progressive": 65, "undetermined": 0}
+    for fo in ("tt", "bb", "tb", "bt"):
+        assert cc.interlaced_verdict({"idet": mixed, "field_order": fo})[0] is True
+    assert cc.interlaced_verdict({"idet": mixed, "field_order": "progressive"})[0] is False
+    assert cc.interlaced_verdict({"idet": mixed})[0] is None  # undecided -> deinterlace
+
+
+def test_classify_error_deinterlaces(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(cc, "_classify", boom)
+    plan = cc.classify(probe())
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    assert plan.evidence["error"] == "bug"
+
+
+def test_no_plan_ever_changes_the_frame_rate():
+    plans = [cc.plan_for_class(n, res=r, hdr_meta=HDR_META, grainy_hdr=g)
+             for n in cc.CLASSES for r in ("sd", "hd", "uhd") for g in (False, True)]
+    plans += [cc.classify(probe(idet=INTERLACED_IDET)), cc.classify({}),
+              cc.forced_class_plan(cc.ANIMATION, {"idet": INTERLACED_IDET})]
+    for plan in plans:
+        for optional in (True, False):
+            args = plan.video_args(4, optional=optional)
+            assert not set(args) & set(_FRAME_RATE_FLAGS), (plan.class_name, args)
+            assert "send_field" not in " ".join(args)
+            assert "fps=" not in (_vf(args) or "")
+
+
+def test_hook_command_for_an_interlaced_source_has_bwdif_and_no_rate_flags(hook, monkeypatch):
+    src, tmp = hook
+    plan = cc.classify(probe(idet=INTERLACED_IDET, pix_fmt="yuv420p"))
+    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    calls: list = []
+    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams(pix="yuv420p")))
+    av1_hook.after_organize(str(src))
+    (cmd,) = _encode_cmds(calls)
+    assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER
+    assert not set(cmd) & set(_FRAME_RATE_FLAGS)
+
+
+def test_fixed_command_fallback_keeps_bwdif(hook, monkeypatch):
+    """An encoder rejecting the class settings must not drop the deinterlacer."""
+    src, tmp = hook
+    plan = cc.classify(probe(idet=INTERLACED_IDET))
+    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    calls: list = []
+    base = _Run(calls, lambda c: _streams())
+
+    def run(cmd, **kw):
+        if cmd[0] == "ffmpeg" and "testsrc=size=128x128" in " ".join(cmd):
+            return subprocess.CompletedProcess(cmd, 1, "", "bad param")
+        return base(cmd, **kw)
+
+    monkeypatch.setattr(av1_hook.subprocess, "run", run)
+    av1_hook.after_organize(str(src))
+    (cmd,) = _encode_cmds(calls)
+    assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"  # the fixed command...
+    assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER  # ...still deinterlaced
+
+
+def test_kill_switch_command_is_still_byte_identical(hook, monkeypatch):
+    assert "-vf" not in av1_hook._legacy_video_args("4")
+
+
+def test_an_old_interlaced_skip_marker_does_not_count_as_done(hook, monkeypatch):
+    """Files skipped under the old 'interlaced, left untouched' rule get encoded now."""
+    src, tmp = hook
+    st = src.stat()
+    marker = src.parent / (src.name + av1_hook.MARKER_SUFFIX)
+    marker.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime),
+                                  "av1": None, "codec_class": "interlaced"}))
+    assert av1_hook._already_done(src) is False
+    plan = cc.classify(probe(idet=INTERLACED_IDET))
+    monkeypatch.setattr(av1_hook, "_load_classifier", lambda: _FakeClassifier(plan))
+    calls: list = []
+    monkeypatch.setattr(av1_hook.subprocess, "run", _Run(calls, lambda c: _streams()))
+    av1_hook.after_organize(str(src))
+    (cmd,) = _encode_cmds(calls)
+    assert cmd[cmd.index("-vf") + 1] == cc.DEINTERLACE_FILTER
+    done = json.loads(marker.read_text())
+    assert done["codec_class"] == cc.INTERLACED and done["av1"] is not None
+    assert av1_hook._already_done(src) is True
+    # An ordinary passthrough record is still done.
+    marker.write_text(json.dumps({"size": st.st_size, "mtime": int(st.st_mtime),
+                                  "av1": None, "codec_class": "passthrough"}))
+    assert av1_hook._already_done(src) is True
+
+
+def _field_paired_1080i(path: Path, *, flagged: bool) -> Path:
+    """Synthetic 1080i/25: each output frame interleaves the alternate field lines of
+    two consecutive progressive 1080p50 frames (ffmpeg ``interlace``).  ``flagged``
+    False re-tags the frames progressive, the case ``deint=interlaced`` missed."""
+    vf = "interlace=scan=tff,format=yuv420p" + ("" if flagged else ",setfield=prog")
+    enc = ["-vf", vf, "-c:v", "mpeg2video", "-q:v", "2"]
+    if flagged:
+        enc += ["-flags", "+ildct+ilme", "-top", "1"]
+    return _make_source(path, "testsrc2=size=1920x1080:rate=50", enc, seconds=2)
+
+
+def _idet_after(src: Path, vf: str) -> dict:
+    run = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-v", "info", "-i", str(src),
+                          "-vf", f"{vf},idet", "-f", "null", "-"], capture_output=True)
+    tff, bff, prog, und = (int(x) for x in cc._IDET_RE.findall(run.stderr)[-1])
+    return {"tff": tff, "bff": bff, "progressive": prog, "undetermined": und}
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("flagged", [True, False], ids=["flagged-tt", "tagged-progressive"])
+def test_real_field_paired_1080i_is_detected_and_deinterlaced(tmp_path, flagged):
+    src = _field_paired_1080i(tmp_path / "1080i.mkv", flagged=flagged)
+    stream = cc._probe_stream(str(src))
+    assert (stream["width"], stream["height"], stream["fps"]) == (1920, 1080, 25.0)
+
+    # Automatic path (full probe) and forced path (cheap probe) both catch it.
+    plan = cc.plan_for_file(str(src), {"content_type": "movie"})
+    assert plan.evidence["interlaced"] == "yes", plan.evidence
+    assert plan.class_name == cc.INTERLACED
+    assert plan.video_filters == [cc.DEINTERLACE_FILTER]
+    forced = cc.forced_class_plan(cc.LIVE_ACTION_CLEAN, cc.probe_interlace(str(src)))
+    assert forced.video_filters == [cc.DEINTERLACE_FILTER]
+
+    # The filter really removes the combing, on every frame, flagged or not --
+    # and keeps 25 fps (send_frame: one frame out per frame in).
+    after = _idet_after(src, cc.DEINTERLACE_FILTER)
+    assert after["tff"] + after["bff"] == 0 and after["progressive"] == 50
+    if not flagged:
+        # The defect this guards: deint=interlaced leaves a progressive-tagged
+        # combed source exactly as combed as it was.
+        old = _idet_after(src, "bwdif=mode=send_frame:parity=auto:deint=interlaced")
+        assert old["tff"] + old["bff"] >= 45
+
+    out = tmp_path / "out.mkv"
+    args = plan.video_args(2)
+    args[args.index("-preset") + 1] = "12"
+    run = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0",
+                          *args, str(out)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    v = _ffprobe_video(out)
+    assert v["codec_name"] == "av1" and v["pix_fmt"] == "yuv420p"
+    assert cc._probe_stream(str(out))["fps"] == 25.0
+
+
+@needs_ffmpeg
+def test_real_progressive_1080p_gets_no_bwdif(tmp_path):
+    src = _make_source(tmp_path / "1080p.mkv", "testsrc2=size=1920x1080:rate=25",
+                       ["-c:v", "mpeg2video", "-q:v", "2"], seconds=2)
+    plan = cc.plan_for_file(str(src))
+    assert plan.evidence["interlaced"] == "no"
+    assert plan.video_filters == []
+    assert cc.forced_class_plan(cc.ANIMATION, cc.probe_interlace(str(src))).video_filters == []

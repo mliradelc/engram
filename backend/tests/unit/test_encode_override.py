@@ -174,7 +174,8 @@ def test_forced_plan_keeps_the_source_resolution(tmp_path, probe, res, cls, crf)
 
 
 @pytest.mark.parametrize("cls", FOUR)
-def test_forced_plan_never_yields_hdr_or_interlaced(tmp_path, cls):
+def test_forced_plan_never_yields_hdr_or_interlaced(tmp_path, cls, interlace):
+    interlace.result = PROGRESSIVE_SRC
     plan = av1_hook.forced_plan(tmp_path / "x.mkv", cls, HD_VC1)
     assert plan.class_name == cls
     assert plan.class_name not in ("hdr", "interlaced")
@@ -193,7 +194,7 @@ def test_forced_plan_refuses_classes_outside_the_four(tmp_path, cls):
 # ---------------------------------------------------------------------------
 
 ENCODING_FOUR = [c for c in FOUR if c != "passthrough"]
-BWDIF = "bwdif=mode=send_frame:parity=auto:deint=interlaced"
+BWDIF = "bwdif=mode=send_frame:parity=auto:deint=all"
 
 
 @pytest.mark.parametrize("cls", ENCODING_FOUR)
