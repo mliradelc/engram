@@ -4,6 +4,32 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+## [0.45.2] - 2026-11-18
+
+_Highlights: discs identified by TheDiscDB get each episode on the right track again, complete Blu-ray rips are no longer mistaken for truncated ones, AI matching works with LM Studio and Ollama, German shows matched in German go to review far less often, and the TheTVDB numbering suggestion can be accepted on a disc with no known season._
+
+### Fixed
+
+- A disc identified by TheDiscDB now gets each episode on the right track when your MakeMKV minimum title length differs from the contributor's. TheDiscDB numbers titles the way its contributor's MakeMKV did, so a skipped short title shifted every later one: Bluey Season 2 had episodes assigned two tracks off and a short extra filed as an episode. Titles are now paired by their source file, length and size, and a title with no clear partner is matched by audio instead (#912).
+- Complete Blu-ray rips are no longer sent to review as "Incomplete rip". A Blu-ray title's scan size counts the disc's stream padding, so a low-bitrate show (Bluey: 1.8 GB scanned, 880 MB ripped) looked truncated, waited 90 seconds per track, and skipped matching. Engram now checks that the ripped file actually reaches the end of the title before calling it incomplete (#912).
+- Accepting the TheTVDB numbering suggestion on a TV disc with no known season now works. It used to fail with "the job's season is not known yet". The switch now compares every season of the show, re-downloads references for all of them in TheTVDB numbering, and re-matches. If TheTVDB cannot return every season, nothing changes and the review page says TheTVDB is unavailable (#886).
+- **AI matching works with LM Studio and Ollama.** The review page's **Try AI match** button stayed disabled for a local provider because it looked for an API key, which a local server does not need; it is now enabled whenever AI matching is on and the provider is local or has a key. Reasoning models running locally also get room to think before they answer: **Test Connection** allows them 1,024 output tokens instead of 16, episode matching 4,096 instead of 512, and Engram now uses the local server's own sampling settings instead of forcing temperature 0, which could make a thinking model repeat itself until it ran out of tokens. A response that is still cut off fails as before. Hosted providers are unchanged (#913, thanks @BrendanoElTaco!).
+
+### Changed
+
+- German shows matched in German now file themselves when the match is clear, instead of most tracks going to review. A chunk of dialogue only votes for an episode when that episode clearly leads the next best one, and the lead that is clear for English (1.8 times) turned out too strict for German, where right answers led by 1.5 to 1.9 times and wrong ones by under 1.2. German now votes from a 1.3 lead; other languages keep the English rule until they are measured (#846, thanks @wintheriscomming!).
+
+## [0.45.1] - 2026-11-15
+
+_Highlights: DVD contributions to TheDiscDB now carry the right format and episodes; a MakeMKV crash while scanning a disc backup is named instead of reported as "No titles found"; and two smaller fixes for History durations and unreadable import paths._
+
+### Fixed
+
+- **DVD contributions to TheDiscDB now arrive with the right format and episodes.** TheDiscDB recorded every disc Engram submitted as Blu-ray, because Engram never sent the disc format; it now sends DVD, Blu-ray or 4K, read from MakeMKV's scan. On DVDs, TheDiscDB could also give several tracks the same episode (a Roseanne disc showed 15, 15, 16, 15, ...), because it pairs titles by a MakeMKV segment map that DVDs repeat from title to title; Engram now leaves out any segment map that is not unique on the disc, so TheDiscDB pairs those titles by title number and each keeps the episode Engram matched. The Contributing Data guide now explains which columns on TheDiscDB's page come from Engram and which (Name, Comment) come from the MakeMKV scan log. Discs submitted before this fix keep their old format and episodes on TheDiscDB until they are resubmitted or edited there (#903).
+- **A disc scan that crashes MakeMKV now says so.** When makemkvcon crashed while opening an imported disc backup, the job failed with "No titles found on disc" and the log showed only an exit code. The job's error now names the source and the crash (for example "access violation, 0xC0000005"), and when the crash comes from MakeMKV 2.0.0 opening a backup or ISO, which MakeMKV users have reported as a 2.0.0 bug, it says that MakeMKV 1.18.4 opens them. A scan Engram cancels, or one stopped by a kill or Ctrl+C, is not reported as a crash. The raw MakeMKV output of a failed scan is now saved as `scan.log` in the diagnostics bundle; before, it was kept only when the scan succeeded (#901).
+- History no longer shows a duration like `1h 60m`. Minutes are rounded before they are split into hours, so 7,199 seconds now reads `2h 0m` (#890, thanks @BrendanoElTaco!).
+- Browsing into, previewing or importing a path Windows cannot probe (one whose existence check fails with WinError 87) now returns the usual invalid-path error instead of a server error (#898).
+
 ## [0.45.0] - 2026-11-08
 
 _Highlights: shows in other languages are now matched in their own language; the re-identify dialog offers All seasons; TV discs with no known season get the TheTVDB numbering check and subtitle retries on Re-match all; and two ranking fixes sharpen German-show matches._

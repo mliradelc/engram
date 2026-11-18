@@ -217,7 +217,7 @@ Separate `uv` project (never imports `backend/`), deployed with Docker from `dep
 - **Ruff config**: Line length 100, target Python 3.11, rules E/F/I/UP/B, double quotes
 - **Tailwind v4**: Uses `@theme inline` blocks in CSS for custom colors (including custom `magenta` palette), not `tailwind.config.js`. No PostCSS config — uses `@tailwindcss/vite` plugin directly.
 - **Database migration**: Alembic with async SQLModel metadata. `render_as_batch=True` for SQLite. Existing databases auto-stamped at head on first startup. `app_config` always preserves data via backup/restore (independent of Alembic).
-- **DiscDB mapping persistence**: `discdb_mappings_json` column on `DiscJob` stores serialized `DiscDbTitleMapping` list. Persisted during identification, restored from DB on server startup via `_restore_discdb_mappings()`.
+- **DiscDB mapping persistence**: `discdb_mappings_json` column on `DiscJob` stores serialized `DiscDbTitleMapping` list. Persisted during identification, restored from DB on server startup via `_restore_discdb_mappings()`. A mapping's `index` is THIS scan's title index: `classify_from_discdb` re-binds TheDiscDB's titles through `bind_mappings_to_scan` (source file, duration, exact size), because TheDiscDB's index is its contributor's MakeMKV numbering and shifts with the minimum title length (#912). Unbindable titles are dropped, never guessed.
 - **CI caching**: Playwright browsers cached by version, uv packages cached by lockfile hash, apt packages cached via `cache-apt-pkgs-action`.
 - **All-extras TV discs are held, not filed**: `check_job_completion` routes a TV disc whose
   every track was classified as an extra to REVIEW_NEEDED rather than filing the lot into
@@ -313,7 +313,11 @@ Separate `uv` project (never imports `backend/`), deployed with Docker from `dep
   first** (an English stream wins, so a dubbed disc keeps today's path), else the show's language
   (`match` / `untagged` / `unprobed`), else the refusal naming both languages. Only a language in
   `ORIGINAL_FIRST_LANGUAGES` (one with a measured vote margin; empty until one is measured) tries
-  its own stream before English. Whisper transcribes in the bound language (`language=` only
+  its own stream before English. The chunk-vote margin is per language too: `identify_episode`
+  reads `MATCH_LANGUAGE_VOTE_MARGIN_RATIOS` for the bound language (German 1.3, measured on one
+  disc, #846; every other language, English included, keeps `CHUNK_VOTE_MARGIN_RATIO` 1.8), so
+  an English-audio track in a German job, rebound to English by the curator, keeps 1.8.
+  Whisper transcribes in the bound language (`language=` only
   off English, so English keeps `transcribe(audio_path)` and every cache key), and TF-IDF fits
   word n-grams except for `UNSPACED_LANGUAGES` (ja/zh/th): character n-grams (`char_wb`, 2 to 4)
   on a cosine scale no real disc has calibrated, so a confident match there is still held for
