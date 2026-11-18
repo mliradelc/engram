@@ -204,6 +204,44 @@ describe('EncodeProgressPanel failed rows', () => {
         render(<EncodeProgressPanel encodes={[]} failures={[failure()]} />);
         expect(screen.queryByRole('button', { name: /Retry encoding/ })).not.toBeInTheDocument();
     });
+
+    // A long name used to clamp to one line and read 'The Fifth Rac…'. CSS clamping does
+    // not change textContent, so assert the whole name is there and the clamp is applied;
+    // never a rendered pixel width (jsdom has no layout).
+    const LONG_NAME = 'The Fifth Racecourse of the Midnight Archipelago (1987) - Director\'s Cut Remastered 4K.mkv';
+    const LONG_SOURCE = `/library/movies/The Fifth Racecourse (1987)/${LONG_NAME}`;
+
+    const expectTwoLineClamp = (el: HTMLElement) => {
+        expect(el.style.display).toBe('-webkit-box');
+        expect(el.style.getPropertyValue('-webkit-line-clamp')).toBe('2');
+        expect(el.style.getPropertyValue('-webkit-box-orient')).toBe('vertical');
+        expect(el.style.overflow).toBe('hidden');
+        expect(el.style.whiteSpace).not.toBe('nowrap');
+    };
+
+    it('keeps a long filename whole, clamped to two lines, full path on hover', () => {
+        expect(LONG_NAME.length).toBeGreaterThanOrEqual(80);
+        render(
+            <EncodeProgressPanel
+                encodes={[]}
+                failures={[failure({ file: LONG_NAME, source: LONG_SOURCE })]}
+                onRetry={vi.fn()}
+            />,
+        );
+        const name = screen.getByTestId('encode-failed-name');
+        expect(name.textContent).toBe(LONG_NAME);
+        expect(name).toHaveAttribute('title', LONG_SOURCE);
+        expectTwoLineClamp(name);
+        // Controls sit top-aligned when the name wraps.
+        expect(screen.getByTestId('encode-failed-row').style.alignItems).toBe('flex-start');
+    });
+
+    it('gives the active-encode name the same two-line clamp', () => {
+        render(<EncodeProgressPanel encodes={[row({ file: LONG_NAME })]} />);
+        const name = screen.getByTestId('encode-progress-name');
+        expect(name.textContent).toBe(LONG_NAME);
+        expectTwoLineClamp(name);
+    });
 });
 
 describe('EncodeClassSelect', () => {

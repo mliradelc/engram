@@ -45,6 +45,16 @@ const ellipsis = {
   whiteSpace: "nowrap" as const,
 };
 
+/** A filename gets two lines before it ellipsises: one line cut long show names mid-word. */
+const twoLineClamp = {
+  display: "-webkit-box",
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: "vertical" as const,
+  overflow: "hidden",
+  wordBreak: "break-word" as const,
+  minWidth: 0,
+};
+
 const actionButton = (busy: boolean, color: string) => ({
   display: "inline-flex",
   alignItems: "center",
@@ -105,7 +115,8 @@ function FailedEncodeRow({ failure: f, busy, onRetry, onDismiss, loadOverride }:
       data-testid="encode-failed-row"
       style={{
         display: "flex",
-        alignItems: "center",
+        // Top-aligned so the icon and controls stay level with a two-line name.
+        alignItems: "flex-start",
         flexWrap: "wrap",
         gap: 12,
         fontFamily: sv.mono,
@@ -113,10 +124,14 @@ function FailedEncodeRow({ failure: f, busy, onRetry, onDismiss, loadOverride }:
         paddingLeft: 10,
       }}
     >
-      <IcoError size={14} color={sv.magenta} />
+      <IcoError size={14} color={sv.magenta} style={{ flexShrink: 0, marginTop: 2 }} />
       <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-          <div title={f.source} style={{ ...ellipsis, fontSize: 13, color: sv.ink }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
+          <div
+            data-testid="encode-failed-name"
+            title={f.source}
+            style={{ ...twoLineClamp, fontSize: 13, color: sv.ink }}
+          >
             {f.file}
           </div>
           <EncodeClassBadge codecClass={f.codec_class} forced={f.forced} />
@@ -297,10 +312,11 @@ export function EncodeProgressPanel({
                 const pct = Math.min(100, Math.max(0, row.percent ?? 0));
                 return (
                   <li key={row.file} data-testid="encode-progress-row" style={{ fontFamily: sv.mono }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 }}>
                       <div
+                        data-testid="encode-progress-name"
                         title={row.file}
-                        style={{ ...ellipsis, color: sv.cyanHi, fontSize: 13, fontWeight: 600 }}
+                        style={{ ...twoLineClamp, color: sv.cyanHi, fontSize: 13, fontWeight: 600 }}
                       >
                         {row.file}
                       </div>
