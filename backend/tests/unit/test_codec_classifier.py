@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1490,9 +1492,9 @@ def test_a_clean_repeated_fields_line_yields_zero():
 def test_probe_idet_sums_repeated_fields_across_samples(monkeypatch):
     outputs = iter([_IDET_STDERR_TELECINE, _IDET_STDERR_CLEAN, _IDET_STDERR_TELECINE])
     monkeypatch.setattr(
-        cc,
-        "_run",
-        lambda cmd, timeout=None: subprocess.CompletedProcess(cmd, 0, b"", next(outputs)),
+        cc.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, b"", next(outputs)),
     )
     total = cc._probe_idet("x.mkv", [1.0, 2.0, 3.0])
     assert total == {
@@ -1742,3 +1744,209 @@ def test_real_progressive_gets_neither_filter(tmp_path):
     assert cc.telecine_verdict(p)[0] is False
     assert cc.plan_for_file(str(src)).video_filters == []
     assert cc.forced_class_plan(cc.ANIMATION, p).video_filters == []
+
+
+# ---------------------------------------------------------------------------
+# An interrupted probe is not evidence (Defect A)
+#
+# Fake ``ffmpeg`` / ``ffprobe`` scripts on PATH, so the real ``_run`` and the
+# real subprocess machinery are exercised without killing a real ffmpeg.  The
+# source the fake ffprobe describes is progressive 1080p MPEG-2: before the fix
+# a killed idet/pixel probe classified it ``live_action_clean`` with no error.
+# ---------------------------------------------------------------------------
+
+_FAKE_FFPROBE = """#!/bin/sh
+cat <<'JSON'
+{"streams": [{"codec_name": "mpeg2video", "width": 1920, "height": 1080,
+  "field_order": "progressive", "pix_fmt": "yuv420p", "avg_frame_rate": "24000/1001",
+  "color_transfer": "bt709"}], "format": {"duration": "2700.0"}}
+JSON
+"""
+
+# Modes: progressive (a real answer), fail (ffmpeg's own error), sigterm (dies
+# of the signal), caught (what ffmpeg 7.1 really does on SIGTERM: prints the
+# idet summary of the truncated span, then exits 255), hang (timeout), and
+# ok-then-sigterm (first sample fine, the next one killed).
+_FAKE_FFMPEG = """#!/bin/sh
+summary() {
+  echo "[Parsed_idet_0 @ 0x2] Repeated Fields: Neither: $1 Top: 0 Bottom: 0" >&2
+  echo "[Parsed_idet_0 @ 0x2] Multi frame detection: TFF: 0 BFF: 0 Progressive: $1 Undetermined: 0" >&2
+}
+mode="$FAKE_FFMPEG_MODE"
+if [ "$mode" = ok-then-sigterm ]; then
+  echo x >> "$FAKE_FFMPEG_COUNTER"
+  if [ "$(wc -l < "$FAKE_FFMPEG_COUNTER")" -gt 1 ]; then mode=sigterm; else mode=progressive; fi
+fi
+case "$mode" in
+  progressive) summary 72; exit 0 ;;
+  fail) echo "Error opening input file" >&2; exit 1 ;;
+  sigterm) kill -TERM $$; sleep 5; exit 0 ;;
+  caught) summary 30; echo "Exiting normally, received signal 15." >&2; exit 255 ;;
+  hang) exec sleep 30 ;;
+esac
+exit 1
+"""
+
+
+@pytest.fixture
+def fake_tools(tmp_path, monkeypatch):
+    """Put fake ffmpeg/ffprobe first on PATH; returns a setter for the ffmpeg mode."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, body in (("ffprobe", _FAKE_FFPROBE), ("ffmpeg", _FAKE_FFMPEG)):
+        script = bindir / name
+        script.write_text(body)
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    monkeypatch.setenv("FAKE_FFMPEG_COUNTER", str(tmp_path / "count"))
+
+    def mode(name: str) -> None:
+        monkeypatch.setenv("FAKE_FFMPEG_MODE", name)
+
+    return mode
+
+
+def test_run_names_each_of_the_three_outcomes(fake_tools, monkeypatch, tmp_path):
+    fake_tools("progressive")
+    assert cc._run(["ffmpeg"]).outcome == cc.PROBE_OK
+    fake_tools("fail")
+    run = cc._run(["ffmpeg"])
+    assert run.outcome == cc.PROBE_FAILED and run.returncode == 1
+    fake_tools("sigterm")
+    run = cc._run(["ffmpeg"])
+    assert run.outcome == cc.PROBE_ABORTED and run.returncode == -15
+    assert "SIGTERM" in run.detail
+    fake_tools("caught")
+    run = cc._run(["ffmpeg"])
+    assert run.outcome == cc.PROBE_ABORTED and run.returncode == 255
+    assert "interrupted" in run.detail
+    fake_tools("hang")
+    run = cc._run(["ffmpeg"], timeout=0.5)
+    assert run.outcome == cc.PROBE_ABORTED and "timed out" in run.detail
+    run = cc._run([str(tmp_path / "no-such-binary")])
+    assert run.outcome == cc.PROBE_ABORTED and "could not run" in run.detail
+
+
+def test_255_is_an_interruption_only_for_ffmpeg(monkeypatch):
+    # ffprobe has no SIGTERM handler (it dies with -15), so its 255 is an error.
+    monkeypatch.setattr(
+        cc.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 255, b"", b"")
+    )
+    assert cc._run(["ffprobe", "x"]).outcome == cc.PROBE_FAILED
+    assert cc._run(["/usr/bin/ffmpeg", "x"]).outcome == cc.PROBE_ABORTED
+
+
+def test_a_successful_progressive_idet_is_still_a_real_answer(fake_tools):
+    # The control: the same source with a probe that completes is classified
+    # exactly as before (no grain/animation measured -> the default class).
+    fake_tools("progressive")
+    plan = cc.plan_for_file("/any/source.mkv")
+    assert plan.class_name == cc.LIVE_ACTION_CLEAN
+    assert plan.video_filters == []
+    assert plan.evidence["interlaced"] == "no"
+
+
+def test_an_idet_that_fails_on_the_file_still_means_undecided_or_field_order(fake_tools, caplog):
+    # A non-zero exit is the source's answer ("cannot decode here"): no idet
+    # evidence, field_order decides, and the failure is logged, not hidden.
+    fake_tools("fail")
+    with caplog.at_level("WARNING"):
+        p = cc.probe_interlace("/any/source.mkv")
+    assert "idet" not in p and p["field_order"] == "progressive"
+    assert "idet failed on every sample" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("mode", "detail"),
+    [
+        ("sigterm", "killed by signal 15"),
+        ("caught", "exited 255 (interrupted by a signal)"),
+        ("hang", "timed out"),
+        ("ok-then-sigterm", "killed by signal 15"),
+    ],
+)
+def test_an_interrupted_probe_never_yields_a_verdict(fake_tools, monkeypatch, mode, detail):
+    monkeypatch.setattr(cc, "PROBE_TIMEOUT", 1)
+    fake_tools(mode)
+    # The automatic path, the forced path's interlace probe, and idet itself.
+    for call in (
+        lambda: cc.plan_for_file("/any/source.mkv"),
+        lambda: cc.probe_interlace("/any/source.mkv"),
+        lambda: cc._probe_idet("/any/source.mkv", [1.0, 2.0]),
+    ):
+        # ok-then-sigterm: every call starts with one good sample, then a kill.
+        Path(os.environ["FAKE_FFMPEG_COUNTER"]).unlink(missing_ok=True)
+        with pytest.raises(cc.ProbeAborted, match=re.escape(detail)) as info:
+            call()
+        assert info.value.run.aborted
+
+
+def test_missing_binaries_never_yield_a_verdict(tmp_path, monkeypatch):
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    with pytest.raises(cc.ProbeAborted, match="ffprobe probe could not run"):
+        cc.plan_for_file("/any/source.mkv")
+    with pytest.raises(cc.ProbeAborted, match="could not run"):
+        cc.probe_interlace("/any/source.mkv")
+    with pytest.raises(cc.ProbeAborted, match="ffmpeg probe could not run"):
+        cc._probe_idet("/any/source.mkv", [1.0])
+
+
+def test_an_interrupted_pixel_probe_does_not_default_the_class(fake_tools, monkeypatch):
+    # The observed failure: idet completes, the pixel probe is killed, and the
+    # class used to fall to live_action_clean for want of grain/animation.
+    calls = {"n": 0}
+    real_run = cc._run
+
+    def run(cmd, timeout=None):
+        if "-filter_complex" in cmd:
+            calls["n"] += 1
+            return cc.ProbeRun("ffmpeg", cc.PROBE_ABORTED, -15, detail="killed by signal 15")
+        return real_run(cmd, timeout)
+
+    fake_tools("progressive")
+    monkeypatch.setattr(cc, "_run", run)
+    with pytest.raises(cc.ProbeAborted):
+        cc.plan_for_file("/any/source.mkv")
+    assert calls["n"] == 1
+
+
+# --- the hook: an interrupted probe is a visible failure, never an encode ---
+
+
+class _AbortingClassifier:
+    """Classifier stand-in whose probes are interrupted."""
+
+    ProbeAborted = cc.ProbeAborted
+
+    def _abort(self, *a, **k):
+        raise cc.ProbeAborted(
+            cc.ProbeRun("ffmpeg", cc.PROBE_ABORTED, 255, detail="exited 255 (interrupted)")
+        )
+
+    plan_for_file = _abort
+    probe_interlace = _abort
+
+    def forced_class_plan(self, *a, **k):  # pragma: no cover - must not be reached
+        pytest.fail("planned a forced class from an interrupted probe")
+
+
+@pytest.mark.parametrize("forced", [None, cc.ANIMATION])
+def test_hook_records_an_interrupted_probe_and_encodes_nothing(hook, monkeypatch, forced):
+    src, tmp = hook
+    encode_hook.dismiss_failure()
+    monkeypatch.setattr(encode_hook, "_load_classifier", lambda: _AbortingClassifier())
+    calls: list = []
+    monkeypatch.setattr(
+        encode_hook.subprocess, "run", _Run(calls, lambda c: _streams(codec="mpeg2video"))
+    )
+    encode_hook.after_organize(str(src), forced_class=forced)
+    # Not the fixed settings, not any encode, no marker (so it is re-probed later).
+    assert _encode_cmds(calls) == []
+    assert not (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).exists()
+    (row,) = encode_hook.failures_snapshot()
+    assert row["source"] == str(src)
+    assert "probe interrupted" in row["reason"] and "exited 255" in row["reason"]
+    assert row["forced"] is (forced is not None)
+    encode_hook.dismiss_failure()

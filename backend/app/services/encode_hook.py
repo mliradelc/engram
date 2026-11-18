@@ -17,6 +17,10 @@ Design constraints, each deliberate:
   job does not re-encode an already-converted file.
 * **Fail-open.** Any error logs and returns; the rip stays in the library as
   Engram filed it. Losing a transcode is recoverable, losing a rip is not.
+* **Unmeasured is not classified.** A classifier probe that could not run,
+  timed out or was killed (``ProbeInterrupted``) records a failed row and encodes
+  nothing; it never falls back to the fixed settings, which would encode a
+  source nobody measured (and without its deinterlace filter).
 * **Off by default.** Enabled only when ``ENGRAM_ENCODE_HOOK=1`` in the container
   environment, so a rebuild without the setting behaves exactly as upstream.
 
@@ -25,7 +29,8 @@ the media is probed and classified, and the Engram identification context is a
 hint only.  ``ENGRAM_CODEC_CLASSIFIER=0`` restores the original fixed CRF/preset
 encoding arguments byte-for-byte.  The same fixed command is the fallback whenever the
 classifier or its encoder pre-check fails, so a classifier fault never costs the
-transcode, let alone the rip.
+transcode, let alone the rip -- except an interrupted probe, which is not a
+classifier fault (see "Unmeasured is not classified").
 
 Configuration (environment):
     ENGRAM_ENCODE_HOOK       "1" to enable; anything else disables.
@@ -735,7 +740,8 @@ def forced_plan(
     unless given -- so an interlaced source gets ``bwdif`` whichever class was
     forced or pinned.  ``passthrough`` encodes nothing and skips the idet probe.
     Returns None when the classifier module cannot be loaded.  Raises
-    ``ValueError`` for a class outside :data:`OFFERED_CLASSES`.
+    ``ValueError`` for a class outside :data:`OFFERED_CLASSES`, and
+    :class:`ProbeInterrupted` when the idet probe could not run or was killed.
     """
     if codec_class not in OFFERED_CLASSES:
         raise ValueError(f"codec class {codec_class!r} cannot be forced")
@@ -745,7 +751,13 @@ def forced_plan(
     video = _video_stream(probe if probe is not None else _probe(src))
     facts: dict[str, Any] = {}
     if codec_class != "passthrough":
-        facts.update(interlace if interlace is not None else mod.probe_interlace(str(src)))
+        if interlace is None:
+            try:
+                interlace = mod.probe_interlace(str(src))
+            except Exception as exc:
+                _reraise_if_aborted(mod, exc)
+                raise
+        facts.update(interlace)
     # The full probe's stream fields win over the interlace probe's copies.
     facts.update({k: video[k] for k in ("width", "height", "pix_fmt") if video.get(k)})
     return mod.forced_class_plan(
@@ -753,6 +765,23 @@ def forced_plan(
         facts,
         reason=f"forced by operator ({codec_class})",
     )
+
+
+class ProbeInterrupted(RuntimeError):
+    """The classifier could not measure the source: a probe never ran, timed out
+    or was killed (``codec_classifier.ProbeAborted``).
+
+    Not a reason to fall back to the fixed settings: that command has no
+    deinterlace filter and the class it stands in for was never measured.  The
+    hook records a failed row (with Retry) and encodes nothing.
+    """
+
+
+def _reraise_if_aborted(mod, exc: BaseException) -> None:
+    """Raise :class:`ProbeInterrupted` from ``exc`` if it is the classifier's ProbeAborted."""
+    aborted = getattr(mod, "ProbeAborted", None)
+    if isinstance(aborted, type) and isinstance(exc, aborted):
+        raise ProbeInterrupted(str(exc)) from exc
 
 
 def _plan_forced(plan) -> bool:
@@ -1106,7 +1135,11 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
 
 
 def _classify(src: Path, context: dict | None):
-    """Return a CodecPlan, or None to use the fixed settings.  Never raises."""
+    """Return a CodecPlan, or None to use the fixed settings.
+
+    Raises only :class:`ProbeInterrupted`: an unmeasured source is not handed
+    to the fixed settings.
+    """
     if not classifier_enabled():
         return None
     mod = _load_classifier()
@@ -1118,7 +1151,8 @@ def _classify(src: Path, context: dict | None):
         plan = mod.plan_for_file(str(src), context)
         logger.info("Encoding hook: codec_classifier: %s (%s)", plan.describe(), src.name)
         return plan
-    except Exception:  # noqa: BLE001 - fail-open: fixed settings
+    except Exception as exc:  # noqa: BLE001 - fail-open: fixed settings
+        _reraise_if_aborted(mod, exc)
         logger.exception("Encoding hook: classifier failed for %s; using fixed settings", src.name)
         return None
 
@@ -1206,25 +1240,38 @@ def after_organize(
             cls = None
 
         forced = cls is not None
-        if forced:
-            probe = _probe(src)
-            problem = forced_class_problem(cls, probe)
-            if problem is not None:
-                logger.error(
-                    "Encoding hook: refusing forced class=%s for %s: %s", cls, src.name, problem
-                )
-                return
-            plan = forced_plan(src, cls, probe)
-            if plan is None:
-                logger.error(
-                    "Encoding hook: classifier unavailable; cannot force class=%s for %s",
-                    cls,
-                    src.name,
-                )
-                return
-            logger.info("Encoding hook: codec class forced: %s (%s)", plan.describe(), src.name)
-        else:
-            plan = _classify(src, context)
+        try:
+            if forced:
+                probe = _probe(src)
+                problem = forced_class_problem(cls, probe)
+                if problem is not None:
+                    logger.error(
+                        "Encoding hook: refusing forced class=%s for %s: %s", cls, src.name, problem
+                    )
+                    return
+                plan = forced_plan(src, cls, probe)
+                if plan is None:
+                    logger.error(
+                        "Encoding hook: classifier unavailable; cannot force class=%s for %s",
+                        cls,
+                        src.name,
+                    )
+                    return
+                logger.info("Encoding hook: codec class forced: %s (%s)", plan.describe(), src.name)
+            else:
+                plan = _classify(src, context)
+        except ProbeInterrupted as exc:
+            # Visible, retryable, and nothing encoded: no marker is written, so
+            # the next organize pass (or Retry) probes the source again.
+            logger.error("Encoding hook: not encoding %s: %s", src.name, exc)
+            _record_failure(
+                src,
+                staging / src.name,
+                f"Source probe interrupted, nothing encoded: {exc}",
+                codec_class=cls,
+                forced=forced,
+            )
+            return
 
         if plan is not None and plan.is_passthrough:
             logger.info("Encoding hook: leaving %s untouched (%s)", src.name, plan.reason)

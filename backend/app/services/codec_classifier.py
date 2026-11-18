@@ -8,7 +8,9 @@ win, because the identification can be wrong and the file cannot.
 
 Import discipline: stdlib only at module level (no ``app.*`` imports), so this
 file is importable and testable on its own, independent of the ASR stack that
-``app.services`` drags in.  It never raises out of its public entry points.
+``app.services`` drags in.  Its public entry points raise exactly one exception,
+:class:`ProbeAborted`, when a probe could not run or was killed (an unmeasured
+source must fail visibly, not be classified); everything else is handled.
 
 Class set (six, evaluated in this order; first match wins)
 ----------------------------------------------------------
@@ -106,10 +108,13 @@ setting; there is no opt-in flag.
   480i/29.97 stays 29.97; no command carries ``-r`` / ``-fps_mode`` / ``-vsync``.
 * Progressive -> no ``bwdif`` at all.
 * **Undecided -> deinterlace.**  When neither idet nor ``field_order`` can tell
-  (or the probe failed outright), the source is treated as interlaced: bwdif on
+  (or the probe failed on the file), the source is treated as interlaced: bwdif on
   a progressive frame is visually near-lossless, combing in an encode is
   permanent.  The original stays in the library either way.  Undecided never
   means IVTC: only a measured telecine verdict selects ``fieldmatch``.
+* **Unmeasured -> no encode.**  Undecided is a *measurement* that could not
+  tell.  A probe that never ran, timed out or was killed is not a measurement
+  at all, and raises :class:`ProbeAborted` instead (see there for why).
 
 
 Presets: preset 6 is the floor for AV1 (i3-7100T, software only); UHD also uses 6.
@@ -126,6 +131,7 @@ import json
 import logging
 import os
 import re
+import signal
 import statistics
 import subprocess
 import tempfile
@@ -938,15 +944,110 @@ def classify(probe: dict | None, context: dict | None = None) -> CodecPlan:
 
 
 # --------------------------------------------------------------------------
-# Probes (ffprobe / ffmpeg).  All best-effort; every failure yields a missing key.
+# Probes (ffprobe / ffmpeg).
+#
+# A probe has three outcomes, and only two of them say anything about the file:
+#
+#   ok       ran and exited 0: its output is evidence.
+#   failed   ran and exited non-zero on its own (ffmpeg could not open, seek or
+#            decode): a property of the *source*, so a missing key, as before.
+#   aborted  never ran (missing binary, OSError), timed out, or was killed by a
+#            signal: a property of the *host*.  Its output is not evidence --
+#            ffmpeg catches SIGTERM, prints the idet summary for the truncated
+#            span it saw and exits 255, so a killed idet reads like a short,
+#            valid measurement.  An aborted probe raises :class:`ProbeAborted`.
+#
+# Why aborting raises instead of yielding an "undecided" verdict: see
+# :class:`ProbeAborted`.
 # --------------------------------------------------------------------------
 
+PROBE_OK = "ok"
+PROBE_FAILED = "failed"
+PROBE_ABORTED = "aborted"
 
-def _run(cmd: list[str], timeout: int = PROBE_TIMEOUT) -> subprocess.CompletedProcess | None:
+# fftools/ffmpeg.c exits 255 when it caught SIGINT/SIGTERM and shut down
+# "normally" (``Exiting normally, received signal 15.`` at -v info).  Measured on
+# ffmpeg 7.1.5: SIGTERM -> 255, SIGKILL -> -9.  Its genuine errors use other
+# codes (missing input 254, unknown filter 8, generic 1).  ffprobe installs no
+# handler, so it dies with a negative return code.  encode_hook relies on the
+# same 255 convention for the encode itself.
+FFMPEG_INTERRUPTED_RC = 255
+
+
+class ProbeAborted(RuntimeError):
+    """A probe could not run, timed out, or was killed: nothing is known.
+
+    Raised (rather than reporting "undecided") because no default is correct
+    for a source nobody measured.  The undecided interlace answer is bwdif,
+    which is wrong for a telecined source (it keeps the repeated fields and the
+    29.97 rate; IVTC is deliberately never chosen without measurement), and the
+    same kill takes out the pixel probes, so grain/animation are blind too and
+    the class collapses to ``live_action_clean``.  The cause is the host (a
+    disk-space guard, the OOM killer, a timeout under load), so a retry measures
+    the truth; the original stays in the library.  The encode hook turns this
+    into a failed row on the panel, never into an encode.
+    """
+
+    def __init__(self, run: ProbeRun):
+        self.run = run
+        super().__init__(f"{run.name} probe {run.detail}")
+
+
+@dataclass(frozen=True)
+class ProbeRun:
+    """One probe subprocess and which of the three outcomes it had."""
+
+    name: str  # the program, for messages ("ffmpeg", "ffprobe")
+    outcome: str  # PROBE_OK | PROBE_FAILED | PROBE_ABORTED
+    returncode: int | None = None
+    stdout: bytes = b""
+    stderr: bytes = b""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == PROBE_OK
+
+    @property
+    def aborted(self) -> bool:
+        return self.outcome == PROBE_ABORTED
+
+
+def _signal_name(num: int) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-    except (subprocess.SubprocessError, OSError):
-        return None
+        return f"{num} ({signal.Signals(num).name})"
+    except ValueError:
+        return str(num)
+
+
+def _run(cmd: list[str], timeout: float | None = None) -> ProbeRun:
+    """Run one probe and say which of ok / failed / aborted it was.  Never raises."""
+    timeout = PROBE_TIMEOUT if timeout is None else timeout
+    name = os.path.basename(str(cmd[0])) if cmd else "probe"
+    try:
+        cp = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return ProbeRun(name, PROBE_ABORTED, detail=f"timed out after {timeout}s")
+    except (subprocess.SubprocessError, OSError) as exc:
+        return ProbeRun(name, PROBE_ABORTED, detail=f"could not run: {exc}")
+    rc = cp.returncode
+    out, err = cp.stdout or b"", cp.stderr or b""
+    if rc is not None and rc < 0:
+        detail = f"killed by signal {_signal_name(-rc)}"
+        return ProbeRun(name, PROBE_ABORTED, rc, out, err, detail)
+    if rc == FFMPEG_INTERRUPTED_RC and name.startswith("ffmpeg"):
+        detail = f"exited {rc} (interrupted by a signal)"
+        return ProbeRun(name, PROBE_ABORTED, rc, out, err, detail)
+    if rc != 0:
+        return ProbeRun(name, PROBE_FAILED, rc, out, err, f"exited {rc}")
+    return ProbeRun(name, PROBE_OK, rc, out, err)
+
+
+def _checked(run: ProbeRun) -> ProbeRun:
+    """``run`` unless it was aborted, in which case raise :class:`ProbeAborted`."""
+    if run.aborted:
+        raise ProbeAborted(run)
+    return run
 
 
 def _parse_rate(text: str | None) -> float | None:
@@ -972,8 +1073,8 @@ def _probe_stream(path: str) -> dict:
         "color_transfer,color_primaries,color_space,pix_fmt:format=duration",
         path,
     ]
-    run = _run(cmd)
-    if not run or run.returncode != 0:
+    run = _checked(_run(cmd))
+    if not run.ok:
         return {}
     try:
         data = json.loads(run.stdout or b"{}")
@@ -1020,8 +1121,8 @@ def _probe_hdr_meta(path: str) -> dict | None:
         "json",
         path,
     ]
-    run = _run(cmd)
-    if not run or run.returncode != 0:
+    run = _checked(_run(cmd))
+    if not run.ok:
         return None
     try:
         frames = json.loads(run.stdout or b"{}").get("frames") or []
@@ -1102,6 +1203,7 @@ def _probe_idet(path: str, times: list[float]) -> dict | None:
         **dict.fromkeys(_REPEAT_KEYS, 0),
     }
     seen = False
+    failed = 0
     for t in times:
         cmd = [
             "ffmpeg",
@@ -1125,10 +1227,19 @@ def _probe_idet(path: str, times: list[float]) -> dict | None:
             "null",
             "-",
         ]
-        run = _run(cmd)
-        if not run:
+        # A killed idet still prints a plausible summary (of the truncated span),
+        # so an aborted sample raises and a failed one is skipped, never parsed.
+        run = _checked(_run(cmd))
+        if not run.ok:
+            failed += 1
+            logger.warning(
+                "codec_classifier: idet sample at %.2fs %s for %s; sample ignored",
+                t,
+                run.detail,
+                path,
+            )
             continue
-        det, rep = _parse_idet(run.stderr or b"")
+        det, rep = _parse_idet(run.stderr)
         if det:
             seen = True
             for key, val in det.items():
@@ -1137,6 +1248,12 @@ def _probe_idet(path: str, times: list[float]) -> dict | None:
         if det and rep:
             for key, val in rep.items():
                 total[key] += val
+    if failed and not seen:
+        logger.warning(
+            "codec_classifier: idet failed on every sample of %s; interlacing is decided "
+            "by field_order, or deinterlaced as undecided",
+            path,
+        )
     return total if seen else None
 
 
@@ -1256,8 +1373,8 @@ def _probe_pixels(path: str, width: int, height: int, times: list[float]) -> tup
                 "rawvideo",
                 spath,
             ]
-            run = _run(cmd)
-            if not run or run.returncode != 0:
+            run = _checked(_run(cmd))
+            if not run.ok:
                 continue
             try:
                 with open(gpath, "rb") as fh:
@@ -1285,7 +1402,12 @@ def sample_times(duration: float | None) -> list[float]:
 
 
 def probe_media(path: str) -> dict:
-    """Run every probe on ``path`` and return the probe dict.  Never raises."""
+    """Run every probe on ``path`` and return the probe dict.
+
+    A probe that fails on the file leaves its key missing.  A probe that could
+    not run, timed out or was killed raises :class:`ProbeAborted`: that is the
+    only exception that leaves this function.
+    """
     probe: dict = {}
     try:
         probe = _probe_stream(path)
@@ -1306,13 +1428,17 @@ def probe_media(path: str) -> dict:
             if anims:
                 probe["animation"] = statistics.median(anims)
             probe["pixel_frames"] = len(grains)
+    except ProbeAborted:
+        raise
     except Exception:  # noqa: BLE001 - probes are best-effort
         logger.warning("codec_classifier: probing failed for %s", path, exc_info=True)
     return probe
 
 
 def probe_interlace(path: str) -> dict:
-    """The cheap probes a forced class needs: stream info plus idet.  Never raises.
+    """The cheap probes a forced class needs: stream info plus idet.
+
+    Raises only :class:`ProbeAborted` (see :func:`probe_media`).
 
     One ffprobe (dimensions, ``pix_fmt``, ``field_order``, duration) and the
     same idet sampling :func:`probe_media` runs (``IDET_SECONDS`` at each of
@@ -1325,15 +1451,24 @@ def probe_interlace(path: str) -> dict:
         idet = _probe_idet(path, sample_times(probe.get("duration")))
         if idet:
             probe["idet"] = idet
+    except ProbeAborted:
+        raise
     except Exception:  # noqa: BLE001 - probes are best-effort
         logger.warning("codec_classifier: interlace probe failed for %s", path, exc_info=True)
     return probe
 
 
 def plan_for_file(path: str, context: dict | None = None) -> CodecPlan:
-    """Probe ``path`` and classify it.  Never raises."""
+    """Probe ``path`` and classify it.
+
+    Raises :class:`ProbeAborted` when a probe could not run or was killed, so
+    the caller fails visibly instead of encoding with a class nobody measured.
+    Any other error yields the undecided-source plan.
+    """
     try:
         return classify(probe_media(str(path)), context)
+    except ProbeAborted:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("codec_classifier: plan_for_file failed (%s)", exc)
         return _undecided_plan(str(exc), "probe error")

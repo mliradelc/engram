@@ -61,8 +61,11 @@ Three-way, checked in this order:
   plan with `bwdif` in front.
 * **Progressive** -> no `bwdif` and no `fieldmatch` in the command at all.
 * **Undecided** (no usable idet and no usable `field_order`, idet combed with no consistent field
-  order and no usable `field_order`, or the probe/classifier failed) -> **deinterlaced**. `bwdif`
-  on a progressive frame is visually near-lossless; combing baked into an encode is permanent.
+  order and no usable `field_order`, or the probe failed on the file / the classifier failed) ->
+  **deinterlaced**. `bwdif` on a progressive frame is visually near-lossless; combing baked into
+  an encode is permanent.
+* **Unmeasured** (a probe could not run, timed out, or was killed) is *not* undecided: nothing is
+  encoded and the panel shows a failed row with Retry. See "Detection signals".
 * The filter is one shared constant, `DEINTERLACE_FILTER = bwdif=mode=send_frame:parity=auto:deint=all`:
   * `deint=all` deinterlaces every frame of a source judged interlaced. The previous
     `deint=interlaced` only touched frames *flagged* interlaced, so a combed source whose frames
@@ -79,7 +82,26 @@ Three-way, checked in this order:
 
 ## Detection signals
 
-All probes are cheap and best-effort; a failed probe just leaves its key out.
+Every probe has one of three outcomes, and only the first two say anything about the file:
+
+* **ok** (exit 0): its output is evidence.
+* **failed** (ffmpeg/ffprobe exited non-zero on its own: cannot open, seek or decode): a property
+  of the source, so the key is left out (and an idet that fails on every sample is logged at
+  WARNING). Interlacing then falls to `field_order`, or to undecided, as above.
+* **aborted** (binary missing, timed out after 60 s, or killed by a signal): a property of the
+  *host*, raised as `ProbeAborted`. ffmpeg catches SIGTERM, prints the idet summary of the
+  truncated span and exits **255** (measured, ffmpeg 7.1.5; SIGKILL gives -9, ffprobe -15), so a
+  killed idet looked like a short valid measurement; before this, a killed idet or pixel probe
+  classified a progressive source `live_action_clean` with no error. The hook now records a
+  failed row ("Source probe interrupted, nothing encoded: ...") and encodes nothing; it does not
+  fall back to the fixed settings, which would encode an unmeasured source without its
+  deinterlace filter. No marker is written, so the next organize pass or a Retry re-probes.
+
+  Why raise rather than "undecided": there is no conservative default for an unmeasured source.
+  Undecided means `bwdif`, which is wrong for a telecined source (IVTC is never chosen without
+  measurement, by design), and the same kill blinds the grain/animation probes, so the class
+  would be a guess too. The cause is transient, a retry gets the truth, and the original stays
+  in the library.
 
 * **Interlacing**: `ffmpeg -vf idet` on five 3-second samples spread across the title (12/30/48/66/84 %
   of the duration, not the first seconds, which are often a logo or black, and a Blu-ray may open on a
