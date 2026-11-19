@@ -134,7 +134,7 @@ async def test_retry_returns_404_outside_library_roots(client, retry_env, tmp_pa
 async def test_retry_returns_409_while_encoding(client, retry_env):
     src = retry_env.lib / "Show - S01E01.mkv"
     src.write_bytes(b"x")
-    key = str(encode_hook._staging_dir() / src.name)
+    key = str(encode_hook.encode_destination(src, encode_hook._staging_dir()))
     encode_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
     resp = await client.post("/api/encoding/retry", json={"file": str(src)})
     assert resp.status_code == 409

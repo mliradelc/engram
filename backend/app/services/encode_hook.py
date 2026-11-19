@@ -82,6 +82,7 @@ only in memory.  ``hdr`` and ``interlaced`` are never accepted from an operator.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
 import json
 import logging
@@ -795,14 +796,58 @@ def _plan_forced(plan) -> bool:
     return plan is not None and bool((getattr(plan, "evidence", None) or {}).get("forced"))
 
 
+def encode_destination(src: Path, staging_dir: Path) -> Path:
+    """Where ``src``'s encode lands: a per-rip subdirectory of ``staging_dir``.
+
+    ``dest = staging_dir / src.name`` was the old shape and it collided: nothing
+    in the path identified the *job*, so two rips whose first track carried the
+    same disc label (two "Reef Diary" tracks from one box set, or two discs whose
+    episode names match) resolved to the same path and the second
+    ``tmp.replace(dest)`` destroyed the first one's output.
+
+    The component is derived from the source's parent directory, which is where
+    Engram puts each rip (``.../not identified_<id>/`` or the curator's per-disc
+    folder).  That keeps the destination:
+
+    * unique per rip, which is the point;
+    * **stable** across a retry and across a process restart — a PID, a temp dir
+      or a uuid would orphan the previous output and make resume impossible;
+    * still inside ``ENGRAM_ENCODE_STAGING``, so the curator's scan finds it.
+
+    Deterministic on purpose: ``sha1`` here is a name shortener, not a security
+    primitive, and the readable stem is kept as a prefix.
+    """
+    try:
+        parent = src.resolve(strict=False).parent
+    except (OSError, RuntimeError):  # cannot tell: fall back to the flat shape
+        return staging_dir / src.name
+    if parent.resolve(strict=False) == staging_dir.resolve(strict=False):
+        # A source sitting directly in the staging root has no job component to
+        # derive; the in-place guard refuses it, so this path is only a fallback.
+        return staging_dir / src.name
+    digest = hashlib.sha1(str(parent).encode("utf-8")).hexdigest()[:12]
+    stem = _slug(parent.name) or "rip"
+    return staging_dir / f"{stem}-{digest}" / src.name
+
+
+def _slug(text: str, limit: int = 48) -> str:
+    """Filesystem-safe, human-readable slug.  Never returns a path separator."""
+    cleaned = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in text)
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned[:limit].strip("-.")
+
+
 def _would_encode_in_place(src: Path, staging_dir: Path) -> bool:
     """True when the encode's destination is the source itself.
 
-    ``dest = staging_dir / src.name`` and ``tmp.replace(dest)``: for a source
-    sitting directly in ``ENGRAM_ENCODE_STAGING`` that overwrites the original.
+    ``dest = encode_destination(src, staging_dir)`` and ``tmp.replace(dest)``:
+    for a source sitting directly in ``ENGRAM_ENCODE_STAGING`` that overwrites
+    the original.  A source in a subdirectory of the staging root is safe — the
+    output goes to a *sibling* job directory — so only the root level is refused.
     """
     try:
-        return (staging_dir / src.name).resolve(strict=False) == src.resolve(strict=False)
+        dest = encode_destination(src, staging_dir).resolve(strict=False)
+        return dest == src.resolve(strict=False)
     except (OSError, RuntimeError):
         return True  # cannot tell: fail closed
 
@@ -1130,12 +1175,14 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
         )
         return None
 
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    dest = staging_dir / src.name
+    dest = encode_destination(src, staging_dir)
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     # Encode to a temp name, then rename, so a partial file is never mistaken
-    # for a finished one by the curator's settle check.
-    tmp = staging_dir / f".{src.stem}.partial.mkv"
+    # for a finished one by the curator's settle check.  The temp file lives in
+    # the destination's own job directory, so two concurrent jobs never share a
+    # ``.partial`` name either.
+    tmp = dest.parent / f".{src.stem}.partial.mkv"
 
     if plan is None:
         video_args, expect_codec, active = _legacy_video_args(threads), "av1", None
@@ -1625,7 +1672,7 @@ def retry_encode(
             )
         _validate_forced(src, codec_class)
 
-    key = str(_staging_dir() / src.name)
+    key = str(encode_destination(src, _staging_dir()))
     with _encoding_lock:
         if key in _ENCODING or key in _RETRY_PENDING:
             raise RetryConflict(f"Already encoding {src.name}")

@@ -249,13 +249,15 @@ def test_snapshot_empty_before_populated_during_empty_after_success(tmp_path, mo
     monkeypatch.setattr(subprocess, "run", fake)
     src = _src(tmp_path)
     out = encode_hook.transcode_file(src, tmp_path / "out")
-    assert out == tmp_path / "out" / src.name
+    # Per-rip subdirectory: two rips with the same track name must not collide.
+    assert out.parent.parent == tmp_path / "out"
+    assert out.name == src.name
 
     during = fake.seen[2]
     assert len(during) == 1
     row = during[0]
     assert row["file"] == src.name
-    assert row["destination_folder"] == str(tmp_path / "out")
+    assert row["destination_folder"] == str(out.parent)
     assert row["percent"] == 50.0
     assert row["eta"] == 200
     assert row["speed"] == "0.25x"
@@ -365,7 +367,7 @@ def test_progress_published_on_loop_throttled_and_terminated(tmp_path, monkeypat
     assert len(received) == 3
     for msg in received:
         assert msg["file"] == src.name
-        assert msg["destination_folder"] == str(tmp_path / "out")
+        assert Path(msg["destination_folder"]).parent == tmp_path / "out"
         assert msg["codec"] == "av1"
         assert set(msg) == {
             "file",
@@ -511,7 +513,7 @@ def test_failed_encode_lands_in_the_failure_buffer(tmp_path, monkeypatch):
     row = status["failed"][0]
     assert row["file"] == src.name
     assert row["source"] == str(src)
-    assert row["destination_folder"] == str(tmp_path / "out")
+    assert Path(row["destination_folder"]).parent == tmp_path / "out"
     assert "ffmpeg exited 1" in row["reason"] and "boom" in row["reason"]
     assert isinstance(row["failed_at"], float)
 
@@ -661,7 +663,9 @@ def test_retry_goes_through_the_shared_gate_and_registry(hook_env, monkeypatch):
 
 def test_retry_moves_the_row_out_of_failed(hook_env, monkeypatch):
     src = _staged_src(hook_env)
-    encode_hook._record_failure(src.resolve(), encode_hook._staging_dir() / src.name, "boom")
+    encode_hook._record_failure(
+        src.resolve(), encode_hook.encode_destination(src, encode_hook._staging_dir()), "boom"
+    )
     assert len(encode_hook.failures_snapshot()) == 1
     started = threading.Event()
     release = threading.Event()
@@ -731,7 +735,7 @@ def test_retry_without_roots_fails_closed(hook_env, tmp_path, monkeypatch):
 def test_retry_refused_while_the_file_is_encoding(hook_env, monkeypatch):
     src = _staged_src(hook_env)
     marker = _write_done_marker(src)
-    key = str(encode_hook._staging_dir() / src.name)
+    key = str(encode_hook.encode_destination(src, encode_hook._staging_dir()))
     encode_hook._ENCODING[key] = {"file": src.name, "started_at": 1.0}
     called = []
     monkeypatch.setattr(encode_hook, "transcode_file", lambda *a, **k: called.append(a))

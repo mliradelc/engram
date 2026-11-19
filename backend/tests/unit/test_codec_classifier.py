@@ -587,6 +587,17 @@ def hook(monkeypatch, tmp_path):
     _clear_encoder_caches()
 
 
+def _job_dir(staging, src):
+    """The per-rip destination directory ``encode_destination`` derives."""
+    return encode_hook.encode_destination(Path(src), staging).parent.relative_to(staging)
+
+
+def _out(tmp, src):
+    """The encoded output path for ``src`` (per-rip subdir, not the staging root)."""
+    staging = tmp / "stage"
+    return staging / _job_dir(staging, src) / Path(src).name
+
+
 def _encode_cmds(calls):
     return [c for c in calls if c[0] == "ffmpeg" and c[-1].endswith(".partial.mkv")]
 
@@ -639,7 +650,7 @@ def test_kill_switch_reproduces_the_original_command_exactly(hook, monkeypatch):
         "copy",
         "-c:s",
         "copy",
-        str(staging / ".Movie (2000).partial.mkv"),
+        str(staging / _job_dir(staging, src) / ".Movie (2000).partial.mkv"),
     ]
     assert not any(c[0] == "ffmpeg" and "testsrc" in " ".join(c) for c in calls)
 
@@ -691,7 +702,7 @@ def test_classifier_plan_drives_the_command_and_context_is_forwarded(hook, monke
         "0:s?",
     ]
     assert cmd[-5:-1] == ["-c:a", "copy", "-c:s", "copy"]
-    assert (tmp / "stage" / src.name).exists()
+    assert _out(tmp, src).exists()
     marker = json.loads((src.parent / (src.name + encode_hook.MARKER_SUFFIX)).read_text())
     assert marker["codec_class"] == cc.ANIMATION
 
@@ -710,7 +721,7 @@ def test_hevc_plan_is_verified_as_hevc(hook, monkeypatch):
     encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-c:v") + 1] == "libx265"
-    assert (tmp / "stage" / src.name).exists()
+    assert _out(tmp, src).exists()
 
 
 def test_wrong_codec_or_pixfmt_aborts_the_swap(hook, monkeypatch):
@@ -724,8 +735,8 @@ def test_wrong_codec_or_pixfmt_aborts_the_swap(hook, monkeypatch):
         calls: list = []
         monkeypatch.setattr(encode_hook.subprocess, "run", _Run(calls, lambda c, s=streams: s))
         encode_hook.after_organize(str(src))
-        assert not (tmp / "stage" / src.name).exists()
-        assert not list((tmp / "stage").glob("*.partial.mkv"))
+        assert not _out(tmp, src).exists()
+        assert not list((tmp / "stage").rglob("*.partial.mkv"))
         assert src.read_bytes() == b"source"
 
 
@@ -747,7 +758,7 @@ def test_track_count_mismatch_still_aborts_the_swap(hook, monkeypatch):
 
     monkeypatch.setattr(encode_hook.subprocess, "run", run)
     encode_hook.after_organize(str(src))
-    assert not (tmp / "stage" / src.name).exists()
+    assert not _out(tmp, src).exists()
     assert src.read_bytes() == b"source"
 
 
@@ -765,7 +776,7 @@ def test_hdr_transfer_loss_aborts_the_swap(hook, monkeypatch):
 
     monkeypatch.setattr(encode_hook.subprocess, "run", run)
     encode_hook.after_organize(str(src))
-    assert not (tmp / "stage" / src.name).exists()
+    assert not _out(tmp, src).exists()
 
 
 def test_passthrough_plan_encodes_nothing_and_writes_an_idempotent_marker(hook, monkeypatch):
@@ -801,7 +812,7 @@ def test_classifier_exception_falls_back_to_fixed_settings(hook, monkeypatch):
     encode_hook.after_organize(str(src))
     (cmd,) = _encode_cmds(calls)
     assert cmd[cmd.index("-svtav1-params") + 1] == "tune=0:lp=4"
-    assert (tmp / "stage" / src.name).exists()
+    assert _out(tmp, src).exists()
 
 
 def test_unloadable_classifier_falls_back_to_fixed_settings(hook, monkeypatch):
@@ -840,7 +851,7 @@ def test_encoder_rejecting_extras_degrades_to_essential_params_then_to_fixed(hoo
     assert "film-grain-denoise=0" in p and "variance-boost" not in p
 
     # Encoder rejects everything the plan emits: fixed legacy command.
-    (tmp / "stage" / src.name).unlink()
+    _out(tmp, src).unlink()
     (src.parent / (src.name + encode_hook.MARKER_SUFFIX)).unlink()
     _clear_encoder_caches()
     calls, run = run_factory(lambda c: "film-grain" not in " ".join(c))
@@ -1167,7 +1178,7 @@ def test_full_hook_path_with_real_ffmpeg_on_a_synthetic_file(tmp_path, monkeypat
     monkeypatch.setattr(real, "plan_for_file", fast)
     _clear_encoder_caches()
     encode_hook.after_organize(str(src), context={"content_type": "tv", "is_extra": False})
-    out = tmp_path / "stage" / src.name
+    out = _out(tmp_path, src)
     assert out.exists()
     probe_out = encode_hook._probe(out)
     src_counts = encode_hook._track_counts(encode_hook._probe(src))

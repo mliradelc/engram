@@ -19,8 +19,16 @@ Evaluated top to bottom; first match wins. `sd` = width < 1200, `hd` = 1200-2999
 | `interlaced` | idet says interlaced with a dominant field order; or `field_order` says so when idet is inconclusive; **or interlacing cannot be decided at all** | **deinterlace, then encode** (no flag needed) | `bwdif=mode=send_frame:parity=auto:deint=all` (telecined: `fieldmatch,decimate`), then AV1 CRF 24, preset 6, film-grain 0 |
 | `hdr` | `color_transfer` = `smpte2084` (PQ) or `arib-std-b67` (HLG) | AV1, or x265 if the title is also grainy | AV1 CRF 24, preset 6 (8 at uhd), film-grain 4 (0 at uhd); x265 CRF 20 |
 | `animation` | animation score >= 0.60 and grain below threshold | AV1 | CRF 27, preset 6 (8 uhd), film-grain 0, variance-boost strength 1 |
-| `live_action_grainy` | normalised grain >= 0.40 | **x265** | CRF 20 (sd) / 21, preset medium (fast at uhd), `aq-mode=3` |
+| `live_action_grainy` | normalised grain >= 0.55 | **x265** | CRF 20 (sd) / 21, preset medium (fast at uhd), `aq-mode=3` |
 | `live_action_clean` | everything else (a progressive source with no grain/animation measurement lands here; a probe too empty to decide interlacing goes to `interlaced`) | AV1 | CRF 23 (sd) / 25, preset 6 (8 uhd), film-grain 4 (0 at uhd), variance-boost strength 2 |
+
+**The grain threshold is 0.55, and it was raised from 0.40 on measured evidence.** 0.40 was
+fitted on synthetic sources before any real disc was probed. On the principal's own Blu-ray, two
+tracks off the *same disc* scored 0.46 and 0.28 — the 0.46 one was routed to x265 while its
+sibling went to AV1. Two tracks from one disc do not carry different film stock; the higher score
+was compression artefact, not grain. MPEG-2 mosquito noise on DVD and light H.264 dither on Blu-ray
+both land in 0.40–0.52, so the old threshold admitted artefacts and paid x265 prices for them. When
+encodes still look wrong, retune from `av1-measurement.json` rates, not by eye.
 
 Every output is `yuv420p10le`. Every AV1 command carries `tune=0`, `film-grain-denoise=0`
 (this SVT build defaults denoising **on**, which would stack on top of real grain) and

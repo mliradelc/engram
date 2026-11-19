@@ -201,7 +201,16 @@ IDET_PARITY_DOMINANCE = 0.75  # real interlace has ONE field order; a TFF/BFF co
 # Below it idet's "interlaced" is not trusted *on its own*: the container's
 # field_order decides, and with no usable field_order the source is undecided,
 # which deinterlaces (see interlaced_verdict).  It never declares progressive.
-GRAIN_THRESHOLD = 0.40  # normalised grain at/above this -> grainy
+# Normalised grain at/above this -> ``live_action_grainy`` (x265, much more
+# expensive).  Was 0.40 when fitted on synthetic sources, before any real disc
+# was probed; 0.46 is not synthetic — it is a measured Blu-ray compression
+# artefact (``Reef Diary - Builders``, grain=0.46, routed to x265 while its
+# sibling track off the same disc measured 0.28 and went to AV1).  MPEG-2
+# mosquito noise on DVD and light H.264 dither on Blu-ray both land in
+# 0.40-0.52, so the old threshold admitted artefacts.  0.55 sits above that
+# band and below genuinely grainy film; retune with ``references/av1-hook.md``
+# measurements rather than by eye if encodes still look wrong.
+GRAIN_THRESHOLD = 0.55
 ANIMATION_THRESHOLD = 0.60  # animation score at/above this -> animation
 HINT_NUDGE = 0.05  # how far a tv/movie hint may move a threshold (never a verdict)
 # Telecine: (top + bottom) / (neither + top + bottom) from idet's "Repeated
