@@ -550,6 +550,41 @@ async def _encode_roots() -> list:
     return encode_hook.default_retry_roots([config.library_tv_path, config.library_movies_path])
 
 
+@router.get(
+    "/encoding/library",
+    dependencies=[Depends(require_localhost_or_lan)],
+)
+async def encoding_library() -> dict:
+    """Every encode Engram has recorded, grouped by series / film folder.
+
+    Read-only.  Walks the roots ``encode_hook.library_scan_roots`` reports for
+    ``.mkv`` sources carrying an ``.engram-av1.json`` marker; the scan is cached
+    for ``encode_library.LIBRARY_SCAN_TTL_SECONDS``.  The live registry is
+    overlaid on every call, so an in-flight encode shows ``encoding`` and a
+    buffered failure ``failed``.  ``encoded_at`` is the marker file's mtime (the
+    marker itself carries no timestamp).  Paths are absolute server paths, as in
+    ``GET /api/encoding``'s ``destination_folder``.
+
+    The scan roots are *wider* than the encode domain on purpose: markers record
+    what was encoded, and they end up in the library once the curator files the
+    source there.  Scanning is read-only and never authorises an encode —
+    ``POST /api/encoding/retry`` still goes through ``default_retry_roots``.
+    """
+    from app.services import encode_hook, encode_library
+    from app.services.config_service import get_config
+
+    config = await get_config()
+    roots = encode_hook.library_scan_roots([config.library_tv_path, config.library_movies_path])
+    status = encode_hook.encoding_status()
+    return await asyncio.to_thread(
+        encode_library.library_snapshot,
+        roots,
+        tv_root=config.library_tv_path or None,
+        movies_root=config.library_movies_path or None,
+        status=status,
+    )
+
+
 @router.post(
     "/encoding/dismiss",
     dependencies=[Depends(require_localhost_or_lan)],

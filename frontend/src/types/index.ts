@@ -312,6 +312,64 @@ export interface EncodeDismissResponse {
     dismissed: number;
 }
 
+/**
+ * A library row's state. `stale` (the source changed since the encode) and
+ * `output_missing` (the recorded output is gone) are the two where the marker
+ * no longer tells the truth. `pending` is a pin with no encode recorded yet.
+ */
+export type EncodeLibraryState =
+    | 'encoded'
+    | 'passthrough'
+    | 'stale'
+    | 'output_missing'
+    | 'pending'
+    | 'encoding'
+    | 'failed';
+
+/** One marked source in `GET /api/encoding/library`. */
+export interface EncodeLibraryEntry {
+    source: string;
+    file: string;
+    folder: string;
+    season: number | null;
+    episode: number | null;
+    /** Output path as recorded in the marker; null for passthrough. */
+    output: string | null;
+    codec_class: string | null;
+    forced: boolean;
+    state: EncodeLibraryState;
+    note?: string | null;
+    /** Epoch seconds: the marker file's mtime (the marker has no timestamp). */
+    encoded_at: number | null;
+    source_bytes: number | null;
+    output_bytes: number | null;
+    progress?: {
+        percent: number | null;
+        eta: number | null;
+        speed: string | null;
+        destination_folder?: string | null;
+        started_at?: number | null;
+    } | null;
+    failure?: { reason: string | null; failed_at: number | null } | null;
+}
+
+export interface EncodeLibraryGroup {
+    kind: 'series' | 'film' | 'other';
+    title: string;
+    /** Absolute folder path; empty for the Ungrouped group. */
+    folder: string;
+    entries: EncodeLibraryEntry[];
+}
+
+/** `GET /api/encoding/library` payload. */
+export interface EncodeLibrary {
+    root_tv: string | null;
+    root_movies: string | null;
+    scan_ttl_seconds?: number;
+    groups: EncodeLibraryGroup[];
+    totals: Record<string, number>;
+}
+
 export interface TitlesDiscovered {
     type: 'titles_discovered';
     job_id: number;

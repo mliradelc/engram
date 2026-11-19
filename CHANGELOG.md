@@ -4,6 +4,10 @@ All notable changes to Engram will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Encode library.** A new **Encodes** screen (`/encodes`) lists every encode Engram has recorded, current and past, grouped by series or film with each folder's path shown. Each row shows its codec class, state, source and output size with the space saved, and when its encode record was written. From a row you can pick a pipeline (Auto or one of the four forceable classes) and re-encode it; the button warns first that the new encode replaces the existing one. Rows whose record no longer holds are marked: **Stale** when the source changed after the encode, **Output missing** when the recorded output is gone. Encodes in progress are pinned at the top with percent, ETA and speed. You can search by title, file or folder and filter by state. Backed by a read-only `GET /api/encoding/library` that reads the existing `.engram-av1.json` markers and caches the scan for 10 seconds.
+
 ## [0.45.2] - 2026-11-18
 
 _Highlights: discs identified by TheDiscDB get each episode on the right track again, complete Blu-ray rips are no longer mistaken for truncated ones, AI matching works with LM Studio and Ollama, German shows matched in German go to review far less often, and the TheTVDB numbering suggestion can be accepted on a disc with no known season._

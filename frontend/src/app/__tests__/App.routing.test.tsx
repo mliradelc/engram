@@ -70,6 +70,7 @@ describe("App routing — every page mounts (no blank/black screen)", () => {
   const routeCases: Array<[string, string]> = [
     ["/", "dashboard"],
     ["/history", "history"],
+    ["/encodes", "encode library"],
     ["/review/7", "review detail"],
     ["/review", "bare review → redirects to dashboard"],
   ];

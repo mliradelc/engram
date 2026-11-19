@@ -22,6 +22,8 @@ export const ROUTES = {
   /** Bare `/review` — redirects to the dashboard (no jobId to review). */
   REVIEW: "/review",
   REVIEW_DETAIL: "/review/:jobId",
+  /** Encode library: every recorded encode, grouped by series / film. */
+  ENCODE_LIBRARY: "/encodes",
 } as const;
 
 /**
@@ -36,6 +38,7 @@ export const ROUTE_PATTERNS: readonly string[] = [
   ROUTES.HISTORY_DETAIL,
   ROUTES.REVIEW,
   ROUTES.REVIEW_DETAIL,
+  ROUTES.ENCODE_LIBRARY,
   ...(FEATURES.DISCDB_CONTRIBUTE ? [ROUTES.CONTRIBUTE] : []),
 ];
 

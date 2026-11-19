@@ -26,6 +26,7 @@ import UpdateModal from "../components/UpdateModal";
 import { FingerprintDisclosureModal } from "../components/FingerprintDisclosureModal";
 import HistoryPage from "../components/HistoryPage";
 import ContributePage from "../components/ContributePage";
+import EncodeLibraryPage from "../components/EncodeLibraryPage";
 import { FEATURES } from "../config/constants";
 import { ROUTES, reviewPath } from "../config/routes";
 import { buildNavItems } from "./navigation";
@@ -1088,6 +1089,7 @@ function App() {
       <Route path={ROUTES.HOME} element={<MainDashboard />} />
       <Route path={ROUTES.HISTORY} element={<HistoryPage />} />
       <Route path={ROUTES.HISTORY_DETAIL} element={<HistoryPage />} />
+      <Route path={ROUTES.ENCODE_LIBRARY} element={<EncodeLibraryPage />} />
       {FEATURES.DISCDB_CONTRIBUTE && <Route path={ROUTES.CONTRIBUTE} element={<ContributePage />} />}
       <Route path="/library" element={<Navigate to={ROUTES.HISTORY} replace />} />
       <Route path={ROUTES.REVIEW} element={<Navigate to={ROUTES.HOME} replace />} />

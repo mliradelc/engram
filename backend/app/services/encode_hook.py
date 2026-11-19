@@ -1201,6 +1201,7 @@ def transcode_file(src: Path, staging_dir: Path, plan=None, *, loop=None) -> Pat
         # and removed in ``finally`` so a failed or timed-out encode leaves no row.
         entry: dict[str, Any] = {
             "file": src.name,
+            "source": str(src),
             "destination_folder": str(dest.parent),
             "percent": 0.0,
             "eta": None,
@@ -1491,6 +1492,31 @@ def default_retry_roots(library_paths: Iterable[str | None]) -> list[Path]:
     domain only", not "anywhere Jellyfin reads from".
     """
     return domain_roots(library_paths)
+
+
+def library_scan_roots(library_paths: Iterable[str | None] = ()) -> list[Path]:
+    """Roots to *read* when cataloguing what Engram has already encoded.
+
+    Deliberately wider than :func:`domain_roots`, and **read-only**.  The hook
+    writes a source's marker next to the source, and the curator then files
+    that source (marker and all) into the library — so the durable record of
+    every past encode ends up *in the library*, which ``domain_roots``
+    correctly refuses to encode from.  Cataloguing therefore needs the library
+    roots too, or it would find nothing.
+
+    This must never be used to authorise an encode: re-encode keeps going
+    through ``default_retry_roots``/``domain_roots`` and stays staging-only.
+    Passing these roots to ``retry_encode`` would re-open the exact hole
+    ``domain_roots`` exists to close.
+    """
+    roots = domain_roots(library_paths)
+    for raw in library_paths:
+        if not raw:
+            continue
+        candidate = Path(raw)
+        if candidate.is_dir() and not _within(candidate, roots):
+            roots.append(candidate)
+    return roots
 
 
 def _within(path: Path, roots: Iterable[Path]) -> bool:
