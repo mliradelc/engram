@@ -73,7 +73,7 @@ Update `backend/tests/unit/test_codec_classifier.py` for every changed value, an
 ## Constraints
 
 - Do not change the class set, the classifier thresholds, or the interlaced passthrough default.
-- Do not touch `av1_hook.py` or `finalization_coordinator.py`.
+- Do not touch `encode_hook.py` or `finalization_coordinator.py`.
 - Keep the module stdlib-only at import time.
 - Every emitted ffmpeg command must remain valid on **ffmpeg 5.1.9** (the production image), not
   the dev box's 7.x. You may probe with `docker exec engram` if useful, but do not rebuild or

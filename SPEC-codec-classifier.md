@@ -4,7 +4,7 @@
 
 Engram (fork at `/opt/engram/src`, container `engram` on CT111, image
 `engram-remote-asr:local`) files rips into the library as untouched MakeMKV output, then runs a
-post-organize hook (`backend/app/services/av1_hook.py`) that re-encodes the file to AV1.
+post-organize hook (`backend/app/services/encode_hook.py`) that re-encodes the file to AV1.
 
 That hook is **content-blind**: CRF and preset are fixed env vars applied to every file. A
 grainy 1080p film, a flat cel-animation episode, and an interlaced 1080i concert all get the
@@ -51,7 +51,7 @@ called with only `org_result.get("final_path")`. **Extend the signature** to pas
 identification context the classifier needs. Suggested payload:
 
 ```python
-av1_hook.after_organize(
+encode_hook.after_organize(
     final_path,
     context={
         "content_type": job.content_type.value if job.content_type else None,
@@ -78,8 +78,8 @@ existing call shape and any other caller keep working.
 - **`codec_classifier.py` must be importable standalone**, with only the standard library and
   `subprocess`/`json`. Do not import from `app.services`, `app.matcher`, or `app.models` at
   module level. If you need a type, use a plain dict.
-- **`av1_hook.py` must keep working when imported directly** by the tests
-  (`import av1_hook`), so put the classifier import behind a try/except or import it lazily
+- **`encode_hook.py` must keep working when imported directly** by the tests
+  (`import encode_hook`), so put the classifier import behind a try/except or import it lazily
   inside the function if it would otherwise create a cycle.
 - The test file must import the classifier by file path or as a top-level module, not through
   `app.services`.
@@ -166,7 +166,7 @@ rename classes, and you must justify the final set:
 
 ### 3. Wire it into the hook
 
-Modify `av1_hook.py` to:
+Modify `encode_hook.py` to:
 - Call the classifier, log the chosen class and the evidence that drove it
   (e.g. `codec_classifier: class=live_action_grainy grain=0.42 interlaced=no -> x265 crf=20`).
 - Build the ffmpeg command from the class's settings.
@@ -193,7 +193,7 @@ Run the suite. Report the actual pass/fail counts.
 
 1. `backend/app/services/codec_classifier.py` — new module, with a docstring citing the sources above
    and justifying the class set.
-2. `backend/app/services/av1_hook.py` — modified to use it, kill switch preserved.
+2. `backend/app/services/encode_hook.py` — modified to use it, kill switch preserved.
 3. `backend/app/services/finalization_coordinator.py` — both call sites pass context.
 4. `tests/test_codec_classifier.py` — passing tests.
 5. A short `CODEC-CLASSIFIER.md` at repo root: the class table, what each class detects, the
