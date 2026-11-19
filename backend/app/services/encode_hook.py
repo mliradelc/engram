@@ -108,7 +108,13 @@ logger = logging.getLogger(__name__)
 # them look unconverted and re-trigger a re-encode of the whole library.
 # Guarded by test_marker_suffix_is_frozen.
 MARKER_SUFFIX = ".engram-av1.json"
-ENCODE_TIMEOUT_SECONDS = 6 * 60 * 60  # a 45-min BD episode is well inside this
+# 24 h, not 6: a grainy 1080i BD source classified live_action_grainy encodes
+# with x265 -crf 21 -preset slow at ~0.09x, i.e. ~9 h for a ~48-min episode (and
+# up to ~14 h for a full-length one).  The old 6 h ceiling guaranteed those runs
+# were killed at 100% of the work spent and nothing kept.  This is a backstop for
+# a wedged ffmpeg, not a schedule: the slot is held for the whole encode, so a
+# run that genuinely hangs still ties up the encoder until this fires.
+ENCODE_TIMEOUT_SECONDS = 24 * 60 * 60
 PROGRESS_PUBLISH_INTERVAL = 2.0  # seconds between encode_progress messages per file
 FAILURE_BUFFER_SIZE = 20  # recently-failed encodes kept for the panel's Retry rows
 
