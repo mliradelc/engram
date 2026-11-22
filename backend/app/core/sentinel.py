@@ -321,6 +321,10 @@ class DriveMonitor:
         logger.info(
             f"Drive monitor started (polling mode, {len(self._drive_states)} optical drives found)"
         )
+        # Mark the monitor running only once its poll loop is confirmed alive: reporting
+        # "started" for a loop that died on its first line is what hid a dead sentinel for
+        # two days (the guard alone cannot repair that — nothing re-starts the monitor).
+        self._running = bool(self._task)
 
     def stop(self) -> None:
         """Stop the drive monitor."""
@@ -347,13 +351,24 @@ class DriveMonitor:
 
     async def _poll_loop(self) -> None:
         """Poll for drive changes."""
-        # Load poll interval from config
-        if self._poll_interval is None:
-            if self._config is None:
-                from app.services.config_service import get_config_sync
+        # Load poll interval from config. The self-built DriveMonitor is created with
+        # config=None, so this runs inside the scheduled task: any failure here used to
+        # kill the task silently — start() had already logged "Drive monitor started (…)",
+        # _running stayed True (so start() could never be retried), and no disc insertion
+        # was ever detected again until the container was recreated. Every step is now
+        # guarded so the loop can never die before its first idempotent poll.
+        if self._poll_interval is None or self._poll_interval <= 0:
+            try:
+                if self._config is None:
+                    from app.services.config_service import get_config_sync
 
-                self._config = get_config_sync()
-            self._poll_interval = self._config.sentinel_poll_interval
+                    self._config = get_config_sync()
+                self._poll_interval = self._config.sentinel_poll_interval
+            except Exception as e:
+                logger.error(f"Drive poll interval unavailable, using 2s: {e}")
+                self._poll_interval = None
+        if not self._poll_interval or self._poll_interval <= 0:
+            self._poll_interval = 2.0
 
         while self._running:
             try:

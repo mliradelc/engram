@@ -8,6 +8,7 @@ Covers the platform-independent surface:
 The ctypes Windows paths are guarded so they only run on win32.
 """
 
+import asyncio
 import sys
 from unittest.mock import AsyncMock, mock_open, patch
 
@@ -117,6 +118,78 @@ class TestCheckDrivesDebounce:
             await monitor._check_drives()
 
         notify.assert_awaited_once_with("inserted", "/dev/sr1", "DISC")
+
+
+@pytest.mark.unit
+class TestPollLoopSurvivesConfigFailure:
+    """_poll_loop must poll even when the poll interval cannot be loaded.
+
+    Regression: the config read ran unguarded inside the scheduled task. A failure
+    there killed the loop after start() had already logged "Drive monitor started",
+    and _running stayed True — so discs inserted afterwards were never detected and
+    start() could not be retried. Reproduced on CT111 (dead sentinel 2026-11-20 →
+    2026-11-22, LXC running, disc in the drive, zero polls since container start).
+    """
+
+    async def test_config_failure_falls_back_to_default_interval(self):
+        monitor, notify = _make_monitor()
+        monitor._drive_states = {"/dev/sr0": False}
+        monitor._config = None
+        polls = []
+
+        async def _fake_check() -> None:
+            polls.append(1)
+            if len(polls) >= 2:
+                monitor._running = False
+
+        with (
+            patch(
+                "app.services.config_service.get_config_sync",
+                side_effect=RuntimeError("db gone"),
+            ),
+            patch.object(monitor, "_check_drives", side_effect=_fake_check),
+            patch.object(sentinel.asyncio, "sleep", new=AsyncMock()),
+        ):
+            monitor._running = True
+            # Must return on its own: the old loop died here before polling once.
+            await asyncio.wait_for(monitor._poll_loop(), timeout=5.0)
+
+        assert len(polls) >= 2
+        assert monitor._poll_interval == 2.0
+
+    async def test_disc_inserted_is_detected_alongside_another_drive(self):
+        """The CT111 shape: a second optical drive (/dev/sr0) is enumerated too."""
+        monitor, notify = _make_monitor()
+        monitor._drive_states = {"/dev/sr0": False, "/dev/sr1": False}
+
+        def _present(drive: str) -> bool:
+            return drive == "/dev/sr1"
+
+        with (
+            patch.object(sentinel, "get_optical_drives", return_value=["/dev/sr0", "/dev/sr1"]),
+            patch.object(sentinel, "is_disc_present", side_effect=_present),
+            patch.object(sentinel, "get_volume_label", return_value="GREAT BARRIER REEF DISC2"),
+        ):
+            await monitor._check_drives()
+            await monitor._check_drives()
+
+        notify.assert_awaited_once_with("inserted", "/dev/sr1", "GREAT BARRIER REEF DISC2")
+        assert monitor._drive_states == {"/dev/sr0": False, "/dev/sr1": True}
+
+    async def test_zero_interval_is_rejected(self):
+        monitor, _ = _make_monitor()
+
+        class _Cfg:
+            sentinel_poll_interval = 0
+
+        monitor._config = _Cfg()
+        monitor._running = False  # loop body must not spin
+
+        with patch.object(sentinel.asyncio, "sleep", new=AsyncMock()) as sleeper:
+            await monitor._poll_loop()
+
+        assert monitor._poll_interval == 2.0
+        sleeper.assert_not_called()
 
 
 @pytest.mark.unit
