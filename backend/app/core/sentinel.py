@@ -321,10 +321,17 @@ class DriveMonitor:
         logger.info(
             f"Drive monitor started (polling mode, {len(self._drive_states)} optical drives found)"
         )
-        # Mark the monitor running only once its poll loop is confirmed alive: reporting
-        # "started" for a loop that died on its first line is what hid a dead sentinel for
-        # two days (the guard alone cannot repair that — nothing re-starts the monitor).
-        self._running = bool(self._task)
+        # Report the monitor running — and able to be (re)started — only from facts: the
+        # poll task must exist and not already have died. A loop that crashed on its first
+        # line while start() logged "Drive monitor started" hid a dead sentinel for two days
+        # (nothing re-starts the monitor, so _running True made start() a no-op).
+        self._running = self._task is not None and not self._task.done()
+        if self._running:
+            logger.info(
+                f"Drive monitor running (polling mode, {len(self._drive_states)} optical drives found)"
+            )
+        else:
+            logger.error("Drive monitor could not start its poll loop")
 
     def stop(self) -> None:
         """Stop the drive monitor."""
