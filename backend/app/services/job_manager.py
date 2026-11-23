@@ -4376,6 +4376,30 @@ class JobManager:
                 if sent_to_review:
                     return
 
+            # always_review gate for movies: mirror the TV gate in
+            # finalize_after_matching (finalization_coordinator.py ~line 1240).
+            # Hold every disc for confirmation before anything moves. The
+            # resolution above has already pre-filled is_selected / is_extra
+            # on every title, so the review UI opens with the machine's best
+            # guess and the user confirms or corrects.
+            # getattr: some callers' tests stub get_config with a partial
+            # namespace; a missing field means the default (off).
+            from app.services.config_service import get_config
+
+            if getattr(await get_config(), "always_review", False):
+                logger.info(
+                    f"Job {safe_job}: always_review enabled — holding movie for confirmation"
+                )
+                job.state = JobState.REVIEW_NEEDED
+                job.review_reason = (
+                    "Manual review is on for every disc — confirm the assignments "
+                    "below, then organize."
+                )
+                job.updated_at = datetime.now(UTC)
+                await session.commit()
+                await ws_manager.broadcast_job_update(job_id, JobState.REVIEW_NEEDED.value)
+                return
+
             # Single title flow (Standard Movie). Commit ORGANIZING and
             # release the session before the blocking organize so no DB
             # connection is held across it (mirrors the rip itself).

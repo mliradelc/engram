@@ -9,7 +9,7 @@ the ones the reviewer kept while deleting the ones they discarded.
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -252,3 +252,168 @@ class TestAskReview:
         assert kept.organized_to == str(kept_dest)
         assert discarded.state == TitleState.FAILED
         assert (await _job(job_id)).state == JobState.COMPLETED
+
+
+class TestAlwaysReviewMovieGate:
+    """SPEC-046: ``always_review`` holds a movie disc in REVIEW_NEEDED before the
+    auto-organize, the same way the TV gate in ``finalize_after_matching`` does.
+    Without it a disc misidentified as a movie auto-completed, the terminal cleanup
+    deleted its staging folder, and no review endpoint could correct it."""
+
+    GATE_REASON = "Manual review is on for every disc"
+
+    @pytest.fixture
+    def broadcasts(self, monkeypatch):
+        from app.api.websocket import manager as ws_manager
+
+        m = AsyncMock()
+        monkeypatch.setattr(ws_manager, "broadcast_job_update", m)
+        return m
+
+    async def _finalize(self, jm, job_id, tmp_path):
+        jm.job_manager._matching.get_discdb_mappings = lambda _job_id: []
+        await jm.job_manager._finalize_ripped_movie(
+            job_id, tmp_path, "HAIRSPRAY_DISC1", "Hairspray"
+        )
+
+    async def test_single_title_parks_in_review(
+        self,
+        tmp_path,
+        monkeypatch,
+        policy,
+        broadcasts,
+        job_manager_module,  # noqa: F811
+    ):
+        policy.always_review = True
+        organize = _organize_ok(monkeypatch, tmp_path / "lib" / "Hairspray (2007).mkv")
+        job_id, _ = await _seed(
+            tmp_path,
+            state=JobState.RIPPING,
+            specs=[(0, 117, TitleState.MATCHED, False, True)],
+        )
+
+        await self._finalize(job_manager_module, job_id, tmp_path)
+
+        organize.assert_not_called()
+        job = await _job(job_id)
+        assert job.state == JobState.REVIEW_NEEDED
+        assert "Manual review" in job.review_reason
+        broadcasts.assert_any_await(job_id, JobState.REVIEW_NEEDED.value)
+
+    async def test_off_auto_completes_as_before(
+        self,
+        tmp_path,
+        monkeypatch,
+        policy,
+        broadcasts,
+        job_manager_module,  # noqa: F811
+    ):
+        policy.always_review = False
+        organize = _organize_ok(monkeypatch, tmp_path / "lib" / "Hairspray (2007).mkv")
+        job_id, _ = await _seed(
+            tmp_path,
+            state=JobState.RIPPING,
+            specs=[(0, 117, TitleState.MATCHED, False, True)],
+        )
+
+        await self._finalize(job_manager_module, job_id, tmp_path)
+
+        organize.assert_called_once()
+        assert (await _job(job_id)).state == JobState.COMPLETED
+
+    async def test_multi_title_fall_through_parks_in_review(
+        self,
+        tmp_path,
+        monkeypatch,
+        policy,
+        broadcasts,
+        job_manager_module,  # noqa: F811
+    ):
+        policy.always_review = True
+        organize = _organize_ok(monkeypatch, tmp_path / "lib" / "Hairspray (2007).mkv")
+        resolve = AsyncMock(return_value=False)
+        monkeypatch.setattr(job_manager_module.job_manager, "_resolve_multi_title_movie", resolve)
+        job_id, _ = await _seed(
+            tmp_path,
+            state=JobState.RIPPING,
+            specs=[
+                (0, 117, TitleState.MATCHED, False, True),
+                (1, 15, TitleState.MATCHED, False, True),
+            ],
+        )
+
+        await self._finalize(job_manager_module, job_id, tmp_path)
+
+        resolve.assert_awaited_once()
+        organize.assert_not_called()
+        job = await _job(job_id)
+        assert job.state == JobState.REVIEW_NEEDED
+        assert self.GATE_REASON in job.review_reason
+
+    async def test_multi_title_already_parked_is_not_double_parked(
+        self,
+        tmp_path,
+        monkeypatch,
+        policy,
+        broadcasts,
+        job_manager_module,  # noqa: F811
+    ):
+        policy.always_review = True
+        organize = _organize_ok(monkeypatch, tmp_path / "lib" / "Hairspray (2007).mkv")
+        resolver_reason = "Pick the version to keep."
+
+        async def resolve(job, job_id, ripped_titles, session):
+            job.state = JobState.REVIEW_NEEDED
+            job.review_reason = resolver_reason
+            session.add(job)
+            await session.commit()
+            return True
+
+        monkeypatch.setattr(job_manager_module.job_manager, "_resolve_multi_title_movie", resolve)
+        job_id, _ = await _seed(
+            tmp_path,
+            state=JobState.RIPPING,
+            specs=[
+                (0, 117, TitleState.MATCHED, False, True),
+                (1, 118, TitleState.MATCHED, False, True),
+            ],
+        )
+
+        await self._finalize(job_manager_module, job_id, tmp_path)
+
+        organize.assert_not_called()
+        job = await _job(job_id)
+        assert job.state == JobState.REVIEW_NEEDED
+        assert job.review_reason == resolver_reason
+        broadcasts.assert_not_awaited()
+
+    async def test_confirming_the_parked_movie_organizes_and_completes(
+        self,
+        tmp_path,
+        monkeypatch,
+        policy,
+        broadcasts,
+        job_manager_module,  # noqa: F811
+    ):
+        policy.always_review = True
+        main = tmp_path / "lib" / "Hairspray (2007).mkv"
+        organize = _organize_ok(monkeypatch, main)
+        job_id, (feature_id,) = await _seed(
+            tmp_path,
+            state=JobState.RIPPING,
+            specs=[(0, 117, TitleState.MATCHED, False, True)],
+        )
+
+        await self._finalize(job_manager_module, job_id, tmp_path)
+        assert (await _job(job_id)).state == JobState.REVIEW_NEEDED
+        # Parking is not terminal: no cleanup ran, the rip is still in staging.
+        (feature,) = await _titles([feature_id])
+        assert Path(feature.output_filename).exists()
+        organize.assert_not_called()
+
+        await _make_coord().apply_review(job_id, feature_id)
+
+        organize.assert_called_once()
+        assert (await _job(job_id)).state == JobState.COMPLETED
+        (feature,) = await _titles([feature_id])
+        assert feature.organized_to == str(main)
