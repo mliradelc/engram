@@ -244,12 +244,13 @@ review but CAN re-complete it.
 
 Fold corrections into the implementation and list each one in the final report.
 
-## Status (orchestrator, 2026-11-24 05:2x)
+## Status (orchestrator, 2026-11-24 06:0x)
 
-Round 1 (commit `8295fe0`) implemented: D1 in both sweeps, D2 in sweep A, the
-`review_reason` clear in `_complete_tv_job`, and 3 new tests in
-`test_organize_failure_reporting.py` (suite: 5698 passed). The implementer
-correctly flagged the then-open gap: **sweep B lacked its D2 job re-read** — a
-suspended sweep B can still re-complete a job a concurrent save completed.
-This spec revision (D2 for sweep B + Test 5) closes it. Round 2 implements ONLY
-the delta: the sweep B guard + Test 5, then full suite + ruff again.
+Round 1 (commit `8295fe0`): D1 in both sweeps, D2 in sweep A, the
+`review_reason` clear in `_complete_tv_job`, and tests 1-4 in
+`test_organize_failure_reporting.py` (suite: 5698 passed). Round 2 (commit
+`b393c7d`): D2 guard for sweep B + Test 5 — the test fails without the guard
+(job completed twice) and passes with it (suite: 5699 passed; test file
+re-run by the orchestrator: 26 passed). Both rounds verified against the tree,
+pushed, tagged `v0.45.2-fork.7`, CI green, image pulled onto CT111 (2.65 GB).
+Deploy is gated only on the encode queue draining (idle watcher armed).
