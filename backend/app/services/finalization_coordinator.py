@@ -2760,6 +2760,20 @@ class FinalizationCoordinator:
             )
             unresolved = unresolved_result.scalars().all()
 
+            # Same guard as _finalize_tv_if_resolved: this sweep may have
+            # resumed hours later after a concurrent save finished the job.
+            await session.refresh(job)
+            if job.state == JobState.COMPLETED:
+                logger.info(
+                    f"Job {job_id}: process_matched_titles finished after the "
+                    f"job was already completed — skipping completion"
+                )
+                return {
+                    "organized": success_count,
+                    "conflicts": conflict_count,
+                    "unresolved": len(unresolved),
+                }
+
             # A title whose move failed still has a matched_episode, so the
             # "unresolved" query above cannot see it. Without failure_count the
             # job would complete while its files sat in staging (#563).

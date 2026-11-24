@@ -20,6 +20,7 @@ import asyncio
 import importlib
 import json
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock
 
@@ -739,4 +740,47 @@ class TestSuspendedSweepStateGuard:
         assert blocking_encode.calls == [str(tmp_path / "lib" / "show_t00.mkv")]
         assert result["organized"] == 1
         _, titles = await _load(job_id)
+        assert titles[1].organized_to == str(tmp_path / "lib" / "elsewhere.mkv")
+
+    async def test_process_matched_titles_does_not_recomplete_job_completed_during_encode(
+        self, tmp_path, organize_spy, blocking_encode, monkeypatch
+    ):
+        """D2 (sweep B): the concurrent save also completed the JOB while the
+        sweep was parked in the encode. The resumed sweep must not complete it a
+        second time (completed_at rewritten, completion side effects re-fired)."""
+        a = tmp_path / "show_t00.mkv"
+        b = tmp_path / "show_t01.mkv"
+        a.write_text("")
+        b.write_text("")
+        job_id = await _seed(
+            [
+                (0, "S01E01", str(a), TitleState.MATCHED),
+                (1, "S01E02", str(b), TitleState.MATCHED),
+            ],
+            staging=str(tmp_path),
+        )
+        _, titles = await _load(job_id)
+        coord = _make_coord()
+        spy = AsyncMock(wraps=coord._state_machine.transition_to_completed)
+        monkeypatch.setattr(coord._state_machine, "transition_to_completed", spy)
+
+        sweep = asyncio.create_task(coord.process_matched_titles(job_id))
+        await blocking_encode.wait_entered()
+        await _concurrent_save(
+            titles[1].id, str(tmp_path / "lib" / "elsewhere.mkv"), job_id=job_id, remove=b
+        )
+        async with _unit_session_factory() as session:
+            job = await session.get(DiscJob, job_id)
+            job.completed_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+            session.add(job)
+            await session.commit()
+        blocking_encode.release.set()
+        result = await asyncio.wait_for(sweep, timeout=10)
+
+        assert spy.await_count == 0, "a concurrently completed job was completed again"
+        job, titles = await _load(job_id)
+        assert job.state == JobState.COMPLETED
+        assert job.completed_at == datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        assert result == {"organized": 1, "conflicts": 0, "unresolved": 0}
+        assert organize_spy == ["show_t00.mkv"]
         assert titles[1].organized_to == str(tmp_path / "lib" / "elsewhere.mkv")
