@@ -83,10 +83,11 @@ next to a CIFS move. Place it so it runs on EVERY iteration (i.e. before the
 `if disc_title.output_filename` line), because the await happens mid-iteration
 and the NEXT iteration's object is the one that can be stale.
 
-### Fix D2: re-read the job before the terminal decision
+### Fix D2: re-read the job before the terminal decision — in BOTH sweeps
 
-Immediately before the `failure_total = len(...)` decision block (line ~2459),
-re-read the job and bail if it is no longer ORGANIZING:
+**Sweep A** (`_finalize_tv_if_resolved`): immediately before the
+`failure_total = len(...)` decision block (line ~2459), re-read the job and bail
+if it is no longer ORGANIZING:
 
 ```python
         # The encode await above can suspend this sweep for hours. If another
@@ -104,9 +105,39 @@ re-read the job and bail if it is no longer ORGANIZING:
             return
 ```
 
-This guard makes the zombie-request scenario a harmless no-op: the suspended
-sweep finishes its (now correct, refreshed) loop, then refuses to touch a job
-that is already COMPLETED/FAILED.
+**Sweep B** (`process_matched_titles`): the SAME guard, immediately before its
+terminal decision (line ~2766, `if not unresolved and conflict_count == 0 and
+failure_count == 0:` — verified: sweep B's `job` is loaded ONCE via
+`session.get` at the top of the function and is the same object later passed to
+`_complete_tv_job`, and `transition_to_completed` validates against the
+in-memory `job.state` with `expire_on_commit=False` — so without the re-read, a
+suspended sweep B re-completes a job a concurrent save already completed:
+`completed_at`/`final_path` rewritten, completion callbacks and broadcasts fire
+a second time). Verified consequence is benign-ish but wrong: no demotion (COMPLETED
+is final), but duplicated side effects.
+
+```python
+            # Same guard as _finalize_tv_if_resolved: this sweep may have
+            # resumed hours later after a concurrent save finished the job.
+            await session.refresh(job)
+            if job.state == JobState.COMPLETED:
+                logger.info(
+                    f"Job {job_id}: process_matched_titles finished after the "
+                    f"job was already completed — skipping completion"
+                )
+                return {
+                    "organized": success_count,
+                    "conflicts": conflict_count,
+                    "unresolved": len(unresolved),
+                }
+```
+
+Note the asymmetry is deliberate: sweep A's job must be ORGANIZING (it owns the
+whole terminal decision incl. demote-to-review); sweep B's only terminal move
+is completion, so bail on COMPLETED specifically and let the counters decide
+the rest exactly as before.
+
+This guard makes the zombie-request scenario a harmless no-op in both paths.
 
 ### Cosmetic: clear stale review_reason when a job completes
 
@@ -163,6 +194,14 @@ same way; state which file you picked and why). Required tests:
 - Assert: the concurrently-completed title is not re-organized and no encode is
   re-queued for it.
 
+### Test 5 — sweep B does not re-complete a concurrently-completed job
+- Same setup as Test 4, but during the encode await the concurrent save also
+  completes the JOB (state=COMPLETED, completed_at set).
+- Release the event.
+- Assert: `transition_to_completed` is NOT called a second time (completion
+  callbacks / `completed_at` unchanged), the returned `organized` count reflects
+  only titles this call actually filed.
+
 ## Constraints
 
 - **Do not make the encode await fire-and-forget.** The await-after-commit ordering
@@ -204,3 +243,13 @@ lines still match): two sweeps, both await `encode_hook.after_organize` mid-loop
 review but CAN re-complete it.
 
 Fold corrections into the implementation and list each one in the final report.
+
+## Status (orchestrator, 2026-11-24 05:2x)
+
+Round 1 (commit `8295fe0`) implemented: D1 in both sweeps, D2 in sweep A, the
+`review_reason` clear in `_complete_tv_job`, and 3 new tests in
+`test_organize_failure_reporting.py` (suite: 5698 passed). The implementer
+correctly flagged the then-open gap: **sweep B lacked its D2 job re-read** — a
+suspended sweep B can still re-complete a job a concurrent save completed.
+This spec revision (D2 for sweep B + Test 5) closes it. Round 2 implements ONLY
+the delta: the sweep B guard + Test 5, then full suite + ruff again.
