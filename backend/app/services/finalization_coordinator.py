@@ -973,6 +973,9 @@ class FinalizationCoordinator:
 
         job.progress_percent = 100.0
         job.error_message = None
+        # A completed job must not keep displaying a stale failure reason
+        # (e.g. "N title(s) failed to organize") from an earlier review park.
+        job.review_reason = None
         db_config = await get_db_config()
         _lib_path = _library_path_for_job(job, "tv")
         job.final_path = str(
@@ -2324,6 +2327,11 @@ class FinalizationCoordinator:
 
         extra_index = 1
         for disc_title in resolved_titles:
+            # The encode await below can suspend this sweep for hours; a
+            # concurrent save may have completed this title since the list was
+            # loaded. Re-read it so the skip-check sees current state, not the
+            # pre-encode snapshot (SPEC-047).
+            await session.refresh(disc_title)
             if disc_title.output_filename and disc_title.matched_episode != "skip":
                 # Skip already-organized titles
                 if disc_title.state == TitleState.COMPLETED and disc_title.organized_to:
@@ -2455,6 +2463,22 @@ class FinalizationCoordinator:
                 else:
                     missing_files.append(source_file.name)
                     logger.warning(f"Source file not found: {source_file}")
+
+        # The encode await above can suspend this sweep for hours. If another
+        # path (a concurrent review save) already moved the job to a terminal
+        # state in that window, this sweep is stale: its counters describe a
+        # world that no longer exists. Do not demote or re-complete the job;
+        # the other path owns its state now. (The state machine validates
+        # against the in-memory job.state, so without this re-read a stale
+        # ORGANIZING snapshot would pass validation and overwrite COMPLETED.)
+        await session.refresh(job)
+        if job.state != JobState.ORGANIZING:
+            logger.info(
+                f"Job {job_id}: sweep finished after job reached "
+                f"{job.state.value} (concurrent save during encode await) — "
+                f"skipping terminal decision"
+            )
+            return
 
         failure_total = len(organize_errors) + len(missing_files)
         if conflict_count > 0:
@@ -2591,6 +2615,13 @@ class FinalizationCoordinator:
             extra_index = 1
 
             for disc_title in matched_titles:
+                # The encode await below can suspend this sweep for hours, and the
+                # query above filtered COMPLETED titles only at load time. Re-read
+                # the title and skip it if a concurrent save organized it since
+                # (SPEC-047), so it is neither re-organized nor re-encoded.
+                await session.refresh(disc_title)
+                if disc_title.state == TitleState.COMPLETED and disc_title.organized_to:
+                    continue
                 if not disc_title.output_filename:
                     continue
 

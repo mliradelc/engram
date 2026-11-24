@@ -16,8 +16,11 @@ These tests pin both, plus the library-writability preflight that turns a
 mid-sweep surprise into an upfront, actionable error.
 """
 
+import asyncio
 import importlib
 import json
+import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
@@ -544,3 +547,196 @@ class TestReviewSaveIsJobTagged:
         await jm.job_manager.apply_review(42, 1, episode_code="S01E01")
 
         assert seen == [42]
+
+
+# ---------------------------------------------------------------------------
+# SPEC-047: a sweep suspended across the encode await must not clobber state a
+# concurrent save wrote in the meantime.
+# ---------------------------------------------------------------------------
+
+
+class _BlockingEncode:
+    """Stand-in for ``encode_hook.after_organize`` that blocks until released.
+
+    The sweep calls the hook through ``asyncio.to_thread``, so it runs in a
+    worker thread: threading events, not asyncio ones, gate it.
+    """
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[str] = []
+
+    def __call__(self, final_path, *, context=None, loop=None):
+        self.calls.append(str(final_path))
+        self.entered.set()
+        assert self.release.wait(timeout=10), "test never released the encode"
+
+    async def wait_entered(self):
+        for _ in range(500):
+            if self.entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("sweep never reached the encode await")
+
+
+@pytest.fixture
+def organize_spy(monkeypatch, tmp_path):
+    """Every TV organize entry point succeeds and records the source it moved."""
+    moved: list[str] = []
+
+    def _ok(source_file, *a, **k):
+        moved.append(Path(source_file).name)
+        return {
+            "success": True,
+            "final_path": str(tmp_path / "lib" / Path(source_file).name),
+            "error": None,
+        }
+
+    monkeypatch.setattr(organizer_module.tv_organizer, "organize", Mock(side_effect=_ok))
+    monkeypatch.setattr(organizer_module, "organize_tv_episode", Mock(side_effect=_ok))
+    monkeypatch.setattr(organizer_module, "organize_tv_extras", Mock(side_effect=_ok))
+    return moved
+
+
+@pytest.fixture
+def blocking_encode(monkeypatch):
+    enc = _BlockingEncode()
+    monkeypatch.setattr(finalization_module.encode_hook, "after_organize", enc)
+    yield enc
+    enc.release.set()  # never leave a worker thread parked on failure
+
+
+async def _concurrent_save(title_id, organized_to, *, job_id=None, remove=None):
+    """What the other request did while the sweep was parked in the encode."""
+    if remove is not None:
+        remove.unlink()
+    async with _unit_session_factory() as session:
+        t = await session.get(DiscTitle, title_id)
+        t.state = TitleState.COMPLETED
+        t.organized_to = organized_to
+        session.add(t)
+        if job_id is not None:
+            job = await session.get(DiscJob, job_id)
+            job.state = JobState.COMPLETED
+            job.review_reason = None
+            session.add(job)
+        await session.commit()
+
+
+async def _seed_two_title_review(tmp_path):
+    a = tmp_path / "show_t00.mkv"
+    b = tmp_path / "show_t01.mkv"
+    a.write_text("")
+    b.write_text("")
+    job_id = await _seed(
+        [(0, None, str(a), TitleState.REVIEW), (1, None, str(b), TitleState.REVIEW)],
+        staging=str(tmp_path),
+        state=JobState.REVIEW_NEEDED,
+    )
+    async with _unit_session_factory() as session:
+        job = await session.get(DiscJob, job_id)
+        job.review_reason = "2 titles need episode assignment"
+        session.add(job)
+        await session.commit()
+    _, titles = await _load(job_id)
+    return job_id, titles, a, b
+
+
+@pytest.mark.unit
+class TestSuspendedSweepStateGuard:
+    async def test_title_completed_during_encode_is_not_reorganized(
+        self, tmp_path, organize_spy, blocking_encode
+    ):
+        """D1 (sweep A): the title B snapshot loaded before the encode must be
+        re-read, so a concurrent save's COMPLETED + organized_to is honoured."""
+        job_id, titles, _a, _b = await _seed_two_title_review(tmp_path)
+        coord = _make_coord()
+
+        sweep = asyncio.create_task(
+            coord.apply_review_batch(
+                job_id,
+                [
+                    {"title_id": titles[0].id, "episode_code": "S01E01"},
+                    {"title_id": titles[1].id, "episode_code": "S01E02"},
+                ],
+            )
+        )
+        await blocking_encode.wait_entered()
+        await _concurrent_save(titles[1].id, str(tmp_path / "lib" / "elsewhere.mkv"))
+        blocking_encode.release.set()
+        await asyncio.wait_for(sweep, timeout=10)
+
+        assert organize_spy == ["show_t00.mkv"]  # title B never re-organized
+        assert len(blocking_encode.calls) == 1
+        job, titles = await _load(job_id)
+        assert job.state == JobState.COMPLETED
+        assert job.review_reason is None
+        assert titles[1].organized_to == str(tmp_path / "lib" / "elsewhere.mkv")
+
+    async def test_job_completed_during_encode_is_not_demoted(
+        self, tmp_path, organize_spy, blocking_encode, monkeypatch
+    ):
+        """D2 (sweep A), the job-13 incident: the concurrent save moved B's file
+        and completed the whole job. The resumed sweep must not touch the job."""
+        job_id, titles, _a, b = await _seed_two_title_review(tmp_path)
+        coord = _make_coord()
+        sm = coord._state_machine
+        spies = {}
+        for name in ("transition_to_review", "transition_to_completed", "transition_to_failed"):
+            spies[name] = AsyncMock(wraps=getattr(sm, name))
+            monkeypatch.setattr(sm, name, spies[name])
+
+        sweep = asyncio.create_task(
+            coord.apply_review_batch(
+                job_id,
+                [
+                    {"title_id": titles[0].id, "episode_code": "S01E01"},
+                    {"title_id": titles[1].id, "episode_code": "S01E02"},
+                ],
+            )
+        )
+        await blocking_encode.wait_entered()
+        await _concurrent_save(
+            titles[1].id, str(tmp_path / "lib" / "elsewhere.mkv"), job_id=job_id, remove=b
+        )
+        blocking_encode.release.set()
+        await asyncio.wait_for(sweep, timeout=10)
+
+        job, _ = await _load(job_id)
+        assert job.state == JobState.COMPLETED
+        assert job.review_reason is None
+        for name, spy in spies.items():
+            assert spy.await_count == 0, f"{name} was called on a concurrently completed job"
+        assert organize_spy == ["show_t00.mkv"]
+
+    async def test_process_matched_titles_skips_title_completed_during_encode(
+        self, tmp_path, organize_spy, blocking_encode
+    ):
+        """D1 (sweep B): process_matched_titles filters COMPLETED only at load
+        time; a title completed during the encode await is neither re-organized
+        nor re-encoded."""
+        a = tmp_path / "show_t00.mkv"
+        b = tmp_path / "show_t01.mkv"
+        a.write_text("")
+        b.write_text("")
+        job_id = await _seed(
+            [
+                (0, "S01E01", str(a), TitleState.MATCHED),
+                (1, "S01E02", str(b), TitleState.MATCHED),
+            ],
+            staging=str(tmp_path),
+        )
+        _, titles = await _load(job_id)
+
+        sweep = asyncio.create_task(_make_coord().process_matched_titles(job_id))
+        await blocking_encode.wait_entered()
+        await _concurrent_save(titles[1].id, str(tmp_path / "lib" / "elsewhere.mkv"))
+        blocking_encode.release.set()
+        result = await asyncio.wait_for(sweep, timeout=10)
+
+        assert organize_spy == ["show_t00.mkv"]
+        assert blocking_encode.calls == [str(tmp_path / "lib" / "show_t00.mkv")]
+        assert result["organized"] == 1
+        _, titles = await _load(job_id)
+        assert titles[1].organized_to == str(tmp_path / "lib" / "elsewhere.mkv")
