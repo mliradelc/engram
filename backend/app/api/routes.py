@@ -1765,7 +1765,20 @@ async def submit_review(
     review: ReviewRequest,
     job: DiscJob = Depends(get_job_or_404),
 ) -> dict:
-    """Submit a review decision for a title."""
+    """Submit a review decision for a title.
+
+    The organize runs inside this request, so it blocks for the whole file move.
+    Moving a Blu-ray from local staging onto a network library share is a
+    cross-device copy that can take tens of minutes, and a reverse proxy in front
+    of Engram may answer 504 Gateway Time-out before it ends. **A 504 from a
+    proxying gateway here does not mean the save failed**: the move carries on
+    server-side, ``move_media_file`` checks the destination's byte length against
+    the source's before it deletes the staging file (a mismatch removes the
+    partial copy and fails the title instead), and progress is broadcast as
+    ``move_progress`` messages, ending with ``done: true`` once verified. Check
+    the job's state, not this response. See docs/troubleshooting.md ("Saving a review
+    shows 504 Gateway Time-out") and docs/architecture/websocket.md (``move_progress``).
+    """
     if job.state != JobState.REVIEW_NEEDED:
         raise HTTPException(status_code=400, detail="Job is not awaiting review")
 

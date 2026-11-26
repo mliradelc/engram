@@ -345,6 +345,52 @@ class ConnectionManager:
             }
         )
 
+    async def broadcast_move_progress(
+        self,
+        job_id: int,
+        *,
+        title_index: int | None,
+        source_name: str,
+        current_bytes: int,
+        total_bytes: int,
+        speed: str | None = None,
+        eta: int | None = None,
+        done: bool = False,
+    ) -> None:
+        """Broadcast byte progress of a verified cross-device organize move.
+
+        A distinct message type rather than job_update progress: the organize
+        phase already drives the job's progress_percent as a count of titles,
+        and a 40 GB move onto a NAS share is one title for its whole ~25 min.
+
+        Flat, like every other message this class emits: the frontend reads
+        fields straight off the message and does no unwrapping, so a nested
+        "data" envelope silently produced an undefined job id and a progress
+        bar that never moved (see broadcast_backup_progress).
+
+        Every key is always present. ``speed`` and ``eta`` are timed by the
+        backend between samples, so unlike backup_progress they are real; they
+        are None only on a title's first sample, where there is no interval yet,
+        and the client coalesces a None against what it is already showing.
+        ``done`` is True exactly once per title, after the destination's byte
+        length has been checked against the source's, and always carries
+        ``current_bytes == total_bytes``. Sent from the organizer's worker thread
+        via ``run_coroutine_threadsafe``, throttled to one per 2 s per title.
+        """
+        await self.broadcast(
+            {
+                "type": "move_progress",
+                "job_id": job_id,
+                "title_index": title_index,
+                "source_name": source_name,
+                "current_bytes": current_bytes,
+                "total_bytes": total_bytes,
+                "speed": speed,
+                "eta": eta,
+                "done": done,
+            }
+        )
+
     async def broadcast_encode_progress(
         self,
         *,

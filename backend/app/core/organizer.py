@@ -17,11 +17,26 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from app.core.media_formats import IMPORTABLE_VIDEO_EXTENSIONS, library_suffix, list_video_files
 
 logger = logging.getLogger(__name__)
+
+# ``progress_callback(bytes_done, total_bytes)``: called from whatever thread runs
+# the move (the organizers run under ``asyncio.to_thread``), so an implementation
+# that touches the event loop must hand off with ``run_coroutine_threadsafe``.
+MoveProgressCallback = Callable[[int, int], None]
+
+# Cross-device copies go in fixed 8 MiB chunks so progress can be reported.
+COPY_CHUNK_BYTES = 8 * 1024 * 1024
+# A progress sample is sent only once BOTH this much time has passed and the
+# copy has advanced another 1% (whichever gate is less frequent wins).
+PROGRESS_MIN_INTERVAL_S = 2.0
+PROGRESS_MIN_FRACTION = 0.01
+# Indirection so tests can drive the throttle with a fake clock.
+_monotonic = time.monotonic
 
 # Allowed placeholders for naming format strings
 ALLOWED_TV_PLACEHOLDERS = {
@@ -463,7 +478,119 @@ def resolve_conflict(dest_file: Path, conflict_resolution: str) -> tuple[Path | 
     }
 
 
-def move_media_file(src: Path, dest: Path, *, attempts: int = 3, delay: float = 0.5) -> None:
+class _ProgressThrottle:
+    """Rate-limits ``MoveProgressCallback`` samples for one file copy.
+
+    Sends ``(0, total)`` before the first byte, then a sample only when the copy
+    has advanced by at least 1% AND 2 s have passed since the last one (so a fast
+    local copy and a slow NAS copy are both bounded: ~100 samples at most, and
+    never more than one per 2 s). The ``(total, total)`` sample is NOT sent from
+    the copy loop: ``finish`` sends it once the destination has been verified.
+    A callback that raises is logged and dropped; reporting must never fail a move.
+    """
+
+    def __init__(self, callback: MoveProgressCallback | None, total: int) -> None:
+        self._callback = callback
+        self._total = total
+        self._step = max(1, int(total * PROGRESS_MIN_FRACTION))
+        self._last_bytes = 0
+        self._last_time = 0.0
+
+    def _emit(self, done: int) -> None:
+        if self._callback is None:
+            return
+        try:
+            self._callback(done, self._total)
+        except Exception:
+            logger.warning("Move progress callback failed; disabling it", exc_info=True)
+            self._callback = None
+
+    def start(self) -> None:
+        self._last_time = _monotonic()
+        self._emit(0)
+
+    def update(self, done: int) -> None:
+        if self._callback is None or done >= self._total:
+            return
+        if done - self._last_bytes < self._step:
+            return
+        now = _monotonic()
+        if now - self._last_time < PROGRESS_MIN_INTERVAL_S:
+            return
+        self._last_bytes = done
+        self._last_time = now
+        self._emit(done)
+
+    def finish(self) -> None:
+        self._emit(self._total)
+
+
+class _CountingWriter:
+    """File-like wrapper that reports cumulative bytes written to ``on_write``."""
+
+    def __init__(self, fdst, on_write: Callable[[int], None]) -> None:
+        self._fdst = fdst
+        self._on_write = on_write
+        self.written = 0
+
+    def write(self, buf) -> int:
+        n = self._fdst.write(buf)
+        # Raw/unbuffered writers may report a short write; buffered ones return
+        # len(buf) or raise. Count what the writer says it took.
+        self.written += len(buf) if n is None else n
+        self._on_write(self.written)
+        return n
+
+
+def _sync_to_storage(fdst) -> None:
+    """Flush ``fdst`` to the storage so a size check reflects what was written.
+
+    On a network share a size read before the client cache is flushed can report
+    the bytes as present before the server has them. Filesystems that do not
+    implement fsync (EINVAL/ENOTSUP) are tolerated; a real write error is not.
+    """
+    fdst.flush()
+    try:
+        os.fsync(fdst.fileno())
+    except OSError as e:
+        if e.errno not in (errno.EINVAL, errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", -1)):
+            raise
+
+
+def _copy_verified(src: Path, dest: Path, progress_callback: MoveProgressCallback | None) -> None:
+    """Copy ``src`` to ``dest`` in 8 MiB chunks, then prove ``dest`` is whole.
+
+    Equivalent to ``shutil.copy2`` (data via ``copyfileobj``, then ``copystat``)
+    plus progress samples and a byte-length check. Raises ``OSError`` naming both
+    sizes when ``dest`` does not hold exactly as many bytes as ``src``; the caller
+    removes the partial destination.
+    """
+    total = os.stat(src).st_size
+    throttle = _ProgressThrottle(progress_callback, total)
+    throttle.start()
+    with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
+        shutil.copyfileobj(fsrc, _CountingWriter(fdst, throttle.update), COPY_CHUNK_BYTES)
+        _sync_to_storage(fdst)
+    shutil.copystat(src, dest)
+
+    written = os.stat(dest).st_size
+    if written != total:
+        raise OSError(
+            errno.EIO,
+            f"Verification failed copying {src} to {dest}: the destination holds "
+            f"{written} bytes but the source holds {total} bytes",
+        )
+    throttle.finish()
+
+
+def move_media_file(
+    src: Path,
+    dest: Path,
+    *,
+    attempts: int = 3,
+    delay: float = 0.5,
+    progress_callback: MoveProgressCallback | None = None,
+) -> None:
     """Move ``src`` onto ``dest``, leaving nothing behind when it fails.
 
     ``shutil.move`` catches a bare ``OSError`` around ``os.rename`` and then
@@ -479,7 +606,17 @@ def move_media_file(src: Path, dest: Path, *, attempts: int = 3, delay: float = 
     back. A failed organize must leave the filesystem unchanged so that a
     retry is clean.
 
-    Raises OSError when the move could not be completed.
+    The copy fallback (a cross-device move, e.g. local staging onto a NAS share)
+    runs in 8 MiB chunks and reports ``progress_callback(bytes_done, total_bytes)``:
+    ``(0, total)`` before the first byte, throttled samples while copying, and
+    ``(total, total)`` exactly once, only after the destination's byte length has
+    been checked against the source's. The source is unlinked only after that
+    check passes. A same-device rename is atomic and fires no callback.
+    With ``progress_callback=None`` nothing is reported, but the copy is still
+    chunked and verified.
+
+    Raises OSError when the move could not be completed, including when the
+    destination's size does not match the source's (the partial copy is removed).
     """
     last: OSError | None = None
     for attempt in range(1, attempts + 1):
@@ -503,12 +640,12 @@ def move_media_file(src: Path, dest: Path, *, attempts: int = 3, delay: float = 
                 time.sleep(delay)
 
     # Rename is not going to work (cross-device, or the handle outlived our
-    # budget). Copy, then delete. Both halves clean up after themselves.
+    # budget). Copy, verify, then delete. Both halves clean up after themselves.
     try:
-        shutil.copy2(str(src), str(dest))
+        _copy_verified(src, dest, progress_callback)
     except OSError:
-        # A partial copy is worse than no copy: it looks like a real library
-        # file to every later run.
+        # A partial (or size-mismatched) copy is worse than no copy: it looks
+        # like a real library file to every later run.
         try:
             os.unlink(dest)
         except FileNotFoundError:
@@ -620,12 +757,59 @@ def _movie_library_root(library_path: Path | None) -> tuple[Path | None, str | N
     return library_path, None
 
 
-def _move_extras(extras: list[Path], extras_dir: Path) -> dict[str, Path]:
+class _CombinedProgress:
+    """Folds several sequential file moves into one ``MoveProgressCallback`` stream.
+
+    An organize call that moves more than one file (a movie plus its extras, or
+    a batch of extras) reports one running byte count across all of them, so a
+    client keyed on the call sees a single bar instead of one that resets per
+    file. ``add`` registers a file's size before it moves (the total can grow
+    when extras are found after the feature has moved); ``for_file`` returns the
+    per-file callback; ``advance`` books the file's bytes once it has moved,
+    whether it was copied or renamed (a rename fires no samples of its own).
+    """
+
+    def __init__(self, callback: MoveProgressCallback) -> None:
+        self._callback = callback
+        self._offset = 0
+        self._total = 0
+
+    def add(self, size: int) -> None:
+        self._total += size
+
+    def for_file(self) -> MoveProgressCallback:
+        base = self._offset
+
+        def report(done: int, _file_total: int) -> None:
+            self._callback(base + done, self._total)
+
+        return report
+
+    def advance(self, size: int) -> None:
+        self._offset += size
+
+
+def _size_or_zero(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _move_extras(
+    extras: list[Path],
+    extras_dir: Path,
+    *,
+    progress_callback: MoveProgressCallback | None = None,
+) -> dict[str, Path]:
     """Move ``extras`` into ``extras_dir`` as ``Extra N``, returning name -> destination.
 
     Numbering continues past extras already in the folder, so a second disc of
     the same movie (or a bonus disc) adds to them instead of overwriting them:
     ``move_media_file`` replaces whatever sits at its destination.
+
+    ``progress_callback`` is forwarded to every ``move_media_file`` call as is;
+    callers moving several files wrap it in ``_CombinedProgress`` first.
     """
     extras_dir.mkdir(parents=True, exist_ok=True)
     mapping: dict[str, Path] = {}
@@ -635,7 +819,7 @@ def _move_extras(extras: list[Path], extras_dir: Path) -> dict[str, Path]:
             i += 1
         extra_dest = extras_dir / f"Extra {i}{library_suffix(extra)}"
         logger.info(f"Moving extra: {extra.name} -> {extra_dest}")
-        move_media_file(extra, extra_dest)
+        move_media_file(extra, extra_dest, progress_callback=progress_callback)
         mapping[extra.name] = extra_dest
         i += 1
     return mapping
@@ -649,8 +833,12 @@ def organize_movie_extras(
     *,
     tmdb_id: str | int | None = None,
     already_clean: bool = False,
+    progress_callback: MoveProgressCallback | None = None,
 ) -> dict:
     """File every one of ``files`` under the movie's ``Extras/``, with no feature.
+
+    ``progress_callback`` receives one running byte count across all ``files``
+    (see ``move_media_file`` for the sample contract).
 
     For a disc that carries only bonus content for a movie (#813): the folder is
     named exactly as ``organize_movie`` names it, so the extras land beside the
@@ -674,9 +862,21 @@ def organize_movie_extras(
     )
     extras_dir = library_path / folder_name / "Extras"
     moved: dict[str, Path] = {}
+    combined: _CombinedProgress | None = None
+    if progress_callback is not None:
+        combined = _CombinedProgress(progress_callback)
+        for f in files:
+            combined.add(_size_or_zero(f))
     try:
         for f in files:
-            moved[str(f)] = _move_extras([f], extras_dir)[f.name]
+            if combined is None:
+                moved[str(f)] = _move_extras([f], extras_dir)[f.name]
+                continue
+            size = _size_or_zero(f)
+            moved[str(f)] = _move_extras([f], extras_dir, progress_callback=combined.for_file())[
+                f.name
+            ]
+            combined.advance(size)
     except Exception as e:
         logger.exception("Error filing movie extras")
         return {"success": False, "extras_dir": extras_dir, "moved": moved, "error": str(e)}
@@ -695,6 +895,7 @@ def organize_movie(
     edition: str | None = None,
     already_clean: bool = False,
     extra_files: list[Path] | None = None,
+    progress_callback: MoveProgressCallback | None = None,
 ) -> dict:
     """Organize a ripped movie into the library.
 
@@ -719,6 +920,10 @@ def organize_movie(
             and may hold MKVs the job never scanned; sweeping those into Extras/
             would move files nobody asked Engram to touch (#676). ``None`` keeps
             the folder scan, which is right for Engram's own staging directory.
+        progress_callback: Optional ``(bytes_done, total_bytes)`` reporter for
+            cross-device moves, one running count across the feature and any
+            extras moved with it. The total grows when extras are found, since
+            they are listed only after the feature has moved.
 
     Returns:
         dict with 'success', 'main_file', 'extras', 'extras_mapping', 'error' keys
@@ -797,9 +1002,19 @@ def organize_movie(
     if early:
         return {**early, "main_file": None, "extras": [], "extras_mapping": {}}
 
+    combined: _CombinedProgress | None = None
+    if progress_callback is not None:
+        combined = _CombinedProgress(progress_callback)
+
     try:
         # Move main movie
-        move_media_file(main_file, dest_file)
+        if combined is None:
+            move_media_file(main_file, dest_file)
+        else:
+            main_size = _size_or_zero(main_file)
+            combined.add(main_size)
+            move_media_file(main_file, dest_file, progress_callback=combined.for_file())
+            combined.advance(main_size)
 
         extras_mapping: dict[str, Path] = {}
 
@@ -810,7 +1025,22 @@ def organize_movie(
             else:
                 extras = [f for f in extra_files if f != main_file and f.exists()]
             if extras:
-                extras_mapping = _move_extras(extras, dest_dir / "Extras")
+                if combined is None:
+                    extras_mapping = _move_extras(extras, dest_dir / "Extras")
+                else:
+                    # One file per call so each gets its own offset in the running
+                    # count. Numbering is unchanged: each call skips the Extra N
+                    # slots the previous calls just filled, exactly as one call does.
+                    sizes = [_size_or_zero(extra) for extra in extras]
+                    for size in sizes:
+                        combined.add(size)
+                    for extra, size in zip(extras, sizes, strict=True):
+                        extras_mapping.update(
+                            _move_extras(
+                                [extra], dest_dir / "Extras", progress_callback=combined.for_file()
+                            )
+                        )
+                        combined.advance(size)
         moved_extras = list(extras_mapping.values())
 
         # Clean up empty staging directory
@@ -870,6 +1100,7 @@ class MovieOrganizer:
         already_clean: bool = False,
         conflict_resolution: str = "ask",
         move_extras: bool = True,
+        progress_callback: MoveProgressCallback | None = None,
     ) -> dict:
         """Organize a movie from staging to library.
 
@@ -885,6 +1116,7 @@ class MovieOrganizer:
             tmdb_id=tmdb_id,
             edition=edition,
             already_clean=already_clean,
+            progress_callback=progress_callback,
         )
 
 
@@ -903,6 +1135,7 @@ def organize_tv_episode(
     ordering: str = "aired",
     episode_group_id: str | None = None,
     episode_namespace: str | None = None,
+    progress_callback: MoveProgressCallback | None = None,
 ) -> dict:
     """Organize a ripped TV episode into the library.
 
@@ -929,6 +1162,8 @@ def organize_tv_episode(
         episode_namespace: The job's episode numbering (``tmdb`` | ``tvdb``). Only read
             when the episode format uses ``{episode_title}``, so the title comes from the
             same catalogue as ``episode_code``. ``None`` keeps the ambient namespace.
+        progress_callback: Optional ``(bytes_done, total_bytes)`` reporter for a
+            cross-device move (see ``move_media_file``).
 
     Returns:
         dict with 'success', 'final_path', 'error' keys
@@ -1042,7 +1277,7 @@ def organize_tv_episode(
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Move the file
-        move_media_file(source_file, dest_file)
+        move_media_file(source_file, dest_file, progress_callback=progress_callback)
 
         logger.info(f"Successfully organized: {dest_file}")
 
@@ -1065,6 +1300,7 @@ def organize_tv_extras(
     year: int | None = None,
     tmdb_id: str | None = None,
     conflict_resolution: str = "ask",
+    progress_callback: MoveProgressCallback | None = None,
 ) -> dict:
     """Organize a ripped TV extra/bonus content into the library Extras folder.
 
@@ -1080,6 +1316,8 @@ def organize_tv_extras(
             Only affects the folder when ``naming_tv_show_format`` includes ``{year}``.
         tmdb_id: Show's TMDB id for show-folder disambiguation. Only affects the folder
             when ``naming_tv_show_format`` includes ``{tmdb_id}``.
+        progress_callback: Optional ``(bytes_done, total_bytes)`` reporter for a
+            cross-device move (see ``move_media_file``).
 
     Returns:
         dict with 'success', 'final_path', 'error' keys
@@ -1138,7 +1376,7 @@ def organize_tv_extras(
 
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
-        move_media_file(source_file, dest_file)
+        move_media_file(source_file, dest_file, progress_callback=progress_callback)
         logger.info(f"Successfully organized extra: {dest_file}")
         return {"success": True, "final_path": dest_file, "error": None}
     except Exception as e:
@@ -1161,6 +1399,7 @@ class TVOrganizer:
         year: int | None = None,
         conflict_resolution: str = "ask",
         episode_namespace: str | None = None,
+        progress_callback: MoveProgressCallback | None = None,
     ) -> dict:
         """Organize a TV episode from staging to library.
 
@@ -1178,6 +1417,7 @@ class TVOrganizer:
             episode_group_id=episode_group_id,
             year=year,
             episode_namespace=episode_namespace,
+            progress_callback=progress_callback,
         )
 
     def organize_batch(

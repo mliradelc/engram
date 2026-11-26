@@ -123,6 +123,26 @@ export function formatEta(seconds?: number): string {
 }
 
 /**
+ * Bytes → decimal gigabytes with one decimal, e.g. `39.5 GB`. GB here is 10^9
+ * bytes (not GiB), matching the backend's `MB/s` speed and what a NAS share or
+ * a Blu-ray box reports, so the two numbers on one readout use the same unit.
+ */
+export function formatGigabytes(bytes: number): string {
+  return `${(Math.max(0, bytes) / 1e9).toFixed(1)} GB`;
+}
+
+/**
+ * Seconds → `15m 12s` / `1h 4m` / `42s`. Precise ETA for a long file move,
+ * where "16 min" hides whether the bar is actually moving.
+ */
+export function formatEtaPrecise(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+/**
  * Seconds → `—` (falsy) / `< 1m` / `Nm`. Compact single-line ETA.
  * (formerly the inline ETA expression in App.tsx CompactList)
  */

@@ -117,6 +117,31 @@ a German disc is matched to its episodes like an English show. The review page s
 - Subtitles in other languages stay on your machine, in their own folder in the subtitle
   cache (for example `.../cache/data/70523@de`), and are never part of the shared cache.
 
+## Saving a review shows 504 Gateway Time-out
+
+If Engram sits behind a reverse proxy (nginx, openresty, Traefik, Caddy, a NAS's built-in
+proxy), saving a review can come back with **504 Gateway Time-out** while a large title is
+being moved into the library. **This does not mean the save failed.**
+
+The save request stays open for the whole move. When staging and the library are on
+different disks (local staging, library on a network share), the move is a full copy, and a
+Blu-ray title of around 40 GB can take tens of minutes over the network. The proxy stops
+waiting before Engram finishes, but Engram keeps going:
+
+- The copy carries on in the background, and the dashboard shows it as a green
+  **VERIFIED MOVE** bar with the gigabytes copied, the speed, and the time left.
+- When the copy ends, Engram checks that the library file has exactly as many bytes as the
+  staging file. Only then does it delete the staging file and show
+  **✓ VERIFIED — N GB transferred**. If the sizes differ, it deletes the incomplete library
+  copy, keeps the staging file, and reports the organize as failed, so nothing is lost and
+  a retry starts clean.
+- The review page shows "Still working — check the progress bar" instead of an error when
+  this happens during a move.
+
+To check the outcome, look at the job on the dashboard or in History rather than at the
+504. To stop seeing the 504, raise the proxy's read timeout for Engram (for nginx/openresty,
+`proxy_read_timeout 3600s;`).
+
 ## Restoring the database after an upgrade
 
 Engram's database (`engram.db`) holds your settings and API keys (MakeMKV key, TMDB token, AI and OpenSubtitles keys) along with your job history. Each time Engram starts on a new version, or finds that the database's layout needs updating, it first saves a copy of the database next to it, named `engram.db.bak-<previous-version>-<timestamp>` (for example `engram.db.bak-0.41.0-20261020T153012.123456Z`). The first upgrade to a version with this feature names the copy `bak-unknown`, because no earlier version was recorded. Only the three newest copies are kept. The startup log says when a copy is made: `Backed up database to ... before migrating`.

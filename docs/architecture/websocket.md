@@ -115,6 +115,29 @@ Sent during subtitle download progress.
 | `total` | `int` | Total number of subtitles to download |
 | `failed_count` | `int` | Number of subtitle downloads that failed |
 
+### `move_progress`
+
+Sent while an organize move copies a file across devices (for example local staging onto a
+network library share). A same-device move is an instant rename and sends nothing. Flat (no
+`data` envelope), and every key is always present. At most one message per title every 2 s.
+The organizer itself samples at most once per 1% of the file and once per 2 s, whichever
+comes less often.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `string` | `"move_progress"` |
+| `job_id` | `int` | Job identifier |
+| `title_index` | `int \| null` | Title being moved |
+| `source_name` | `string` | Staging file name |
+| `current_bytes` | `int` | Bytes copied so far (`0` on the first sample) |
+| `total_bytes` | `int` | Bytes to copy |
+| `speed` | `string \| null` | Measured rate, decimal units (`"42.1 MB/s"`); null on the first sample |
+| `eta` | `int \| null` | Seconds left at the measured rate; null on the first sample |
+| `done` | `bool` | True exactly once per title, after the destination's byte length was checked against the source's; then `current_bytes == total_bytes` |
+
+A failed move sends no `done`: the job's next `job_update` ends it. Progress is in memory only
+and is lost on restart, which is correct because a move is not resumable.
+
 ---
 
 ## Client to Server Messages

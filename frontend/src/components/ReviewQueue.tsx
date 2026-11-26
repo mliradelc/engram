@@ -4,7 +4,10 @@ import { motion } from 'motion/react';
 import { Save, Package, Keyboard } from 'lucide-react';
 import { IcoDisc, IcoPlay, IcoRetry, IcoError } from '../app/components/icons';
 import type { CSSProperties, FocusEvent, ReactNode } from 'react';
-import { Job, DiscTitle, type SeasonAnswer } from '../types';
+import { Job, DiscTitle, type MoveProgress, type SeasonAnswer } from '../types';
+import { applyMoveProgress, recordMoveCompleted } from '../app/hooks/useJobManagement';
+import { MoveProgressPanel } from '../app/components/DiscCard/MoveProgressPanel';
+import { isTransportFailure, moveStillWorking, ReviewHttpError, STILL_WORKING_MESSAGE } from './ReviewQueue/moveGrace';
 import { formatDuration, formatSize, titleDisplayName, buildInitialSelections, parseMatchDetails, effectiveOrdering, orderingSelectorHeading, isHeldMovieExtra, movieExtrasOnlyTitles, movieReviewNotice, movieReviewTitles, type MovieReviewNotice, type TitleAction } from './ReviewQueue/utils';
 import { MovieExtrasOnlyAction } from './ReviewQueue/MovieExtrasOnlyAction';
 import { EPISODE_CONFIG, MATCHING_CONFIG } from '../config/constants';
@@ -194,6 +197,33 @@ function ReviewQueue() {
     const [isProcessing, setIsProcessing] = useState(false);
     const [isRematching, setIsRematching] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    // A save whose request failed in transport while its organize move is
+    // still running server-side (see ReviewQueue/moveGrace.ts).
+    const [stillWorking, setStillWorking] = useState<string | null>(null);
+    // This job's organize move, from `move_progress` (the save blocks on it).
+    const [move, setMove] = useState<MoveProgress | null>(null);
+    const [verifiedMove, setVerifiedMove] = useState<MoveProgress | null>(null);
+    // Read from the save handlers' catch blocks, which close over stale state.
+    const moveRef = useRef<{ active: MoveProgress | null; completedAt: number | null }>({
+        active: null,
+        completedAt: null,
+    });
+
+    /**
+     * Route a failed save: a transport failure during a live (or just-verified)
+     * move is the proxy giving up, not the save failing, so it gets the
+     * "still working" notice instead of an error. Everything else is an error.
+     */
+    const reportSaveFailure = (err: unknown, fallback: string) => {
+        if (
+            isTransportFailure(err)
+            && moveStillWorking(moveRef.current.active, moveRef.current.completedAt)
+        ) {
+            setStillWorking(STILL_WORKING_MESSAGE);
+            return;
+        }
+        setError(err instanceof Error ? err.message : fallback);
+    };
 
     // Per-title state
     const [selectedEpisodes, setSelectedEpisodes] = useState<Record<number, string>>({});
@@ -312,6 +342,28 @@ function ReviewQueue() {
             // Re-identify runs in the background. While the identity step is up
             // there are no in-progress picks to lose, so reload the whole job
             // when it changes and the gate lifts without leaving the page.
+            if (msg.type === 'move_progress' && msg.job_id === numericJobId) {
+                if (msg.done) {
+                    const verified = recordMoveCompleted(new Map(), msg).get(numericJobId) ?? null;
+                    moveRef.current = { active: null, completedAt: Date.now() };
+                    setMove(null);
+                    setVerifiedMove(verified);
+                } else {
+                    const next = applyMoveProgress(
+                        moveRef.current.active ? new Map([[numericJobId, moveRef.current.active]]) : new Map(),
+                        msg,
+                    ).get(numericJobId) ?? null;
+                    moveRef.current = { ...moveRef.current, active: next };
+                    setMove(next);
+                }
+                return;
+            }
+            if (msg.type === 'job_update' && msg.job_id === numericJobId && msg.state
+                && ['completed', 'failed', 'review_needed'].includes(msg.state) && moveRef.current.active) {
+                // A failed move sends no `done`; the state change ends it instead.
+                moveRef.current = { ...moveRef.current, active: null };
+                setMove(null);
+            }
             if (msg.type === 'job_update' && msg.job_id === numericJobId && identityGatedRef.current) {
                 void refreshJobRef.current();
                 return;
@@ -569,12 +621,13 @@ function ReviewQueue() {
     const handleSaveAll = async () => {
         setIsSaving(true);
         setError(null);
+        setStillWorking(null);
         try {
             await submitPendingSelections();
             navigate('/');
         } catch (err) {
             console.error('Failed to save reviews:', err);
-            setError(err instanceof Error ? err.message : 'Failed to save reviews');
+            reportSaveFailure(err, 'Failed to save reviews');
         } finally {
             setIsSaving(false);
         }
@@ -614,6 +667,7 @@ function ReviewQueue() {
     const handleProcessMatched = async () => {
         setIsProcessing(true);
         setError(null);
+        setStillWorking(null);
         try {
             // Submit pending selections first. Resolving the last unresolved title
             // makes the backend finalize the job inline, so it may already be
@@ -642,7 +696,7 @@ function ReviewQueue() {
                         return;
                     }
                 }
-                throw new Error(`Processing failed: ${text}`);
+                throw new ReviewHttpError(response.status, `Processing failed: ${text}`);
             }
             const result = await response.json();
             // Navigate home once nothing remains to resolve. Every success response
@@ -657,7 +711,7 @@ function ReviewQueue() {
             }
         } catch (err) {
             console.error('Failed to process matched:', err);
-            setError(err instanceof Error ? err.message : 'Failed to process');
+            reportSaveFailure(err, 'Failed to process');
         } finally {
             setIsProcessing(false);
         }
@@ -683,16 +737,17 @@ function ReviewQueue() {
     const handleFileAsExtras = async () => {
         setIsSaving(true);
         setError(null);
+        setStillWorking(null);
         try {
             const response = await fetch(`/api/jobs/${jobId}/review/file-as-extras`, { method: 'POST' });
             if (!response.ok) {
                 const text = await response.text();
-                throw new Error(`Filing as extras failed: ${response.status} ${text}`);
+                throw new ReviewHttpError(response.status, `Filing as extras failed: ${response.status} ${text}`);
             }
             navigate('/');
         } catch (err) {
             console.error('Failed to file movie as extras:', err);
-            setError(err instanceof Error ? err.message : 'Failed to file as extras');
+            reportSaveFailure(err, 'Failed to file as extras');
             await fetchJobDetails();
         } finally {
             setIsSaving(false);
@@ -706,6 +761,7 @@ function ReviewQueue() {
     ) => {
         setIsSaving(true);
         setError(null);
+        setStillWorking(null);
         try {
             const response = await fetch(`/api/jobs/${jobId}/review`, {
                 method: 'POST',
@@ -719,7 +775,7 @@ function ReviewQueue() {
             });
             if (!response.ok) {
                 const text = await response.text();
-                throw new Error(`Review failed: ${response.status} ${text}`);
+                throw new ReviewHttpError(response.status, `Review failed: ${response.status} ${text}`);
             }
             // The organize runs inside the request, so the job's state is already
             // settled. If it landed back in review (a library conflict, #685),
@@ -735,7 +791,7 @@ function ReviewQueue() {
             navigate('/');
         } catch (err) {
             console.error('Failed to save movie review:', err);
-            setError(err instanceof Error ? err.message : 'Failed to save review');
+            reportSaveFailure(err, 'Failed to save review');
         } finally {
             setIsSaving(false);
         }
@@ -970,6 +1026,8 @@ function ReviewQueue() {
                     style={{ maxWidth: sv.reviewMovieMaxWidth }}
                 >
                     {error && <SvNotice tone="error">› ERROR: {error}</SvNotice>}
+                    {stillWorking && <SvNotice tone="info" testid="review-still-working">› {stillWorking}</SvNotice>}
+                    <MoveProgressPanel move={move} completed={verifiedMove} />
                     <SvNotice tone="warn">
                         {(() => {
                             const notice = movieReviewNotice(titles);
@@ -1175,6 +1233,8 @@ function ReviewQueue() {
                 Shares sv.layoutMaxWidth (1600) with the header above. */}
             <div className="w-full max-w-[1600px] mx-auto px-6 py-8 relative z-0 pb-24">
                 {error && <SvNotice tone="error">› ERROR: {error}</SvNotice>}
+                {stillWorking && <SvNotice tone="info" testid="review-still-working">› {stillWorking}</SvNotice>}
+                <MoveProgressPanel move={move} completed={verifiedMove} />
                 {/* Subtitle failure and any other job error are independent now that
                     subtitle detail lives on its own field — both can surface. */}
                 {job.subtitle_status === 'failed' && (

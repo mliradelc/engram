@@ -29,6 +29,7 @@ from app.services.matching_coordinator import (
     numbering_disagreement_reason,
     numbering_schemes_agree,
 )
+from app.services.move_progress import MoveProgressReporter, finish_if_success
 
 logger = logging.getLogger(__name__)
 
@@ -598,6 +599,23 @@ class FinalizationCoordinator:
         self._season_retries: set[int] = set()
         # Library paths of already-filed tracks that a re-match skipped, per job.
         self._left_as_filed: dict[int, list[str]] = {}
+
+    def _move_progress_reporter(
+        self, job_id: int, title_index: int | None, source_name: str
+    ) -> MoveProgressReporter:
+        """A ``move_progress`` reporter for one organize call, built in async context.
+
+        Must be called on the event loop (it captures the running loop) and BEFORE
+        ``asyncio.to_thread``: the organizer invokes it from the worker thread.
+        Pair with ``finish_if_success`` once the organize call returns.
+        """
+        return MoveProgressReporter(
+            job_id,
+            title_index,
+            source_name,
+            broadcaster=self._broadcaster,
+            note_activity=self._note_activity,
+        )
 
     def note_left_as_filed(self, job_id: int, organized_paths: list[str]) -> None:
         """Remember filed tracks a re-match skipped, for the completion check to report."""
@@ -1585,6 +1603,9 @@ class FinalizationCoordinator:
             # Per title: a code from a corpus numbered unlike the TMDB roster is not
             # a coordinate the episode group can resolve, so it keeps aired numbering.
             _title_ordering = _ordering_for_title(cap["match_details"], ordering, _namespace)
+            _move_reporter = self._move_progress_reporter(
+                job_id, cap["title_index"], source_file.name
+            )
 
             if is_extra:
                 # Mirror the review path (apply_review / process_matched_titles):
@@ -1603,6 +1624,7 @@ class FinalizationCoordinator:
                     tmdb_id=_tmdb_id_str,
                     year=_tmdb_year,
                     conflict_resolution=_tv_conflict_strategy(cap.get("conflict_resolution")),
+                    progress_callback=_move_reporter,
                 )
             elif _lib_path:
                 org_result = await asyncio.to_thread(
@@ -1617,6 +1639,7 @@ class FinalizationCoordinator:
                     episode_group_id=ordering_group_id,
                     year=_tmdb_year,
                     episode_namespace=_namespace,
+                    progress_callback=_move_reporter,
                 )
             else:
                 org_result = await asyncio.to_thread(
@@ -1630,7 +1653,9 @@ class FinalizationCoordinator:
                     year=_tmdb_year,
                     conflict_resolution=_tv_conflict_strategy(cap["conflict_resolution"]),
                     episode_namespace=_namespace,
+                    progress_callback=_move_reporter,
                 )
+            await finish_if_success(_move_reporter, org_result)
 
             # Classification is independent of the file move: a failed extra still
             # IS an extra and must keep is_extra=True so the episode re-match loop
@@ -1942,6 +1967,13 @@ class FinalizationCoordinator:
                         _conflict = await _movie_conflict_strategy(title.conflict_resolution)
 
                         _lib_path = _library_path_for_job(job, "movie")
+                        # This POST blocks for the whole move (tens of minutes for a
+                        # Blu-ray onto a NAS share), so a proxy in front of Engram
+                        # may 504 the request while the move carries on and is
+                        # verified here. The dashboard follows move_progress instead.
+                        _move_reporter = self._move_progress_reporter(
+                            job_id, title.title_index, source_file.name
+                        )
                         if _lib_path or _is_import:
                             # For an import the kept unselected files sit beside the
                             # chosen one; an empty extras list stops the folder scan
@@ -1961,6 +1993,7 @@ class FinalizationCoordinator:
                                     if _is_import
                                     else None
                                 ),
+                                progress_callback=_move_reporter,
                             )
                         else:
                             org_result = await asyncio.to_thread(
@@ -1973,7 +2006,9 @@ class FinalizationCoordinator:
                                 edition=_edition,
                                 already_clean=_already_clean,
                                 conflict_resolution=_conflict,
+                                progress_callback=_move_reporter,
                             )
+                        await finish_if_success(_move_reporter, org_result)
 
                         if org_result.get("skipped"):
                             # "skip" keeps the library copy and leaves this rip in
@@ -2116,6 +2151,13 @@ class FinalizationCoordinator:
             if not await self._state_machine.transition_to_organizing(job, session):
                 raise ValueError("Only a movie job awaiting review can be filed as extras")
 
+            # One running byte count across every file filed: the call is one
+            # unit for the client, so it reports under the first title's index.
+            _move_reporter = self._move_progress_reporter(
+                job_id,
+                titles[0].title_index,
+                files[0].name if len(files) == 1 else f"{len(files)} extras",
+            )
             try:
                 result = await asyncio.to_thread(
                     organizer.organize_movie_extras,
@@ -2125,7 +2167,9 @@ class FinalizationCoordinator:
                     _lib_path,
                     tmdb_id=_tmdb_id,
                     already_clean=_already_clean,
+                    progress_callback=_move_reporter,
                 )
+                await finish_if_success(_move_reporter, result)
             except Exception as e:
                 # Anything outside the organizer's own guarded move (reading the
                 # naming config, say) must not leave the job stranded in ORGANIZING.
@@ -2347,6 +2391,9 @@ class FinalizationCoordinator:
                     _title_ordering = _ordering_for_title(
                         disc_title.match_details, ordering, job.episode_namespace
                     )
+                    _move_reporter = self._move_progress_reporter(
+                        job_id, disc_title.title_index, source_file.name
+                    )
                     if disc_title.matched_episode == "extra":
                         org_result = await asyncio.to_thread(
                             organize_tv_extras,
@@ -2362,6 +2409,7 @@ class FinalizationCoordinator:
                             conflict_resolution=_tv_conflict_strategy(
                                 disc_title.conflict_resolution
                             ),
+                            progress_callback=_move_reporter,
                         )
                         extra_index += 1
                     else:
@@ -2378,6 +2426,7 @@ class FinalizationCoordinator:
                                 episode_group_id=ordering_group_id,
                                 year=_tmdb_year,
                                 episode_namespace=job.episode_namespace,
+                                progress_callback=_move_reporter,
                             )
                         else:
                             org_result = await asyncio.to_thread(
@@ -2393,7 +2442,9 @@ class FinalizationCoordinator:
                                     disc_title.conflict_resolution
                                 ),
                                 episode_namespace=job.episode_namespace,
+                                progress_callback=_move_reporter,
                             )
+                    await finish_if_success(_move_reporter, org_result)
                     if org_result["success"]:
                         success_count += 1
                         disc_title.organized_from = source_file.name
@@ -2637,6 +2688,9 @@ class FinalizationCoordinator:
                 _title_ordering = _ordering_for_title(
                     disc_title.match_details, ordering, job.episode_namespace
                 )
+                _move_reporter = self._move_progress_reporter(
+                    job_id, disc_title.title_index, source_file.name
+                )
                 if disc_title.matched_episode == "extra":
                     org_result = await asyncio.to_thread(
                         organize_tv_extras,
@@ -2650,6 +2704,7 @@ class FinalizationCoordinator:
                         tmdb_id=_tmdb_id_str,
                         year=_tmdb_year,
                         conflict_resolution=_tv_conflict_strategy(disc_title.conflict_resolution),
+                        progress_callback=_move_reporter,
                     )
                     extra_index += 1
                 else:
@@ -2666,6 +2721,7 @@ class FinalizationCoordinator:
                             episode_group_id=ordering_group_id,
                             year=_tmdb_year,
                             episode_namespace=job.episode_namespace,
+                            progress_callback=_move_reporter,
                         )
                     else:
                         org_result = await asyncio.to_thread(
@@ -2681,7 +2737,9 @@ class FinalizationCoordinator:
                                 disc_title.conflict_resolution
                             ),
                             episode_namespace=job.episode_namespace,
+                            progress_callback=_move_reporter,
                         )
+                await finish_if_success(_move_reporter, org_result)
 
                 if org_result["success"]:
                     success_count += 1

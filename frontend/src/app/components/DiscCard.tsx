@@ -8,6 +8,8 @@ import { usePosterImage } from "./DiscCard/hooks/usePosterImage";
 import { MediaTypeBadge } from "./DiscCard/MediaTypeBadge";
 import { DiscMetadata } from "./DiscCard/DiscMetadata";
 import { ActionButtons } from "./DiscCard/ActionButtons";
+import { MoveProgressPanel } from "./DiscCard/MoveProgressPanel";
+import type { MoveProgress } from "../../types";
 import { Bug } from "lucide-react";
 import { isActivePipelineState } from "./discState";
 import { useElapsedTime } from "../hooks/useElapsedTime";
@@ -150,6 +152,12 @@ interface DiscCardProps {
   /** Retry a failed job from its staging files (#713). The card shows the
    *  button only once the backend confirms staging still holds ripped files. */
   onRetryFromStaging?: () => void;
+  /** In-flight organize move for this disc, from `move_progress`. A separate
+   *  prop rather than a `DiscData` field: `DiscData` is rebuilt from the REST
+   *  job list on every fetch, which would blank the bar mid-move. */
+  moveProgress?: MoveProgress | null;
+  /** The disc's last verified move, for the "✓ VERIFIED" line. */
+  moveCompleted?: MoveProgress | null;
 }
 
 /**
@@ -243,7 +251,7 @@ function CoverOverlay({ children }: { children: React.ReactNode }) {
 }
 
 const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
-  ({ disc, onCancel, onSkipTrack, onUnskipTrack, onReview, onReIdentify, onAdvance, onEject, onReportBug, onOpenSettings, onIdentify, identifyLabel, onRetryFromStaging }, ref) => {
+  ({ disc, onCancel, onSkipTrack, onUnskipTrack, onReview, onReIdentify, onAdvance, onEject, onReportBug, onOpenSettings, onIdentify, identifyLabel, onRetryFromStaging, moveProgress, moveCompleted }, ref) => {
     const [isHovered, setIsHovered] = React.useState(false);
     const recovery = useJobRecovery(disc.state === "error" && onRetryFromStaging ? disc.id : null);
     const posterUrl = usePosterImage(disc.id, disc.title);
@@ -730,6 +738,17 @@ const DiscCardComponent = React.forwardRef<HTMLDivElement, DiscCardProps>(
                   <SvProgressBar progress={disc.backupProgress} color="magenta" label="DISC BACKUP" />
                 </div>
               )}
+
+              {/* Verified organize move (cross-device copy onto the library share).
+                  Not gated on disc.state: the bytes are the signal, and the
+                  review-triggered move can start before the ORGANIZING update lands.
+                  The verified line shows only while the organize is current. */}
+              <MoveProgressPanel
+                move={moveProgress}
+                completed={
+                  disc.state === "organizing" || disc.state === "completed" ? moveCompleted : null
+                }
+              />
 
               {/* Ripping */}
               {disc.state === "ripping" && disc.tracks && (

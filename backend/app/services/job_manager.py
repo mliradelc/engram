@@ -70,6 +70,7 @@ from app.services.matching_coordinator import (
     STRICT_SCAN_POINTS,
     MatchingCoordinator,
 )
+from app.services.move_progress import MoveProgressReporter, finish_if_success
 from app.services.ripping_helpers import (
     SpeedCalculator,
     expected_native_index,
@@ -4424,6 +4425,7 @@ class JobManager:
                 _selected = ripped_titles[0]
             _edition = _selected.edition if _selected else None
             _selected_id = _selected.id if _selected else None
+            _selected_title_index = _selected.title_index if _selected else None
             # Extras discarded under extras_policy "skip" carry the policy's own
             # marker (`_apply_movie_extras_policy`); their rips stay in staging
             # rather than being swept into Extras/ by the organizer's folder scan
@@ -4458,6 +4460,15 @@ class JobManager:
 
         await ws_manager.broadcast_job_update(job_id, JobState.ORGANIZING.value)
 
+        # Built here, on the loop, before to_thread: the organizer reports from
+        # its worker thread and hands each sample back to this loop.
+        _move_reporter = MoveProgressReporter(
+            job_id,
+            _selected_title_index,
+            (_main_file or output_dir).name,
+            broadcaster=event_broadcaster,
+            note_activity=self._note_activity,
+        )
         if _lib_path is None and not import_files:
             organize_result = await asyncio.to_thread(
                 movie_organizer.organize,
@@ -4470,6 +4481,7 @@ class JobManager:
                 already_clean=_already_clean,
                 conflict_resolution=_conflict,
                 move_extras=_move_extras,
+                progress_callback=_move_reporter,
             )
         else:
             organize_result = await asyncio.to_thread(
@@ -4484,7 +4496,9 @@ class JobManager:
                 edition=_edition,
                 already_clean=_already_clean,
                 extra_files=_extra_files,
+                progress_callback=_move_reporter,
             )
+        await finish_if_success(_move_reporter, organize_result)
 
         async with async_session() as session:
             job = await session.get(DiscJob, job_id)

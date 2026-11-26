@@ -211,6 +211,47 @@ export interface BackupProgressMessage {
 }
 
 /**
+ * Byte progress of a cross-device organize move (local staging onto a NAS
+ * share), which can take tens of minutes for a Blu-ray. Every key is always
+ * present. Unlike `backup_progress`, `speed` and `eta` are real (the backend
+ * times its own copy); they are null only on a title's first sample, and a
+ * null must not erase what the card already shows. `done` is true exactly once
+ * per title, after the backend checked the destination's byte length against
+ * the source's, and then carries `current_bytes === total_bytes`. A same-device
+ * move is an instant rename and sends nothing.
+ */
+export interface MoveProgressMessage {
+    type: 'move_progress';
+    job_id: number;
+    title_index: number | null;
+    source_name: string;
+    current_bytes: number;
+    total_bytes: number;
+    speed: string | null;
+    eta: number | null;
+    done: boolean;
+}
+
+/**
+ * One job's in-flight (or just-verified) organize move, folded from
+ * `move_progress`. Transient by design: never stored on the REST-built job, so
+ * a job-list refetch cannot blank the bar.
+ */
+export interface MoveProgress {
+    job_id: number;
+    title_index: number | null;
+    source_name: string;
+    current_bytes: number;
+    total_bytes: number;
+    /** 0-100, derived from the bytes. */
+    percent: number;
+    speed: string | null;
+    eta: number | null;
+    /** `Date.now()` of the last sample (or of the verification, once done). */
+    updated_at: number;
+}
+
+/**
  * Progress of one post-organize AV1/x265 encode, keyed by `file` (not a job:
  * the hook runs after the title is filed). Every field is always present; a
  * null `percent`/`eta` means "not known for this sample" (ffmpeg reports no
@@ -462,6 +503,7 @@ export type WebSocketMessage =
     | TitleUpdate
     | SubtitleEvent
     | BackupProgressMessage
+    | MoveProgressMessage
     | EncodeProgressMessage
     | TitlesDiscovered
     | UpdateStatusMessage

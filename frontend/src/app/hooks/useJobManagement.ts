@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ApiError, apiFetch, apiFetchVoid, seasonAnswerBody, skipRipTitle, unskipRipTitle } from '../../api/client';
 import { recoveryErrorMessage, retryFromStaging } from '../../api/recoveryClient';
-import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, EncodeProgress, EncodeProgressMessage, EncodeFailure, EncodingStatus, EncodeRetryRequest, EncodeRetryResponse, EncodeClass, EncodeOverrideStatus, EncodeDismissResponse } from '../../types';
+import type { Job, DiscTitle, SeasonAnswer, WebSocketMessage, UpdateStatus, UpdateStatusMessage, ParkedDisc, ParkedDiscsMessage, BackupProgressMessage, MoveProgress, MoveProgressMessage, EncodeProgress,EncodeProgressMessage, EncodeFailure, EncodingStatus, EncodeRetryRequest, EncodeRetryResponse, EncodeClass, EncodeOverrideStatus, EncodeDismissResponse } from '../../types';
 import type { ArmedIdentity } from '../components/ArmedDriveCard';
 
 // Trailing-debounce window for refetches triggered by a burst of unknown
@@ -83,6 +83,94 @@ export function applyBackupProgress(jobs: Job[], data: Omit<BackupProgressMessag
         current_speed: data.speed ?? next[idx].current_speed,
         eta_seconds: data.eta ?? next[idx].eta_seconds,
     };
+    return next;
+}
+
+/**
+ * Fold a `move_progress` message into the in-flight move map (keyed by job
+ * id). Returns a NEW map when anything changed, the same one otherwise.
+ *
+ * Bytes become a 0-100 percent. A null `speed`/`eta` is coalesced against the
+ * existing entry (null means "not known for this sample", e.g. the first one).
+ * On `done` the entry is removed: the move is verified and over; the
+ * completion readout comes from `recordMoveCompleted`, not from this map.
+ */
+export function applyMoveProgress(
+    moves: Map<number, MoveProgress>,
+    data: Omit<MoveProgressMessage, 'type'>,
+    now: number = Date.now(),
+): Map<number, MoveProgress> {
+    if (data.done) {
+        if (!moves.has(data.job_id)) return moves;
+        const next = new Map(moves);
+        next.delete(data.job_id);
+        return next;
+    }
+    const prev = moves.get(data.job_id);
+    // A new title (TV sweeps move one title after another) starts fresh rather
+    // than inheriting the previous title's speed/ETA.
+    const sameTitle = prev !== undefined && prev.title_index === data.title_index
+        && prev.source_name === data.source_name;
+    const percent = data.total_bytes > 0
+        ? Math.min(100, (data.current_bytes / data.total_bytes) * 100)
+        : 0;
+    const next = new Map(moves);
+    next.set(data.job_id, {
+        job_id: data.job_id,
+        title_index: data.title_index,
+        source_name: data.source_name,
+        current_bytes: data.current_bytes,
+        total_bytes: data.total_bytes,
+        percent,
+        speed: data.speed ?? (sameTitle ? prev?.speed ?? null : null),
+        eta: data.eta ?? (sameTitle ? prev?.eta ?? null : null),
+        updated_at: now,
+    });
+    return next;
+}
+
+/**
+ * Remember a verified move (a `done` message) per job, for the
+ * "✓ VERIFIED — N GB transferred" readout and for the review page's
+ * "still working" grace window. Non-done messages return the same map.
+ */
+export function recordMoveCompleted(
+    completed: Map<number, MoveProgress>,
+    data: Omit<MoveProgressMessage, 'type'>,
+    now: number = Date.now(),
+): Map<number, MoveProgress> {
+    if (!data.done) return completed;
+    const next = new Map(completed);
+    next.set(data.job_id, {
+        job_id: data.job_id,
+        title_index: data.title_index,
+        source_name: data.source_name,
+        current_bytes: data.total_bytes,
+        total_bytes: data.total_bytes,
+        percent: 100,
+        speed: null,
+        eta: null,
+        updated_at: now,
+    });
+    return next;
+}
+
+/** States in which no organize move can still be running for a job. */
+const MOVE_OVER_STATES = new Set(['completed', 'failed', 'review_needed']);
+
+/**
+ * Drop a job's in-flight move when a `job_update` says the organize is over.
+ * A failed move sends no `done` (nothing was verified), so without this its
+ * bar would freeze at the last sample. Same map when nothing changed.
+ */
+export function clearMoveOnStateChange(
+    moves: Map<number, MoveProgress>,
+    jobId: number,
+    state: string | null | undefined,
+): Map<number, MoveProgress> {
+    if (!state || !MOVE_OVER_STATES.has(state) || !moves.has(jobId)) return moves;
+    const next = new Map(moves);
+    next.delete(jobId);
     return next;
 }
 
@@ -197,6 +285,12 @@ export function useJobManagement(devMode: boolean = false) {
     // Seeded from GET /api/encoding (late-joining tab), then folded from
     // `encode_progress` messages.
     const [encodes, setEncodes] = useState<Map<string, EncodeProgress>>(() => new Map());
+    // In-flight organize moves keyed by job id, from `move_progress`. Kept out
+    // of `jobs` on purpose: the job list is rebuilt from REST on every fetch,
+    // which would blank a 25-minute progress bar.
+    const [moveProgress, setMoveProgress] = useState<Map<number, MoveProgress>>(() => new Map());
+    // The last verified move per job (for the "✓ VERIFIED" readout).
+    const [completedMoves, setCompletedMoves] = useState<Map<number, MoveProgress>>(() => new Map());
     // Files whose class this tab has fetched since their encode started. The
     // WS message does not carry the class, so each start triggers one snapshot.
     const encodeClassFetched = useRef(new Set<string>());
@@ -614,6 +708,7 @@ export function useJobManagement(devMode: boolean = false) {
                         scheduleUnknownJobRefetch();
                         return prev;
                     });
+                    setMoveProgress(prev => clearMoveOnStateChange(prev, message.job_id, message.state));
                     break;
 
                 case 'title_update':
@@ -689,6 +784,11 @@ export function useJobManagement(devMode: boolean = false) {
                     setJobs(prev => applyBackupProgress(prev, message));
                     break;
 
+                case 'move_progress':
+                    setMoveProgress(prev => applyMoveProgress(prev, message));
+                    if (message.done) setCompletedMoves(prev => recordMoveCompleted(prev, message));
+                    break;
+
                 case 'encode_progress':
                     // An encode started (or an Auto retry began): fetch the snapshot
                     // once for its class, which `encode_progress` does not carry.
@@ -761,6 +861,8 @@ export function useJobManagement(devMode: boolean = false) {
         parkedDiscs,
         armedDrives,
         encodes,
+        moveProgress,
+        completedMoves,
         encodeFailures,
         retryEncode,
         dismissEncodeFailure,

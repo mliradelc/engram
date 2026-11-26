@@ -435,6 +435,7 @@ All WebSocket messages follow the format: `{"type": "...", "data": {...}}`
 | `title_discovered` | `{"job_id": int, "title": DiscTitle}` | New title found during ripping |
 | `rip_progress` | `{"job_id": int, "current_bytes": int, "total_bytes": int, "speed": str, "eta": int}` | Ripping progress update |
 | `backup_progress` | `job_id`, `current_bytes`, `total_bytes`, `speed`, `eta` (flat, not nested under `data`) | Full-disc backup copy progress |
+| `move_progress` | `job_id`, `title_index`, `source_name`, `current_bytes`, `total_bytes`, `speed`, `eta`, `done` (flat, every key always present) | Cross-device organize copy progress; `done: true` once per title after the destination's size was verified against the source's (`MoveProgressReporter`, `app/services/move_progress.py`) |
 | `title_ripping_started` | `{"job_id": int, "title_id": int}` | Title ripping started |
 | `title_ripping_progress` | `{"job_id": int, "title_id": int, ...}` | Per-track ripping progress |
 | `title_matching_started` | `{"job_id": int, "title_id": int}` | Title matching started |

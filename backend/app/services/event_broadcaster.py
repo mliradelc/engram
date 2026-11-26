@@ -105,6 +105,31 @@ class EventBroadcaster:
             eta=eta_seconds,
         )
 
+    # --- Organize Events ---
+
+    async def broadcast_move_progress(
+        self,
+        job_id: int,
+        title_index: int | None,
+        source_name: str,
+        current_bytes: int,
+        total_bytes: int,
+        speed: str | None = None,
+        eta_seconds: int | None = None,
+        done: bool = False,
+    ) -> None:
+        """Broadcast byte progress of a verified organize move (see ConnectionManager)."""
+        await self._ws.broadcast_move_progress(
+            job_id,
+            title_index=title_index,
+            source_name=source_name,
+            current_bytes=current_bytes,
+            total_bytes=total_bytes,
+            speed=speed,
+            eta=eta_seconds,
+            done=done,
+        )
+
     # --- Title Discovery Events ---
 
     async def broadcast_titles_discovered(

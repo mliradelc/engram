@@ -162,7 +162,7 @@ function MainDashboard() {
   }, [showImport]);
 
   // Job management with WebSocket
-  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, encodeFailures, retryEncode, dismissEncodeFailure, loadEncodeOverride, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
+  const { jobs, titlesMap, isConnected, updateStatus, parkedDiscs, armedDrives, encodes, moveProgress, completedMoves, encodeFailures, retryEncode, dismissEncodeFailure, loadEncodeOverride, cancelJob, advanceJob, skipTrack, unskipTrack, retryJobFromStaging, ejectJob, clearFinished, setJobName, reIdentifyJob, disclosure, clearDisclosure } = useJobManagement(DEV_MODE);
 
   // Footer facts (#720): the detected optical drives and the effective ASR device.
   // Both are hardware/runtime facts that change rarely, so refresh on (re)connect
@@ -811,6 +811,8 @@ function MainDashboard() {
                 <DiscCard
                   key={disc.id}
                   disc={disc}
+                  moveProgress={moveProgress?.get(Number(disc.id)) ?? null}
+                  moveCompleted={completedMoves?.get(Number(disc.id)) ?? null}
                   onCancel={disc.state !== 'completed' && disc.state !== 'error' ? () => cancelJob(disc.id) : undefined}
                   onSkipTrack={(titleId) => { void skipTrack(disc.id, titleId); }}
                   onUnskipTrack={(titleId) => { void unskipTrack(disc.id, titleId); }}
